@@ -1,0 +1,122 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  validate:
+    name: Validate release tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Require tag to match Cargo package version
+        shell: bash
+        run: |
+          package_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          tag_version="${GITHUB_REF_NAME#v}"
+          test "$tag_version" = "$package_version" || {
+            echo "Tag $GITHUB_REF_NAME does not match Cargo.toml version $package_version" >&2
+            exit 1
+          }
+          grep -F "## [$package_version]" CHANGELOG.md >/dev/null
+      - run: cargo package --locked
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: agentbench.exe
+            archive: zip
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            binary: agentbench
+            archive: tar.gz
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            binary: agentbench
+            archive: tar.gz
+          - os: macos-15
+            target: aarch64-apple-darwin
+            binary: agentbench
+            archive: tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package Windows archive
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $package = "agentbench-$env:GITHUB_REF_NAME-${{ matrix.target }}"
+          $root = Join-Path dist $package
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.binary }}" $root
+          Copy-Item README.md, CHANGELOG.md, CONTRIBUTING.md, SECURITY.md, LICENSE $root
+          Compress-Archive -Path $root -DestinationPath "dist/$package.zip"
+          Remove-Item -Recurse -Force -LiteralPath $root
+      - name: Package Unix archive
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          package="agentbench-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p "dist/$package"
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "dist/$package/"
+          cp README.md CHANGELOG.md CONTRIBUTING.md SECURITY.md LICENSE "dist/$package/"
+          chmod +x "dist/$package/${{ matrix.binary }}"
+          tar -C dist -czf "dist/$package.tar.gz" "$package"
+          rm -rf "dist/$package"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agentbench-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: agentbench-*
+          merge-multiple: true
+      - name: Generate checksums
+        shell: bash
+        run: |
+          cd dist
+          sha256sum ./*.zip ./*.tar.gz > SHA256SUMS
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/*
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --generate-notes \
+            --title "AgentBench $GITHUB_REF_NAME"

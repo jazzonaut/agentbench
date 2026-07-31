@@ -1,0 +1,21 @@
+# Commands may incur API charges. Keep both cases equivalent.
+seed = 20260731
+repetitions = 3
+warmups = 1
+save_command_output = false
+[[case]]
+name = "direct"
+program = "claude"
+args = ["-p", "Summarize the repository architecture in five bullets."]
+timeout_seconds = 300
+
+[[case]]
+name = "headroom-proxy"
+program = "claude"
+args = ["-p", "Summarize the repository architecture in five bullets."]
+timeout_seconds = 300
+
+# Put only the routing override needed by your Headroom installation here.
+# Environment values are used locally but never copied into the report.
+# [case.env]
+# ANTHROPIC_BASE_URL = "http://127.0.0.1:8787"

@@ -1,0 +1,4 @@
+/target/
+/*bench-*.json
+/*bench-*.md
+/.agent*bench-tmp-*/
