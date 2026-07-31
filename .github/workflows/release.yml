@@ -85,7 +85,7 @@ jobs:
           chmod +x "dist/$package/${{ matrix.binary }}"
           tar -C dist -czf "dist/$package.tar.gz" "$package"
           rm -rf "dist/$package"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: agentbench-${{ matrix.target }}
           path: dist/*
