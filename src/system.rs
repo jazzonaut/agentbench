@@ -223,12 +223,12 @@ fn power_source() -> Option<String> {
     None
 }
 
-pub fn native_diagnostics(elevated_requested: bool) -> (serde_json::Value, Vec<String>) {
+pub fn native_diagnostics(_elevated_requested: bool) -> (serde_json::Value, Vec<String>) {
     let mut unavailable = Vec::new();
     let mut data = serde_json::Map::new();
     #[cfg(windows)]
     {
-        if elevated_requested && is_elevated() {
+        if _elevated_requested && is_elevated() {
             let script = "Get-MpComputerStatus | Select-Object AntivirusEnabled,RealTimeProtectionEnabled,BehaviorMonitorEnabled,IoavProtectionEnabled | ConvertTo-Json -Compress";
             match Command::new("powershell")
                 .args(["-NoProfile", "-Command", script])
@@ -241,7 +241,7 @@ pub fn native_diagnostics(elevated_requested: bool) -> (serde_json::Value, Vec<S
                 }
                 _ => unavailable.push("Windows Defender status".into()),
             }
-        } else if elevated_requested {
+        } else if _elevated_requested {
             unavailable.push(
                 "elevated Windows security diagnostics (start from an Administrator terminal)"
                     .into(),
