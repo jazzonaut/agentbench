@@ -107,7 +107,7 @@ jobs:
         run: |
           cd dist
           sha256sum ./*.zip ./*.tar.gz > SHA256SUMS
-      - uses: actions/attest-build-provenance@v2
+      - uses: actions/attest-build-provenance@v4
         with:
           subject-path: dist/*
       - name: Create GitHub Release
