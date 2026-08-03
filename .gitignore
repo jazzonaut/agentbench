@@ -2,3 +2,5 @@
 /*bench-*.json
 /*bench-*.md
 /.agent*bench-tmp-*/
+.tokensave
+.claude
