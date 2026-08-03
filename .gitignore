@@ -4,3 +4,5 @@
 /.agent*bench-tmp-*/
 .tokensave
 .claude
+# Local verification harnesses, named so they sort last. Not release material.
+tests/zz_*.rs
