@@ -1,4 +1,5 @@
 use crate::{
+    metrics::{catalog, families},
     model::{LiveLlmRun, Metric, ProfileResult, SystemSample},
     profile::{self, CommandSpec, TimedChunk},
     system,
@@ -192,20 +193,8 @@ pub fn run_suite(
         }
     }
     let mut metrics = summarize(&runs);
-    metrics.push(Metric::scalar(
-        "llm.total_cost_usd",
-        total_cost,
-        "USD",
-        true,
-        "live_llm",
-    ));
-    metrics.push(Metric::scalar(
-        "llm.phase_wall_seconds",
-        live_started.elapsed().as_secs_f64(),
-        "s",
-        true,
-        "live_llm",
-    ));
+    metrics.push(catalog::LLM_TOTAL_COST_USD.scalar(total_cost));
+    metrics.push(catalog::LLM_PHASE_WALL_SECONDS.scalar(live_started.elapsed().as_secs_f64()));
     Ok(LiveOutcome {
         runs,
         profiles,
@@ -416,7 +405,7 @@ fn summarize(runs: &[LiveLlmRun]) -> Vec<Metric> {
     }
     let mut metrics = Vec::new();
     for ((route, scenario), group) in groups {
-        let prefix = format!("llm.{route}.{scenario}");
+        let case = format!("{route}.{scenario}");
         let wall: Vec<f64> = group.iter().map(|run| run.wall_ms as f64).collect();
         let ttft: Vec<f64> = group
             .iter()
@@ -426,28 +415,10 @@ fn summarize(runs: &[LiveLlmRun]) -> Vec<Metric> {
             .iter()
             .filter_map(|run| run.output_tokens_per_second)
             .collect();
-        metrics.push(Metric::distribution(
-            format!("{prefix}.wall_ms"),
-            &wall,
-            "ms",
-            true,
-            "live_llm",
-        ));
-        metrics.push(Metric::distribution(
-            format!("{prefix}.ttft_stream_ms"),
-            &ttft,
-            "ms",
-            true,
-            "live_llm",
-        ));
+        metrics.push(families::LLM_CASE_WALL_MS.distribution(&case, &wall));
+        metrics.push(families::LLM_CASE_TTFT_STREAM_MS.distribution(&case, &ttft));
         if !speed.is_empty() {
-            metrics.push(Metric::distribution(
-                format!("{prefix}.output_tokens_s"),
-                &speed,
-                "tokens/s",
-                false,
-                "live_llm",
-            ));
+            metrics.push(families::LLM_CASE_OUTPUT_TOKENS_S.distribution(&case, &speed));
         }
     }
     metrics

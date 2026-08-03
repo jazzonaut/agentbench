@@ -1,5 +1,8 @@
-use crate::model::{
-    Finding, IntegrationResult, LiveLlmRun, Metric, ProfileResult, Severity, SystemSample,
+use crate::{
+    metrics::catalog,
+    model::{
+        Finding, IntegrationResult, LiveLlmRun, Metric, ProfileResult, Severity, SystemSample,
+    },
 };
 
 pub fn analyze(
@@ -10,13 +13,13 @@ pub fn analyze(
     let mut findings = Vec::new();
     let metric = |name: &str| metrics.iter().find(|m| m.name == name);
 
-    if let Some(m) = metric("filesystem.sequential_write_mib_s").filter(|m| m.value < 100.0) {
+    if let Some(m) = metric(catalog::FS_SEQUENTIAL_WRITE_MIB_S.name).filter(|m| m.value < 100.0) {
         findings.push(finding("disk", Severity::Warning, 0.75, "Low sequential filesystem write throughput",
             vec![format!("Measured {:.1} MiB/s; the diagnostic threshold is 100 MiB/s", m.value)],
             vec!["Filesystem cache, encryption, virtual disks, and concurrent workloads can affect this test"],
             vec!["Repeat against the actual repository volume", "Check drive health, free space, and active disk users"]));
     }
-    if let Some(m) = metric("filesystem.small_file_ops_s").filter(|m| m.value < 1_000.0) {
+    if let Some(m) = metric(catalog::FS_SMALL_FILE_OPS_S.name).filter(|m| m.value < 1_000.0) {
         let scanner = samples
             .iter()
             .filter_map(|s| s.scanner_cpu_percent)
@@ -69,8 +72,8 @@ pub fn analyze(
             ],
         ));
     }
-    if let Some(m) =
-        metric("network.https_latency_ms").filter(|m| m.p95.unwrap_or(m.value) > 1_000.0)
+    if let Some(m) = metric(catalog::NETWORK_HTTPS_LATENCY_MS.name)
+        .filter(|m| m.p95.unwrap_or(m.value) > 1_000.0)
     {
         findings.push(finding(
             "network",
@@ -314,13 +317,7 @@ mod tests {
 
     #[test]
     fn slow_small_files_with_scanner_overlap_has_high_confidence() {
-        let metrics = vec![Metric::scalar(
-            "filesystem.small_file_ops_s",
-            400.0,
-            "ops/s",
-            false,
-            "filesystem",
-        )];
+        let metrics = vec![catalog::FS_SMALL_FILE_OPS_S.scalar(400.0)];
         let samples = vec![SystemSample {
             scanner_cpu_percent: Some(12.0),
             ..Default::default()
@@ -342,27 +339,9 @@ mod tests {
     #[test]
     fn healthy_synthetic_metrics_do_not_create_findings() {
         let metrics = vec![
-            Metric::scalar(
-                "filesystem.sequential_write_mib_s",
-                500.0,
-                "MiB/s",
-                false,
-                "filesystem",
-            ),
-            Metric::scalar(
-                "filesystem.small_file_ops_s",
-                5_000.0,
-                "ops/s",
-                false,
-                "filesystem",
-            ),
-            Metric::distribution(
-                "network.https_latency_ms",
-                &[20.0, 30.0],
-                "ms",
-                true,
-                "network",
-            ),
+            catalog::FS_SEQUENTIAL_WRITE_MIB_S.scalar(500.0),
+            catalog::FS_SMALL_FILE_OPS_S.scalar(5_000.0),
+            catalog::NETWORK_HTTPS_LATENCY_MS.distribution(&[20.0, 30.0]),
         ];
         assert!(analyze(&metrics, &[], &[]).is_empty());
     }

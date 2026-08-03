@@ -1,12 +1,12 @@
 use crate::{
     SCHEMA_VERSION, diagnosis, integrations,
     model::{ProfileResult, Report, RunConfig, RunKind, SystemSample},
-    system,
+    process_tree, system,
 };
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, VecDeque},
     io::Read,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -159,21 +159,13 @@ pub fn profile_command_capture(spec: &CommandSpec) -> Result<CommandCapture> {
             first_output_ms = first_rx.try_recv().ok();
         }
         system.refresh_processes(ProcessesToUpdate::All, true);
-        let tree = process_tree(&system, root_pid);
+        let tree = process_tree::descendants(&system, Pid::from_u32(root_pid));
         max_processes = max_processes.max(tree.len());
-        let mut tree_cpu = 0.0_f32;
-        let mut tree_rss = 0_u64;
-        let mut tree_read = 0_u64;
-        let mut tree_write = 0_u64;
-        for pid in &tree {
-            if let Some(process) = system.process(*pid) {
-                tree_cpu += process.cpu_usage();
-                tree_rss += process.memory();
-                let io = process.disk_usage();
-                tree_read += io.total_read_bytes;
-                tree_write += io.total_written_bytes;
-            }
-        }
+        let usage = process_tree::usage(&system, &tree);
+        let tree_cpu = usage.cpu_percent;
+        let tree_rss = usage.rss_bytes;
+        let tree_read = usage.read_bytes;
+        let tree_write = usage.written_bytes;
         let elapsed = previous.elapsed();
         previous = Instant::now();
         integrated_cpu_ms += tree_cpu as f64 / 100.0 * elapsed.as_secs_f64() * 1000.0;
@@ -256,26 +248,6 @@ pub fn profile_command_capture(spec: &CommandSpec) -> Result<CommandCapture> {
         stderr_tail,
         stdout_chunks,
     })
-}
-
-fn process_tree(system: &System, root_pid: u32) -> HashSet<Pid> {
-    let root = Pid::from_u32(root_pid);
-    let mut result = HashSet::from([root]);
-    loop {
-        let before = result.len();
-        for (pid, process) in system.processes() {
-            if process
-                .parent()
-                .is_some_and(|parent| result.contains(&parent))
-            {
-                result.insert(*pid);
-            }
-        }
-        if result.len() == before {
-            break;
-        }
-    }
-    result
 }
 
 fn spawn_reader<R: Read + Send + 'static>(

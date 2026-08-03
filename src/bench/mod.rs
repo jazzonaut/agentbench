@@ -1,0 +1,242 @@
+//! Benchmark orchestration: sequences the workload phases and assembles the report.
+//!
+//! This module decides *order and sizing*; it contains no measurement logic. Each phase lives in
+//! [`workloads`], each of which is parameterised rather than preset-aware so that other callers can
+//! reuse the same measurement at a different scale.
+
+pub mod options;
+pub mod preset;
+pub mod workloads;
+
+mod cancel;
+mod preflight;
+mod sampler;
+
+pub use options::BenchOptions;
+pub use preset::Preset;
+
+use crate::{
+    SCHEMA_VERSION, diagnosis, integrations, live_llm,
+    metrics::families,
+    model::{Report, RunConfig, RunKind, SystemSample},
+    system,
+};
+use anyhow::{Context, Result};
+use cancel::check_cancel;
+use chrono::Utc;
+use sampler::SamplerGuard;
+use std::{
+    path::Path,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
+};
+use tempfile::Builder;
+use uuid::Uuid;
+
+/// Total phases announced in progress output.
+const PHASE_COUNT: usize = 8;
+
+/// Fallback minimum live-LLM window for presets that declare no minimum duration.
+const DEFAULT_LIVE_MINIMUM: Duration = Duration::from_secs(30);
+
+/// Headroom left before the preset duration limit when budgeting the live-LLM phase.
+const LIVE_PHASE_MARGIN: Duration = Duration::from_secs(10);
+
+/// Run a benchmark, installing a Ctrl+C handler for cooperative cancellation.
+pub fn run(preset: Preset, target: &Path, options: BenchOptions) -> Result<Report> {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let handler_cancel = cancel.clone();
+    let _ = ctrlc::set_handler(move || handler_cancel.store(true, Ordering::Relaxed));
+    run_with_cancel(preset, target, options, cancel)
+}
+
+/// Run a benchmark against a caller-owned cancellation flag.
+///
+/// The TUI uses this so that `q` and Escape share one cancellation path with Ctrl+C.
+pub fn run_with_cancel(
+    preset: Preset,
+    target: &Path,
+    options: BenchOptions,
+    cancel: Arc<AtomicBool>,
+) -> Result<Report> {
+    let limits = preset.limits();
+    let started = Instant::now();
+    let mut inventory = system::inventory(options.elevated);
+    let memory_size = limits.memory_size(inventory.memory_bytes);
+    preflight::ensure_free_space(target, &limits)?;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let shared_samples = Arc::new(Mutex::new(Vec::<SystemSample>::new()));
+    let mut sampler = SamplerGuard::spawn(stop.clone(), shared_samples.clone(), started);
+    let temp = Builder::new()
+        .prefix(".agentbench-tmp-")
+        .tempdir_in(target)
+        .context("create benchmark temporary directory")?;
+    let mut metrics = Vec::new();
+    let mut warnings = Vec::new();
+
+    phase(1, "CPU benchmark");
+    metrics.extend(workloads::cpu::run(limits.cpu_seconds, &cancel)?);
+    check_cancel(&cancel)?;
+
+    phase(
+        2,
+        &format!(
+            "Memory benchmark ({:.0} MiB)",
+            memory_size as f64 / 1_048_576.0
+        ),
+    );
+    metrics.extend(workloads::memory::run(memory_size as usize, &cancel)?);
+    check_cancel(&cancel)?;
+
+    phase(
+        3,
+        &format!(
+            "Filesystem benchmark ({:.0} MiB, {} small files)",
+            limits.disk_working_set as f64 / 1_048_576.0,
+            limits.small_files
+        ),
+    );
+    metrics.extend(workloads::filesystem::run(
+        temp.path(),
+        limits.disk_working_set,
+        limits.small_files,
+        &cancel,
+    )?);
+    check_cancel(&cancel)?;
+
+    phase(
+        4,
+        &format!("SQLite benchmark ({} rows)", limits.sqlite_rows),
+    );
+    metrics.extend(workloads::sqlite::run(
+        temp.path(),
+        limits.sqlite_rows,
+        &cancel,
+    )?);
+    check_cancel(&cancel)?;
+
+    phase(5, "Process launch benchmark");
+    metrics.extend(workloads::process::run()?);
+    check_cancel(&cancel)?;
+
+    phase(6, "Loopback/network benchmark");
+    metrics.extend(workloads::network::loopback()?);
+    check_cancel(&cancel)?;
+
+    if !options.offline {
+        match workloads::network::https(limits.network_samples, &cancel) {
+            Ok(found) => metrics.extend(found),
+            Err(error) => warnings.push(format!("internet benchmark skipped after error: {error}")),
+        }
+    }
+
+    let mut profiles = Vec::new();
+    let mut llm_runs = Vec::new();
+    if options.live_llm {
+        phase(7, "Live Claude benchmark (paid API/subscription traffic)");
+        let minimum = if limits.minimum_duration.is_zero() {
+            DEFAULT_LIVE_MINIMUM
+        } else {
+            limits.minimum_duration
+        };
+        let live = live_llm::run_suite(
+            &live_llm::LiveOptions {
+                route: options.llm_route,
+                model: options.llm_model.clone(),
+                max_cost_usd: options.llm_cost_cap_usd,
+                headroom_port: options.headroom_port,
+                minimum_total_duration: minimum,
+                maximum_total_duration: limits.duration_limit.saturating_sub(LIVE_PHASE_MARGIN),
+            },
+            target,
+            temp.path(),
+            started,
+            &cancel,
+        )?;
+        metrics.extend(live.metrics);
+        profiles.extend(live.profiles);
+        llm_runs.extend(live.runs);
+        warnings.extend(live.warnings);
+    } else {
+        phase(7, "Live Claude benchmark skipped (--no-live-llm)");
+    }
+
+    phase(8, "Agent integrations");
+    let (integrations, mut unavailable) = integrations::collect(target, options.elevated);
+    for integration in &integrations {
+        if let Some(version) = &integration.version {
+            inventory
+                .tool_versions
+                .insert(integration.name.clone(), version.clone());
+        }
+        if let Some(elapsed) = integration.elapsed_ms {
+            metrics.push(families::TOOL_STARTUP_MS.scalar(&integration.name, elapsed as f64));
+        }
+    }
+
+    if started.elapsed() < limits.minimum_duration {
+        metrics.push(workloads::soak::run(
+            temp.path(),
+            limits.minimum_duration.saturating_sub(started.elapsed()),
+            &cancel,
+        )?);
+    }
+
+    sampler.stop();
+    let samples = Arc::try_unwrap(shared_samples)
+        .map(|m| m.into_inner().unwrap_or_default())
+        .unwrap_or_else(|arc| arc.lock().map(|v| v.clone()).unwrap_or_default());
+    if started.elapsed() > limits.duration_limit {
+        warnings.push(format!(
+            "preset target duration exceeded: {:.1}s > {}s",
+            started.elapsed().as_secs_f64(),
+            limits.duration_limit.as_secs()
+        ));
+    }
+    unavailable
+        .push("per-process network attribution is not portable without kernel tracing".into());
+
+    let mut findings = diagnosis::analyze(&metrics, &samples, &profiles);
+    findings.extend(diagnosis::analyze_live_llm(&llm_runs));
+    findings.extend(diagnosis::analyze_integrations(&integrations));
+
+    Ok(Report {
+        schema_version: SCHEMA_VERSION,
+        tool_version: env!("CARGO_PKG_VERSION").into(),
+        run_id: Uuid::new_v4().to_string(),
+        created_at: Utc::now(),
+        kind: RunKind::Benchmark,
+        inventory,
+        config: RunConfig {
+            preset: Some(limits.name.into()),
+            target_hash: Some(system::hash_private(target.to_string_lossy().as_bytes())),
+            offline: options.offline,
+            elevated_requested: options.elevated,
+            duration_limit_seconds: Some(limits.duration_limit.as_secs()),
+            disk_limit_bytes: Some(limits.disk_limit),
+            memory_limit_bytes: Some(memory_size),
+            experiment_hash: None,
+            live_llm: options.live_llm,
+            llm_route: Some(format!("{:?}", options.llm_route).to_ascii_lowercase()),
+            llm_model: options.live_llm.then(|| options.llm_model.clone()),
+            llm_cost_cap_usd: options.live_llm.then_some(options.llm_cost_cap_usd),
+        },
+        metrics,
+        samples,
+        profiles,
+        llm_runs,
+        integrations,
+        findings,
+        warnings,
+        unavailable,
+    })
+}
+
+/// Announce a phase on stdout, matching the `[n/8] label` progress format.
+fn phase(number: usize, label: &str) {
+    println!("[{number}/{PHASE_COUNT}] {label}");
+}

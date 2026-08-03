@@ -1,9 +1,13 @@
 use crate::{
+    metrics,
     model::{Metric, Report},
     report,
 };
 use anyhow::{Result, bail};
 use std::{collections::BTreeMap, fs, path::Path};
+
+/// Percentage change past which a matched-run delta is called a regression or an improvement.
+const REGRESSION_THRESHOLD_PCT: f64 = 10.0;
 
 pub fn run(baseline_path: &Path, candidate_path: &Path, output: Option<&Path>) -> Result<()> {
     let baseline = report::read_report(baseline_path)?;
@@ -186,27 +190,8 @@ pub fn comparison_markdown(baseline: &Report, candidate: &Report) -> String {
             } else {
                 (candidate_metric.value - base.value) / base.value * 100.0
             };
-            let informational = is_informational_metric(&candidate_metric.name);
-            let regression = if candidate_metric.lower_is_better {
-                change > 10.0
-            } else {
-                change < -10.0
-            };
-            let improvement = if candidate_metric.lower_is_better {
-                change < -10.0
-            } else {
-                change > 10.0
-            };
-            let interpretation = if informational {
-                "informational"
-            } else if regression {
-                "regression"
-            } else if improvement {
-                "improvement"
-            } else {
-                "similar"
-            };
-            let description = metric_description(candidate_metric);
+            let interpretation = interpretation(candidate_metric, change);
+            let description = metrics::describe_with_direction(candidate_metric);
             output.push_str(&format!(
                 "| `{}`<br><sub>{}</sub> | {:.2} {} | {:.2} {} | {:+.1}% | {} |\n",
                 candidate_metric.name,
@@ -237,89 +222,27 @@ pub fn comparison_markdown(baseline: &Report, candidate: &Report) -> String {
     output
 }
 
-fn metric_description(metric: &Metric) -> String {
-    let direction = if metric.lower_is_better {
-        "Lower is better."
-    } else {
-        "Higher is better."
-    };
-    let description = match metric.name.as_str() {
-        "cpu.single_mops_s" => {
-            "Single-thread integer work completed per second; reflects one-core execution speed."
-        }
-        "cpu.multi_mops_s" => {
-            "Integer work completed across all logical processors; reflects sustained parallel CPU capacity."
-        }
-        "cpu.multi_elapsed_ms" => {
-            "Observed wall time of the fixed-duration multi-core phase; mainly indicates scheduling or shutdown overrun."
-        }
-        "memory.write_gib_s" => {
-            "Sequential speed while filling the benchmark memory buffer; affected by CPU, RAM, and power limits."
-        }
-        "memory.read_gib_s" => {
-            "Speed while sampling the benchmark memory buffer; affected by cache hierarchy and memory bandwidth."
-        }
-        "filesystem.sequential_write_mib_s" => {
-            "Large-file write throughput on the selected target volume, including the final flush."
-        }
-        "filesystem.sequential_read_mib_s" => {
-            "Large-file read throughput on the selected target volume; OS filesystem cache may contribute."
-        }
-        "filesystem.small_file_ops_s" => {
-            "Combined create, metadata-stat, rename, and delete operations per second across many small files."
-        }
-        "filesystem.small_file_total_ms" => {
-            "Total wall time for the complete small-file create/stat/rename/delete workload."
-        }
-        "filesystem.sustained_seek_ops_s" => {
-            "Repeated small-file metadata and read operations during the preset duration-filling phase."
-        }
-        "sqlite.insert_rows_s" => {
-            "Rows inserted per second into the generated indexed SQLite database in one transaction."
-        }
-        "sqlite.lookup_ms" => "Latency of indexed point lookups in the generated SQLite database.",
-        "process.spawn_ms" => "Time to launch and complete a minimal child AgentBench process.",
-        "network.loopback_connect_ms" => {
-            "TCP connection setup latency through the local operating-system network stack."
-        }
-        "network.loopback_mib_s" => {
-            "TCP throughput over localhost; exercises CPU, memory copies, and the OS network stack without internet variability."
-        }
-        "network.https_latency_ms" => {
-            "End-to-end HTTPS request latency to the public Anthropic endpoint, including network and TLS effects."
-        }
-        "llm.total_cost_usd" => {
-            "Total provider-reported cost of all live cases completed in this run; depends on run count and is informational."
-        }
-        "llm.phase_wall_seconds" => {
-            "Wall time spent in the live-LLM phase; depends on how many cases fit in the preset budget and is informational."
-        }
-        name if name.starts_with("tool.") && name.ends_with("_startup_ms") => {
-            "Wall time for the named local tool or integration probe to start and return its diagnostic result."
-        }
-        name if name.starts_with("llm.") && name.ends_with(".wall_ms") => {
-            "End-to-end wall time for the named live Claude route and scenario, including local CLI startup and provider work."
-        }
-        name if name.starts_with("llm.") && name.ends_with(".ttft_stream_ms") => {
-            "Time from launching the live Claude case until the first streamed response token arrived."
-        }
-        name if name.starts_with("llm.") && name.ends_with(".output_tokens_s") => {
-            "Provider-reported output tokens divided by measured generation time after the first streamed token."
-        }
-        _ => "Benchmark value emitted by the corresponding AgentBench phase.",
-    };
-    if is_informational_metric(&metric.name) {
-        description.to_string()
-    } else {
-        format!("{description} {direction}")
+/// Classify a percentage change between two matched single runs.
+///
+/// The threshold is deliberately coarse: two controlled runs give one observation each, so anything
+/// finer would read noise as signal. The watch dashboard compares distributions instead and uses its
+/// own criterion.
+fn interpretation(metric: &Metric, change: f64) -> &'static str {
+    if metrics::is_informational(&metric.name) {
+        return "informational";
     }
-}
-
-fn is_informational_metric(name: &str) -> bool {
-    matches!(
-        name,
-        "llm.total_cost_usd" | "llm.phase_wall_seconds" | "cpu.multi_elapsed_ms"
-    )
+    let signed = if metric.lower_is_better {
+        -change
+    } else {
+        change
+    };
+    if signed > REGRESSION_THRESHOLD_PCT {
+        "improvement"
+    } else if signed < -REGRESSION_THRESHOLD_PCT {
+        "regression"
+    } else {
+        "similar"
+    }
 }
 
 fn difference(output: &mut String, name: &str, baseline: &str, candidate: &str) {
@@ -361,26 +284,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn descriptions_cover_static_and_dynamic_metrics() {
-        let cpu = Metric::scalar("cpu.single_mops_s", 1.0, "Mops/s", false, "cpu");
-        assert!(metric_description(&cpu).contains("Single-thread"));
-        assert!(metric_description(&cpu).contains("Higher is better"));
+    fn rendered_descriptions_carry_prose_and_direction() {
+        let cpu = crate::metrics::catalog::CPU_SINGLE_MOPS_S.scalar(1.0);
+        let text = metrics::describe_with_direction(&cpu);
+        assert!(text.contains("Single-thread"));
+        assert!(text.contains("Higher is better"));
 
-        let llm = Metric::scalar(
-            "llm.headroom.file_seek.ttft_stream_ms",
-            1.0,
-            "ms",
-            true,
-            "live_llm",
-        );
-        assert!(metric_description(&llm).contains("first streamed response token"));
-        assert!(metric_description(&llm).contains("Lower is better"));
+        let llm = crate::metrics::families::LLM_CASE_TTFT_STREAM_MS
+            .distribution("headroom.file_seek", &[1.0]);
+        let text = metrics::describe_with_direction(&llm);
+        assert!(text.contains("first streamed response token"));
+        assert!(text.contains("Lower is better"));
     }
 
     #[test]
-    fn totals_with_variable_case_counts_are_informational() {
-        assert!(is_informational_metric("llm.total_cost_usd"));
-        assert!(is_informational_metric("llm.phase_wall_seconds"));
-        assert!(!is_informational_metric("llm.direct.latency.wall_ms"));
+    fn direction_decides_whether_a_change_is_a_regression() {
+        let higher_is_better = Metric::scalar("cpu.single_mops_s", 1.0, "Mops/s", false, "cpu");
+        assert_eq!(interpretation(&higher_is_better, -25.0), "regression");
+        assert_eq!(interpretation(&higher_is_better, 25.0), "improvement");
+
+        let lower_is_better = Metric::scalar("sqlite.lookup_ms", 1.0, "ms", true, "sqlite");
+        assert_eq!(interpretation(&lower_is_better, 25.0), "regression");
+        assert_eq!(interpretation(&lower_is_better, -25.0), "improvement");
+    }
+
+    #[test]
+    fn changes_inside_the_threshold_are_similar() {
+        let metric = Metric::scalar("cpu.single_mops_s", 1.0, "Mops/s", false, "cpu");
+        assert_eq!(interpretation(&metric, 9.9), "similar");
+        assert_eq!(interpretation(&metric, -9.9), "similar");
+        assert_eq!(interpretation(&metric, 0.0), "similar");
+    }
+
+    #[test]
+    fn informational_metrics_are_never_regressions() {
+        let cost = Metric::scalar("llm.total_cost_usd", 1.0, "USD", true, "live_llm");
+        assert_eq!(interpretation(&cost, 500.0), "informational");
+        let wall = Metric::scalar("llm.direct.latency.wall_ms", 1.0, "ms", true, "live_llm");
+        assert_eq!(interpretation(&wall, 500.0), "regression");
     }
 }

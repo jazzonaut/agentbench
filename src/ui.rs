@@ -1,3 +1,4 @@
+use crate::process_tree;
 use anyhow::{Result, bail};
 use crossterm::{
     cursor,
@@ -16,7 +17,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use sysinfo::{Pid, ProcessesToUpdate, System};
+use sysinfo::{ProcessesToUpdate, System};
 
 struct TerminalGuard;
 impl TerminalGuard {
@@ -111,23 +112,11 @@ pub fn dashboard(pid: Option<u32>, name: Option<&str>, interval_ms: u64) -> Resu
         system.refresh_processes(ProcessesToUpdate::All, true);
         system.refresh_cpu_all();
         system.refresh_memory();
-        let root = select_process(&system, pid, name);
+        let root = process_tree::select(&system, pid, name.unwrap_or("claude"));
         let processes = root
-            .map(|root| tree_pids(&system, root))
+            .map(|root| process_tree::descendants(&system, root))
             .unwrap_or_default();
-        let mut cpu = 0.0_f32;
-        let mut rss = 0_u64;
-        let mut read = 0_u64;
-        let mut written = 0_u64;
-        for process_pid in &processes {
-            if let Some(process) = system.process(*process_pid) {
-                cpu += process.cpu_usage();
-                rss += process.memory();
-                let disk = process.disk_usage();
-                read += disk.total_read_bytes;
-                written += disk.total_written_bytes;
-            }
-        }
+        let usage = process_tree::usage(&system, &processes);
         draw_header("AgentBench live dashboard")?;
         println_line(
             format!("Elapsed       {:>8.1} s", started.elapsed().as_secs_f64()),
@@ -162,21 +151,33 @@ pub fn dashboard(pid: Option<u32>, name: Option<&str>, interval_ms: u64) -> Resu
                 format!("Observed root {} ({})", root.as_u32(), process_name),
                 Color::Green,
             )?;
-            println_line(format!("Tree CPU      {:>8.1} %", cpu), Color::Cyan)?;
             println_line(
-                format!("Tree RSS      {:>8.1} MiB", rss as f64 / 1_048_576.0),
+                format!("Tree CPU      {:>8.1} %", usage.cpu_percent),
+                Color::Cyan,
+            )?;
+            println_line(
+                format!(
+                    "Tree RSS      {:>8.1} MiB",
+                    usage.rss_bytes as f64 / 1_048_576.0
+                ),
                 Color::Magenta,
             )?;
             println_line(
-                format!("Tree processes{:>8}", processes.len()),
+                format!("Tree processes{:>8}", usage.process_count),
                 Color::White,
             )?;
             println_line(
-                format!("Total reads   {:>8.1} MiB", read as f64 / 1_048_576.0),
+                format!(
+                    "Total reads   {:>8.1} MiB",
+                    usage.read_bytes as f64 / 1_048_576.0
+                ),
                 Color::Blue,
             )?;
             println_line(
-                format!("Total writes  {:>8.1} MiB", written as f64 / 1_048_576.0),
+                format!(
+                    "Total writes  {:>8.1} MiB",
+                    usage.written_bytes as f64 / 1_048_576.0
+                ),
                 Color::Blue,
             )?;
         } else {
@@ -218,43 +219,4 @@ fn println_line(value: String, color: Color) -> Result<()> {
         ResetColor
     )?;
     Ok(())
-}
-
-fn select_process(system: &System, pid: Option<u32>, name: Option<&str>) -> Option<Pid> {
-    if let Some(pid) = pid {
-        let pid = Pid::from_u32(pid);
-        return system.process(pid).map(|_| pid);
-    }
-    let needle = name.unwrap_or("claude").to_ascii_lowercase();
-    system
-        .processes()
-        .iter()
-        .filter(|(_, p)| {
-            p.name()
-                .to_string_lossy()
-                .to_ascii_lowercase()
-                .contains(&needle)
-        })
-        .max_by_key(|(_, p)| p.run_time())
-        .map(|(pid, _)| *pid)
-}
-
-fn tree_pids(system: &System, root: Pid) -> Vec<Pid> {
-    let mut result = vec![root];
-    loop {
-        let before = result.len();
-        for (pid, process) in system.processes() {
-            if process
-                .parent()
-                .is_some_and(|parent| result.contains(&parent))
-                && !result.contains(pid)
-            {
-                result.push(*pid);
-            }
-        }
-        if result.len() == before {
-            break;
-        }
-    }
-    result
 }
