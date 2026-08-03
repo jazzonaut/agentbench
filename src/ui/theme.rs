@@ -4,10 +4,13 @@
 //! places by coincidence rather than by rule, and a whole line — its label as much as its number — was
 //! tinted. Both are fixed here by giving colour a job:
 //!
-//! - **Text wears text ink.** Labels, values and hints use [`label`], [`value`] and [`hint`]. A number is
-//!   never tinted to mean something; the mark beside it carries that.
+//! - **Data text wears text ink.** Labels, values and hints use [`label`], [`value`] and [`hint`]. A number
+//!   is never tinted to mean something; the mark beside it carries that. Chrome is the exception, and only
+//!   because chrome cannot be misread: a heading or a key hint is structure, so [`accent`] tints it without
+//!   any risk of reading as a measurement or a verdict.
 //! - **Status colours are reserved.** [`good`] through [`critical`] mean state and nothing else, so a
-//!   series can never be drawn in a colour that reads as "critical".
+//!   series can never be drawn in a colour that reads as "critical". [`accent`] is reserved the same way,
+//!   in the other direction: no series or status may use it, so it always means "structure".
 //! - **Series colours are a fixed order, never cycled.** [`series`] runs out rather than wrapping around
 //!   to repeat a hue that is already on screen meaning something else.
 //! - **No backgrounds, and no black or white.** The terminal's own palette is the user's, and a hardcoded
@@ -28,9 +31,33 @@ const WARNING_AT: f64 = 0.75;
 /// Utilisation at which a meter reads as a problem rather than a load.
 const SERIOUS_AT: f64 = 0.90;
 
+/// Chrome: headings, key hints, the focus marker.
+///
+/// One hue for everything that frames the data rather than being it, which is what stops the accent from
+/// becoming decoration — a reader who learns it once can tell structure from reading anywhere on any screen.
+pub fn accent() -> Color {
+    Color::Cyan
+}
+
+/// Text ink, stated explicitly.
+///
+/// [`value`] leaves the foreground alone, which is right for body text and wrong inside a heading: a span
+/// with no colour of its own inherits the line's, so a word in a panel title comes out [`accent`] whether it
+/// meant to or not. This is how a span says "not the accent" without naming a colour of its own.
+pub fn ink() -> Color {
+    Color::Reset
+}
+
 /// A screen or panel heading.
+///
+/// `DIM` is removed rather than merely absent: a block's title is drawn over its border area, so a bordered
+/// panel's recessive [`border`] style reaches the title and dims it unless this says otherwise. That was
+/// costing every panel heading in the tool its weight.
 pub fn heading() -> Style {
-    Style::default().add_modifier(Modifier::BOLD)
+    Style::default()
+        .fg(accent())
+        .add_modifier(Modifier::BOLD)
+        .remove_modifier(Modifier::DIM)
 }
 
 /// The name of a field. Secondary ink: present, not competing with its value.
@@ -61,8 +88,14 @@ pub fn selected() -> Style {
 }
 
 /// Text that is unavailable rather than merely low — a missing process, an unsupported platform.
+///
+/// Drops `BOLD` as well as adding dimness, because the two contradict each other and a style that only adds
+/// cannot say so: used inside a heading, this would otherwise come out bold and dim at once, which terminals
+/// resolve however they like.
 pub fn absent() -> Style {
-    Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC)
+    Style::default()
+        .add_modifier(Modifier::DIM | Modifier::ITALIC)
+        .remove_modifier(Modifier::BOLD)
 }
 
 /// Status: nothing to report.
@@ -104,14 +137,14 @@ pub fn pressure(ratio: f64) -> Color {
 /// Identity colours for distinct data series, in fixed order.
 ///
 /// Returns `None` past the end rather than wrapping. A repeated hue on one screen says two series are
-/// the same thing, and none of these overlap the status colours above, so a series can never accidentally
-/// read as a verdict.
+/// the same thing, and none of these overlap the status colours above or [`accent`], so a series can never
+/// accidentally read as a verdict or as part of the frame.
 pub fn series(index: usize) -> Option<Color> {
     const ORDER: [Color; 4] = [
-        Color::Cyan,
         Color::Magenta,
         Color::Blue,
         Color::LightMagenta,
+        Color::LightBlue,
     ];
     ORDER.get(index).copied()
 }
@@ -146,6 +179,21 @@ mod tests {
             index += 1;
         }
         assert!(index > 1, "there should be more than one series colour");
+    }
+
+    /// The reservation that keeps the frame from reading as data, and data from reading as the frame.
+    #[test]
+    fn the_accent_is_neither_a_status_nor_a_series_colour() {
+        let statuses = [good(), warning(), serious(), critical()];
+        assert!(
+            !statuses.contains(&accent()),
+            "the accent uses a reserved status colour"
+        );
+        let mut index = 0;
+        while let Some(colour) = series(index) {
+            assert_ne!(colour, accent(), "series {index} uses the chrome accent");
+            index += 1;
+        }
     }
 
     /// The reservation that keeps a series from reading as a verdict.

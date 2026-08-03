@@ -76,7 +76,7 @@ impl<'a> History<'a> {
             label,
             value,
             series,
-            colour: theme::series(0).unwrap_or(Color::Cyan),
+            colour: theme::series(0).unwrap_or_default(),
             label_width: text_width(label),
             max: None,
         }

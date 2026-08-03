@@ -67,9 +67,21 @@ All notable changes to AgentBench are documented here. The project follows [Sema
   competed with a working agent could be recorded as comparable. Measured on one machine: the first probe
   said no agent was active where the second and third, with the same thirty-seven-process agent tree in
   front of them, said one was.
+- **The terminal screens have a colour for their own structure.** 0.5.0 gave colour a job but gave chrome
+  none, so every panel title, heading and key hint was grey and the screens read as greyscale whatever the
+  data was doing. Cyan is now reserved for structure — titles, section headings, bracketed key
+  hints, the control centre's focus marker — and reserved in both directions: it left the series palette, so
+  the process-tree CPU plot keeps its blue while the system CPU plot and the benchmark's phase gauge move
+  from cyan to magenta. A hue can still only mean one thing, and the control centre's status band now tints
+  the one word in its title that is a state rather than a label: green while collecting, dim when not.
 
 ### Fixed
 
+- **A panel title is no longer dimmed by its own border.** Titles are drawn over the border area, so the
+  deliberately recessive border style reached them and every bordered heading in the tool came out bold
+  *and* dim at once — which is part of why the screens read as greyscale. The heading style now says it is
+  not dim, and a test renders a panel and checks the pixels, since neither end of that interaction says
+  anything about the other.
 - `filesystem.sequential_write_mib_s` divides the bytes actually written by the elapsed time rather than
   the bytes requested. Every caller today passes a multiple of the 1 MiB block size, so the two agreed;
   the point is that they stop agreeing silently.

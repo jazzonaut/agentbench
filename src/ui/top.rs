@@ -271,6 +271,27 @@ mod tests {
         terminal.draw(|frame| app.draw(frame)).expect("draw");
     }
 
+    /// A panel title is drawn *over* the block's border area, so the recessive border style reaches it and
+    /// will dim the heading unless [`theme::heading`] removes it. Nothing about the code at either end says
+    /// so, and the screens spent a release quietly dim, so the guard lives where it can see the pixels.
+    #[test]
+    fn a_panel_title_keeps_its_colour_and_weight_over_a_dim_border() {
+        let mut app = App::new(Some(std::process::id()), "claude");
+        app.refresh();
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).expect("test terminal");
+        terminal.draw(|frame| app.draw(frame)).expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+        let title = (0..60)
+            .map(|column| &buffer[(column, 0)])
+            .find(|cell| cell.symbol().starts_with('S'))
+            .expect("the System title should be on the top border row");
+        assert_eq!(title.fg, theme::accent(), "a heading wears the accent");
+        assert!(
+            !title.modifier.contains(ratatui::style::Modifier::DIM),
+            "the border style should not dim the heading"
+        );
+    }
+
     #[test]
     fn the_screen_draws_at_a_comfortable_size() {
         draw_at(100, 30);

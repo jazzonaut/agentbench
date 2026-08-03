@@ -31,7 +31,7 @@ use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
     style::Style,
-    text::Line,
+    text::{Line, Span},
     widgets::{Block, Paragraph, Wrap},
 };
 use std::time::{Duration, Instant};
@@ -286,17 +286,24 @@ impl App {
             .as_ref()
             .and_then(|status| status.as_ref().ok())
             .is_some_and(|report| report.daemon_running);
+        // Spans rather than one formatted string, because the state word is the only part of this title that
+        // means something: it wears a status colour while the name around it keeps the heading's. Not
+        // collecting is dim rather than a warning — a daemon that is off is often off on purpose.
+        // Both arms name a colour, because a span inside a title inherits the heading's: `absent` alone sets
+        // modifiers only, which would leave "not collecting" italic in the accent rather than out of the way.
+        let (state, state_style) = if running {
+            ("collecting", Style::default().fg(theme::good()))
+        } else {
+            ("not collecting", theme::absent().fg(theme::ink()))
+        };
         let block = Block::bordered()
             .border_style(theme::border())
             .title_style(theme::heading())
-            .title(format!(
-                " AgentBench — {} ",
-                if running {
-                    "collecting"
-                } else {
-                    "not collecting"
-                }
-            ));
+            .title(Line::from(vec![
+                Span::raw(" AgentBench — "),
+                Span::styled(state, state_style),
+                Span::raw(" "),
+            ]));
         let inner = block.inner(area);
         frame.render_widget(block, area);
         if inner.height == 0 {
@@ -312,8 +319,8 @@ impl App {
                 .take(inner.height as usize)
                 .map(|(label, value)| {
                     Line::from(vec![
-                        ratatui::text::Span::styled(format!("{label:<16}"), theme::label()),
-                        ratatui::text::Span::styled(value, theme::value()),
+                        Span::styled(format!("{label:<16}"), theme::label()),
+                        Span::styled(value, theme::value()),
                     ])
                 })
                 .collect(),
@@ -392,7 +399,7 @@ impl App {
             Line::styled(
                 if focused { "▸" } else { " " },
                 if focused {
-                    Style::default()
+                    Style::default().fg(theme::accent())
                 } else {
                     theme::hint()
                 },
@@ -474,6 +481,29 @@ mod tests {
         app.handle(KeyCode::Enter, KeyModifiers::NONE);
         assert!(app.editing.is_some(), "Enter should open the editor");
         draw_at(&app, 100, 40);
+    }
+
+    /// The state word is the only part of the title that means anything, so it has to leave the heading's
+    /// accent behind rather than inherit it — a span that sets modifiers only would come out italic in cyan.
+    #[test]
+    fn the_state_word_in_the_title_is_not_drawn_in_the_accent() {
+        let app = app();
+        let mut terminal = Terminal::new(TestBackend::new(60, 40)).expect("test terminal");
+        terminal.draw(|frame| app.draw(frame)).expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+        // No daemon runs against this data directory, so the band reports "not collecting" in text ink.
+        // Found past the em dash rather than by letter: "AgentBench" has an n of its own, in the accent.
+        let row: Vec<_> = (0..60).map(|column| &buffer[(column, 0)]).collect();
+        let dash = row
+            .iter()
+            .position(|cell| cell.symbol() == "—")
+            .expect("the title should hold an em dash");
+        let state = row[dash..]
+            .iter()
+            .find(|cell| cell.symbol().starts_with('n'))
+            .expect("the state word should follow the em dash");
+        assert_eq!(state.fg, theme::ink(), "the off state wears text ink");
+        assert_ne!(state.fg, theme::accent(), "and not the accent around it");
     }
 
     #[test]

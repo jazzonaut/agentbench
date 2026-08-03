@@ -4,6 +4,7 @@ use crate::ui::theme;
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
+    style::Style,
     text::{Line, Span},
     widgets::Widget,
 };
@@ -50,7 +51,12 @@ impl Widget for Footer<'_> {
             if index > 0 {
                 spans.push(Span::styled("  ", theme::hint()));
             }
-            spans.push(Span::styled(format!("[{key}]"), theme::value()));
+            // The key is the affordance and the action is the explanation, so the key wears the accent: it
+            // is what the eye needs to find on a line it is otherwise meant to ignore.
+            spans.push(Span::styled(
+                format!("[{key}]"),
+                Style::default().fg(theme::accent()),
+            ));
             spans.push(Span::styled(format!(" {action}"), theme::hint()));
         }
         // Truncation is ratatui's: a `Line` longer than its area is cut at the edge rather than wrapped,
