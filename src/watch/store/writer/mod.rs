@@ -1,8 +1,14 @@
 //! The single writer: the only thing in the process that mutates the database.
+//!
+//! This module owns the queue, the batching policy, and the transaction boundary. The statements
+//! themselves live in [`inserts`], so adding a stream means adding one function there rather than
+//! growing the loop.
 
-use crate::watch::store::records::{Event, Level, Record, Sample};
+pub mod inserts;
+
+use crate::watch::store::records::{Event, Level, Record};
 use anyhow::{Context, Result};
-use rusqlite::{Connection, params};
+use rusqlite::Connection;
 use std::{
     sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError},
     time::Duration,
@@ -13,9 +19,6 @@ const BATCH_SIZE: usize = 12;
 
 /// Longest a partial batch waits before being committed anyway.
 const BATCH_LINGER: Duration = Duration::from_secs(10);
-
-/// Events retained; older ones are trimmed so the table cannot grow without bound.
-const EVENT_RETENTION: i64 = 5_000;
 
 /// A cloneable handle collectors use to submit records.
 ///
@@ -56,7 +59,7 @@ impl Sink {
     /// Convenience for operational logging.
     pub fn log(&self, level: Level, source: &str, message: impl Into<String>) {
         self.send(Event {
-            ts: super::now_ms(),
+            ts: crate::watch::store::now_ms(),
             level,
             source: source.to_string(),
             message: message.into(),
@@ -96,59 +99,16 @@ fn flush(conn: &mut Connection, machine_id: &str, batch: &mut Vec<Record>) -> Re
     let mut events_written = false;
     for record in batch.drain(..) {
         match record {
-            Record::Sample(sample) => insert_sample(&tx, machine_id, &sample)?,
+            Record::Sample(sample) => inserts::sample(&tx, machine_id, &sample)?,
             Record::Event(event) => {
-                insert_event(&tx, &event)?;
+                inserts::event(&tx, &event)?;
                 events_written = true;
             }
         }
     }
     if events_written {
-        trim_events(&tx)?;
+        inserts::trim_events(&tx)?;
     }
     tx.commit().context("commit writer transaction")?;
-    Ok(())
-}
-
-/// `INSERT OR REPLACE` because a clock adjustment can produce a duplicate timestamp, and one
-/// overwritten sample is preferable to a failed batch.
-fn insert_sample(tx: &rusqlite::Transaction<'_>, machine_id: &str, sample: &Sample) -> Result<()> {
-    tx.execute(
-        "INSERT OR REPLACE INTO samples (machine_id, ts, cpu_percent, used_memory, total_memory,
-             used_swap, process_count, scanner_cpu, agent_cpu, agent_rss, agent_processes)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
-        params![
-            machine_id,
-            sample.ts,
-            sample.cpu_percent,
-            sample.used_memory,
-            sample.total_memory,
-            sample.used_swap,
-            sample.process_count,
-            sample.scanner_cpu,
-            sample.agent_cpu,
-            sample.agent_rss,
-            sample.agent_processes,
-        ],
-    )
-    .context("insert sample")?;
-    Ok(())
-}
-
-fn insert_event(tx: &rusqlite::Transaction<'_>, event: &Event) -> Result<()> {
-    tx.execute(
-        "INSERT INTO events (ts, level, source, message) VALUES (?1,?2,?3,?4)",
-        params![event.ts, event.level.as_str(), event.source, event.message],
-    )
-    .context("insert event")?;
-    Ok(())
-}
-
-fn trim_events(tx: &rusqlite::Transaction<'_>) -> Result<()> {
-    tx.execute(
-        "DELETE FROM events WHERE id <= (SELECT max(id) - ?1 FROM events)",
-        params![EVENT_RETENTION],
-    )
-    .context("trim events")?;
     Ok(())
 }
