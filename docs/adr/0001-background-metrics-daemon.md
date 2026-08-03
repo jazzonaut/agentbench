@@ -75,8 +75,8 @@ Transcripts carry no duration or TTFT fields. The following are derived from row
 
 | Metric | Derivation | Confound |
 |---|---|---|
-| tool latency | `assistant(tool_use).timestamp` → matching `user.toolUseResult.timestamp` via `sourceToolAssistantUUID` | permission waits inflate it |
-| TTFT proxy | user prompt row → first assistant row | includes local CLI overhead |
+| tool latency | `assistant(tool_use).timestamp` → matching `user.toolUseResult.timestamp`, linked by the result block's `tool_use_id` and falling back to `sourceToolAssistantUUID` | permission waits inflate it |
+| `first_response_ms` | user prompt row → first assistant row | contains the whole thinking block; a queued prompt waits before the request is sent |
 | tokens, cache ratio | `usage`, **deduped by `requestId`** | none once deduped |
 
 Read-only tool latency (`Read`, `Grep`, `Glob`, `Edit`) is the clean filesystem signal and is charted
@@ -84,7 +84,12 @@ by default. `Bash` latency is stored but not charted by default: it is dominated
 and legitimately long commands, so unfiltered it measures time away from the keyboard.
 
 One API request emits several assistant rows sharing a `requestId`, each repeating the *cumulative*
-`usage`. Summing naively multiplies token counts. Dedupe by `requestId` before aggregating.
+`usage`. Summing naively multiplies token counts. Dedupe by `requestId` before aggregating. Measured
+on 411 real transcripts: 1,844 of 2,926 requests emit more than one row.
+
+Failed, refused and interrupted calls are recorded with `ok = 0` and excluded from every latency
+series. Each returned early or spent its time waiting for a person, so including them would make the
+machine look faster the more went wrong. On real data they are 3.3% of calls.
 
 ## Consequences
 
@@ -138,8 +143,8 @@ One API request emits several assistant rows sharing a `requestId`, each repeati
 |---|---|---|
 | 0 | Prep refactor: split `bench.rs` into `bench/`, introduce `metrics/`. No behaviour change | **done** |
 | 1 | Spine: config, store with migrations, sampler, `events`, `--status`, one live tile and one chart | **done** |
-| 2 | Sessions: transcript parsing, derivation, watermarks, full backfill | next |
-| 3 | Probes: micro workloads, covariates, run markers | |
+| 2 | Sessions: transcript parsing, derivation, watermarks, full backfill | **done** |
+| 3 | Probes: micro workloads, covariates, run markers | next |
 | 4 | Analysis: baseline, verdicts, annotations, rollup and retention | |
 | 5 | Ship: README/CHANGELOG polish, autostart docs | mostly done in 1 |
 
@@ -151,6 +156,41 @@ One API request emits several assistant rows sharing a `requestId`, each repeati
 - **The `process_tree` consolidation landed in the phase 0 refactor commit** rather than with the
   feature, because it is behaviour-preserving cleanup of existing code and keeping it there made the
   phase 1 diff purely additive.
+- **"TTFT proxy" was renamed `first_response_ms`, by schema migration v2.** The design assumed the
+  confound was local CLI overhead. On real transcripts the interval has a median of about 15 seconds,
+  because an assistant row is written only once the whole first message exists and for a thinking model
+  that includes the entire thinking block. A column called `ttft_ms` holding 15,000 would have had
+  every chart, tooltip and future reader explaining that the number does not mean what it says. The
+  measurement is kept — it is a real end-to-end interval a person waits through — under a name that
+  claims no more than it delivers.
+- **`session_turns` gained a unique index on `(machine_id, request_id)`, also in v2.** Identifying a
+  turn by the row that happened to be read first is only correct if reading always starts at the top of
+  a request. An import that resumed between two rows of one request would otherwise record a second
+  turn carrying the same cumulative usage and inflate every token total downstream. The index turns the
+  dedupe rule from a convention the importer has to remember into something the database enforces. It
+  also, unplanned, handles resumed and forked sessions: 612 requests and 751 tool results appear in more
+  than one transcript file, because resuming a session copies its earlier rows into the new file.
+- **The watermark is "the earliest byte still needed", not "the last byte read".** A measurement spans
+  two rows, and the pair straddles the end of a pass whenever a tool call is in flight. Stopping at the
+  last byte read would silently lose those; re-reading a fixed stretch before it would re-read whole
+  files to catch them. The deriver instead reports the offset of the oldest row it is still waiting on,
+  which is usually a few hundred bytes back and often nothing at all. A resumed pass therefore reads
+  exactly the new bytes plus the open rows, and parser state never has to survive between passes — so a
+  long-running daemon and a freshly started one derive identically.
+- **Tool-version capture moved into phase 2** from the phase-4 annotation work. The version appears
+  only in transcripts, so recovering it later would mean a second full pass over every file. Collecting
+  it while the bytes are already being read costs about fifteen lines and yielded 20 versions with
+  first-seen dates on the first run.
+- **The writer now drains its queue before committing** rather than committing every dozen records. A
+  backfill submits tens of thousands of rows at once; a transaction per dozen made that thousands of
+  commits. Batch size now follows the producers: one sample commits immediately, a backfill commits
+  thousands at a time. This also removed the linger timer, since every drain ends in a commit and no
+  partial batch is ever left waiting.
+- **Transcript discovery had to go deeper than the documented layout.** Subagent transcripts live under
+  `<session>/subagents/`, and those spawned inside a workflow under
+  `<session>/subagents/workflows/<workflow>/`. A four-level walk found 344 of 411 files and silently
+  dropped a fifth of the evidence; the cap is now eight levels, bounded by the file count rather than
+  by depth alone.
 - **Sampler priming was added and was not in the original design.** `sysinfo` derives CPU percentages
   from the delta between two refreshes, so the first reading of every session reported exactly 100%.
   Left in, each daemon restart would have planted a phantom spike that phase 4's baselines would have
@@ -174,7 +214,13 @@ Note that CI has no MSRV verification job, so `rust-version` is documentation ra
 enforced. Raising it does not break any build that currently passes, and equally would not catch an
 accidental use of a newer language feature.
 
-### Open questions carried into phase 2
+### Open questions carried into phase 3
 
 - **Whether `agentbench top` or the `bench` progress display is rewritten first.** The progress display
   is currently a static text list where gauges and a sparkline would help most; `top` already works.
+- **Whether `first_response_ms` deserves to be split.** It currently mixes queue wait, thinking time and
+  real latency. The transcript may carry enough to separate them — `queue-operation` rows exist, and a
+  thinking block's size is visible — but until something is measured that separation is speculation.
+- **Whether subagent activity should be distinguishable from the session that spawned it.** Both are
+  real work on this machine and both are imported, but a heavy workflow's tool calls currently blend
+  into the parent project's numbers, and neither table records which is which.

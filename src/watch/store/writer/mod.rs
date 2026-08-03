@@ -9,16 +9,14 @@ pub mod inserts;
 use crate::watch::store::records::{Event, Level, Record};
 use anyhow::{Context, Result};
 use rusqlite::Connection;
-use std::{
-    sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError},
-    time::Duration,
-};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
 
-/// Records buffered before a commit is forced.
-const BATCH_SIZE: usize = 12;
-
-/// Longest a partial batch waits before being committed anyway.
-const BATCH_LINGER: Duration = Duration::from_secs(10);
+/// Largest number of records committed in one transaction.
+///
+/// Bounded only to keep a transaction's memory and lock duration finite. Backfilling every transcript
+/// submits tens of thousands of rows at once, and a transaction per dozen would mean thousands of
+/// commits for work that belongs in a handful.
+const MAX_BATCH: usize = 2_000;
 
 /// A cloneable handle collectors use to submit records.
 ///
@@ -69,25 +67,23 @@ impl Sink {
 
 /// Drain `records` into `conn` until the channel closes.
 ///
-/// Runs on its own thread. Commits either when a batch fills or when [`BATCH_LINGER`] elapses, so a
-/// quiet machine still persists its samples promptly without one transaction per row.
+/// Runs on its own thread. Blocks for one record, takes whatever else is already queued, then
+/// commits. The batch size therefore follows the producers rather than a fixed number: a quiet
+/// machine commits its one sample immediately, and a backfill commits thousands per transaction.
+/// Because every drain ends in a commit, nothing is ever left waiting in a partial batch.
 pub fn run(mut conn: Connection, machine_id: &str, records: Receiver<Record>) -> Result<()> {
-    let mut batch: Vec<Record> = Vec::with_capacity(BATCH_SIZE);
-    loop {
-        match records.recv_timeout(BATCH_LINGER) {
-            Ok(record) => {
-                batch.push(record);
-                if batch.len() >= BATCH_SIZE {
-                    flush(&mut conn, machine_id, &mut batch)?;
-                }
-            }
-            Err(RecvTimeoutError::Timeout) => flush(&mut conn, machine_id, &mut batch)?,
-            Err(RecvTimeoutError::Disconnected) => {
-                flush(&mut conn, machine_id, &mut batch)?;
-                return Ok(());
+    let mut batch: Vec<Record> = Vec::new();
+    while let Ok(record) = records.recv() {
+        batch.push(record);
+        while batch.len() < MAX_BATCH {
+            match records.try_recv() {
+                Ok(next) => batch.push(next),
+                Err(_) => break,
             }
         }
+        flush(&mut conn, machine_id, &mut batch)?;
     }
+    Ok(())
 }
 
 /// Commit a batch in one transaction.
@@ -95,6 +91,7 @@ fn flush(conn: &mut Connection, machine_id: &str, batch: &mut Vec<Record>) -> Re
     if batch.is_empty() {
         return Ok(());
     }
+    let now = crate::watch::store::now_ms();
     let tx = conn.transaction().context("begin writer transaction")?;
     let mut events_written = false;
     for record in batch.drain(..) {
@@ -104,6 +101,10 @@ fn flush(conn: &mut Connection, machine_id: &str, batch: &mut Vec<Record>) -> Re
                 inserts::event(&tx, &event)?;
                 events_written = true;
             }
+            Record::Turn(turn) => inserts::turn(&tx, machine_id, &turn)?,
+            Record::ToolCall(call) => inserts::tool_call(&tx, machine_id, &call)?,
+            Record::ToolVersion(version) => inserts::tool_version(&tx, machine_id, &version)?,
+            Record::Watermark(mark) => inserts::watermark(&tx, &mark, now)?,
         }
     }
     if events_written {

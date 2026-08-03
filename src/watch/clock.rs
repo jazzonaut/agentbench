@@ -15,6 +15,30 @@ pub trait Clock: Send + Sync {
     ///
     /// Returning `false` means "stop"; a collector treats it as a cue to exit rather than tick again.
     fn sleep(&self, duration: Duration) -> bool;
+
+    /// Whether work should continue, without waiting.
+    ///
+    /// A collector whose unit of work is long — importing hundreds of transcripts, say — has to be
+    /// able to ask between units, or Ctrl+C waits for the whole batch. Asking through the clock keeps
+    /// the shutdown flag out of collectors, exactly as `sleep` does.
+    fn is_running(&self) -> bool {
+        self.sleep(Duration::ZERO)
+    }
+}
+
+/// Midnight this morning, local time, as milliseconds since the Unix epoch.
+///
+/// Days have to be local ones. Bucketing by UTC puts a European evening's work in tomorrow and an
+/// American morning's in yesterday, and the comparison the dashboard exists to make — today against
+/// the days before it — is then between the wrong things. Two days a year a local day is 23 or 25
+/// hours long, and one of them has no midnight at all in some zones, which is what `earliest` covers.
+pub fn local_day_start_ms() -> i64 {
+    use chrono::{Local, TimeZone};
+    let now = Local::now();
+    now.date_naive()
+        .and_hms_opt(0, 0, 0)
+        .and_then(|midnight| Local.from_local_datetime(&midnight).earliest())
+        .map_or_else(|| now.timestamp_millis(), |start| start.timestamp_millis())
 }
 
 /// Real time.
@@ -29,6 +53,31 @@ impl Clock for SystemClock {
     fn sleep(&self, duration: Duration) -> bool {
         std::thread::sleep(duration);
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::local_day_start_ms;
+
+    #[test]
+    fn the_day_starts_at_local_midnight_within_the_last_day() {
+        let start = local_day_start_ms();
+        let now = crate::watch::store::now_ms();
+        assert!(start <= now, "the day cannot start in the future");
+        // 25 hours, because a day that gains an hour is still one day.
+        assert!(
+            now - start < 25 * 60 * 60 * 1000,
+            "start {start}, now {now}"
+        );
+        let local = chrono::DateTime::from_timestamp_millis(start)
+            .expect("valid instant")
+            .with_timezone(&chrono::Local);
+        assert_eq!(
+            local.format("%H:%M:%S").to_string(),
+            "00:00:00",
+            "expected local midnight, got {local}"
+        );
     }
 }
 
@@ -72,6 +121,12 @@ mod fake {
     impl Clock for FakeClock {
         fn now_ms(&self) -> i64 {
             *self.now_ms.lock().unwrap()
+        }
+
+        /// Peek rather than sleep, so asking the question does not spend a tick and a test's expected
+        /// cadence stays readable.
+        fn is_running(&self) -> bool {
+            self.remaining.load(Ordering::SeqCst) > 0
         }
 
         fn sleep(&self, duration: Duration) -> bool {

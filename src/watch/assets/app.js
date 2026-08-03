@@ -1,6 +1,6 @@
 // Dashboard boot: polls the API, renders the live tiles, the history chart, and daemon health.
 
-import { percent, gib, mib, count, duration, dateTime } from './format.js';
+import { percent, gib, mib, count, duration, dateTime, latency, ratio } from './format.js';
 import { createChart } from './chart.js';
 
 /** Live tiles refresh on this cadence; the server samples independently of it. */
@@ -22,14 +22,24 @@ let selectedRange = RANGES.find((range) => range.label === '48h');
 const dom = {
   subtitle: document.getElementById('subtitle'),
   tiles: document.getElementById('tiles'),
+  today: document.getElementById('today'),
   ranges: document.getElementById('ranges'),
-  chart: document.getElementById('chart'),
-  chartEmpty: document.getElementById('chart-empty'),
   statusLine: document.getElementById('status-line'),
   events: document.querySelector('#events tbody'),
 };
 
-const chart = createChart(dom.chart, percent);
+/** Stacked charts, in reading order. Each owns one metric and one y-axis. */
+const CHARTS = [
+  { id: 'chart-cpu', metric: 'cpu_percent', format: percent, label: 'system CPU' },
+  { id: 'chart-tools', metric: 'tool_read_ms', format: latency, label: 'median latency' },
+].map((config) => {
+  const element = document.getElementById(config.id);
+  return {
+    ...config,
+    chart: createChart(element, config.format, config.label),
+    empty: document.querySelector(`[data-empty-for="${config.id}"]`),
+  };
+});
 
 /** Fetch JSON, surfacing the server's error message rather than a bare status code. */
 async function api(path) {
@@ -79,6 +89,35 @@ function renderTiles(live) {
   );
 }
 
+/** Today's agent activity, from the transcripts the daemon has already read. */
+function renderToday(today, dayStart) {
+  dom.today.replaceChildren();
+  if (!today || today.turns === 0) {
+    dom.today.append(
+      tile('No agent activity', `since ${dateTime(dayStart)}`, true),
+    );
+    return;
+  }
+  const projects = today.projects === 1 ? '1 project' : `${count(today.projects)} projects`;
+  dom.today.append(
+    tile(count(today.turns), `requests in ${count(today.sessions)} session(s)`),
+    tile(count(today.tool_calls), `tool calls · ${projects}`),
+    // Absent is not zero: no file-tool calls yet means nothing was measured, not that it was instant.
+    today.tool_read_p50_ms === null
+      ? tile('no calls yet', 'median file-tool latency', true)
+      : tile(latency(today.tool_read_p50_ms), 'median file-tool latency'),
+    tile(count(today.output_tokens), 'output tokens'),
+    today.cache_hit_ratio === null
+      ? tile('—', 'prompt cache hits', true)
+      : tile(ratio(today.cache_hit_ratio), 'prompt cache hits'),
+    tile(
+      today.last_activity_ts === null ? '—' : duration(Date.now() - today.last_activity_ts),
+      'since the last agent activity',
+      today.last_activity_ts === null,
+    ),
+  );
+}
+
 function renderStatus(status) {
   const fresh = status.collecting;
   dom.statusLine.replaceChildren();
@@ -101,6 +140,8 @@ function renderStatus(status) {
     `${count(status.health.samples)} samples`,
     `${count(status.health.probe_runs)} probes`,
     `${count(status.health.session_turns)} turns`,
+    `${count(status.health.session_tools)} tool calls`,
+    `${count(status.health.imported_files)} transcripts`,
     `import errors: ${count(status.health.import_errors)}`,
     `schema v${status.health.schema_version}`,
     `agentbench ${status.tool_version}`,
@@ -157,6 +198,7 @@ async function loadLive() {
   try {
     const [live, status] = await Promise.all([api('/api/live'), api('/api/status')]);
     renderTiles(live);
+    renderToday(live.today, live.day_start_ts);
     renderStatus(status);
     dom.subtitle.textContent = `machine ${live.machine_id.slice(0, 12)} · uPlot ${status.uplot_version}`;
   } catch (error) {
@@ -165,18 +207,21 @@ async function loadLive() {
 }
 
 async function loadHistory() {
-  try {
-    const to = Date.now();
-    const from = to - selectedRange.ms;
-    const series = await api(
-      `/api/series?metric=cpu_percent&from=${from}&to=${to}`,
-    );
-    chart.update(series.points, series.gap_ms);
-    dom.chartEmpty.hidden = series.points.length > 0;
-  } catch (error) {
-    dom.chartEmpty.hidden = false;
-    dom.chartEmpty.textContent = `Could not load history: ${error.message}`;
-  }
+  const to = Date.now();
+  const from = to - selectedRange.ms;
+  // Each chart loads independently, so one failing metric leaves the others readable.
+  await Promise.all(
+    CHARTS.map(async (panel) => {
+      try {
+        const series = await api(`/api/series?metric=${panel.metric}&from=${from}&to=${to}`);
+        panel.chart.update(series.points, series.gap_ms);
+        panel.empty.hidden = series.points.length > 0;
+      } catch (error) {
+        panel.empty.hidden = false;
+        panel.empty.textContent = `Could not load ${panel.metric}: ${error.message}`;
+      }
+    }),
+  );
 }
 
 renderRanges();

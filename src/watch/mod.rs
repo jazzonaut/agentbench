@@ -61,14 +61,42 @@ pub fn run(config: WatchConfig) -> Result<()> {
         collect::sampler::run(&sampler_config, &clock, &sampler_sink);
     })?;
 
+    if config.sessions.enabled {
+        // Reading transcripts is free in the sense that matters: Claude Code has already written
+        // them, so this thread does no measuring, only accounting.
+        let sessions_config = config.sessions.clone();
+        let sessions_sink = sink.clone();
+        let sessions_shutdown = shutdown.clone();
+        let database = config.database_path();
+        let machine = store.machine_id().to_string();
+        supervisor.spawn("sessions", true, move || {
+            let clock = ShutdownClock::new(SystemClock, sessions_shutdown.clone());
+            match store::Reader::open(&database, machine.clone()) {
+                Ok(reader) => {
+                    collect::sessions::run(&sessions_config, &clock, &sessions_sink, &reader)
+                }
+                Err(error) => sessions_sink.log(
+                    Level::Error,
+                    "sessions",
+                    format!("cannot open the database for reading: {error}"),
+                ),
+            }
+        })?;
+    }
+
     sink.log(
         Level::Info,
         "daemon",
         format!(
-            "started; data dir {}, sampling every {:?} ({:?} when idle)",
+            "started; data dir {}, sampling every {:?} ({:?} when idle), transcripts {}",
             config.data_dir.display(),
             config.collect.sample_interval,
-            config.collect.sample_interval_idle
+            config.collect.sample_interval_idle,
+            if config.sessions.enabled {
+                format!("every {:?}", config.sessions.poll_interval)
+            } else {
+                "disabled".to_string()
+            }
         ),
     );
 

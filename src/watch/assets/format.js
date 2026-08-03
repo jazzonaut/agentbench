@@ -24,6 +24,18 @@ export function count(value) {
   return value === null || value === undefined ? '—' : value.toLocaleString();
 }
 
+/** A latency, kept in the unit a reader can compare: "11 ms", "1.20 s". */
+export function latency(ms) {
+  if (ms === null || ms === undefined) return '—';
+  if (ms < 1000) return `${Math.round(ms)} ms`;
+  return `${(ms / 1000).toFixed(2)} s`;
+}
+
+/** A share of a whole, as a percentage. Takes 0…1, not 0…100. */
+export function ratio(value) {
+  return value === null || value === undefined ? '—' : `${(value * 100).toFixed(0)}%`;
+}
+
 /** A short, human duration: "3s", "4m", "2h 15m", "3d 4h". */
 export function duration(ms) {
   if (ms === null || ms === undefined) return '—';

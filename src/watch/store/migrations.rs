@@ -12,10 +12,16 @@ struct Migration {
     sql: &'static str,
 }
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    sql: super::schema::CREATE_V1,
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        sql: super::schema::CREATE_V1,
+    },
+    Migration {
+        version: 2,
+        sql: super::schema::ALTER_V2,
+    },
+];
 
 /// Version this build expects after migrating.
 pub fn target_version() -> u32 {
@@ -100,6 +106,63 @@ mod tests {
                 .unwrap();
             assert_eq!(found, 1, "table {table} missing");
         }
+    }
+
+    /// Databases written by the phase-1 build exist on real machines, so v2 has to reach them.
+    #[test]
+    fn a_v1_database_gains_the_session_turn_corrections() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(crate::watch::store::schema::CREATE_V1)
+            .unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+
+        migrate(&mut conn).unwrap();
+
+        let column = |name: &str| -> u32 {
+            conn.query_row(
+                "SELECT count(*) FROM pragma_table_info('session_turns') WHERE name = ?1",
+                [name],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(column("first_response_ms"), 1, "the honest name");
+        assert_eq!(column("ttft_ms"), 0, "the misleading one is gone");
+        assert_eq!(column("session_id"), 1);
+        assert_eq!(column("request_id"), 1);
+    }
+
+    /// The guarantee that keeps token counts honest when an import resumes mid-request.
+    #[test]
+    fn one_request_can_only_be_recorded_once() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrate(&mut conn).unwrap();
+        conn.execute(
+            "INSERT INTO machines (id, hostname_hash, os, os_version, architecture, cpu,
+                 logical_cores, memory_bytes, first_seen, last_seen)
+             VALUES ('m', 'm', 'os', '1', 'x86_64', 'cpu', 1, 0, 0, 0)",
+            [],
+        )
+        .unwrap();
+        let insert = |uuid: &str| {
+            conn.execute(
+                "INSERT OR IGNORE INTO session_turns (uuid, machine_id, ts, request_id,
+                     output_tokens) VALUES (?1, 'm', 1, 'req_1', 400)",
+                [uuid],
+            )
+        };
+        insert("first-row").unwrap();
+        insert("a-different-row-of-the-same-request").unwrap();
+
+        let (turns, tokens): (i64, i64) = conn
+            .query_row(
+                "SELECT count(*), coalesce(sum(output_tokens), 0) FROM session_turns",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(turns, 1);
+        assert_eq!(tokens, 400, "tokens must not be counted twice");
     }
 
     #[test]

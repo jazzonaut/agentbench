@@ -66,6 +66,12 @@ enum Command {
         /// Override the probe interval, e.g. 15m.
         #[arg(long)]
         probe_interval: Option<String>,
+        /// Do not read Claude Code transcripts.
+        #[arg(long)]
+        no_sessions: bool,
+        /// Read transcripts from this directory instead of the configured roots. Repeatable.
+        #[arg(long, value_name = "DIR")]
+        sessions_root: Vec<PathBuf>,
         /// Print collection status and recent daemon events, then exit.
         #[arg(long)]
         status: bool,
@@ -207,6 +213,8 @@ fn main() -> Result<()> {
             sample_interval,
             sample_interval_idle,
             probe_interval,
+            no_sessions,
+            sessions_root,
             status,
             pid,
             name,
@@ -221,15 +229,17 @@ fn main() -> Result<()> {
                 );
                 ui::dashboard(pid, name.as_deref(), interval_ms.unwrap_or(500))?;
             } else {
-                run_dashboard(
+                run_dashboard(DashboardArgs {
                     port,
                     data_dir,
                     no_serve,
                     sample_interval,
                     sample_interval_idle,
                     probe_interval,
+                    no_sessions,
+                    sessions_root,
                     status,
-                )?;
+                })?;
             }
         }
         Command::Top {
@@ -282,22 +292,48 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Load configuration, apply CLI overrides, then either report status or run the daemon.
-fn run_dashboard(
+/// Everything `dashboard` accepts that is not the deprecated TUI form.
+///
+/// Grouped rather than passed positionally: nine parameters of which four are `Option<String>` is a
+/// call nobody can read, and a mis-ordered pair of them would compile.
+struct DashboardArgs {
     port: Option<u16>,
     data_dir: Option<PathBuf>,
     no_serve: bool,
     sample_interval: Option<String>,
     sample_interval_idle: Option<String>,
     probe_interval: Option<String>,
+    no_sessions: bool,
+    sessions_root: Vec<PathBuf>,
     status: bool,
-) -> Result<()> {
+}
+
+/// Load configuration, apply CLI overrides, then either report status or run the daemon.
+fn run_dashboard(args: DashboardArgs) -> Result<()> {
+    let DashboardArgs {
+        port,
+        data_dir,
+        no_serve,
+        sample_interval,
+        sample_interval_idle,
+        probe_interval,
+        no_sessions,
+        sessions_root,
+        status,
+    } = args;
     let mut config = watch::WatchConfig::load(data_dir)?;
     if let Some(port) = port {
         config.server.port = port;
     }
     if no_serve {
         config.server.enabled = false;
+    }
+    if no_sessions {
+        config.sessions.enabled = false;
+    }
+    if !sessions_root.is_empty() {
+        // Replaces rather than extends: the point of naming roots is to import those and nothing else.
+        config.sessions.roots = sessions_root;
     }
     if let Some(value) = sample_interval {
         let active = watch::config::parse_duration(&value).context("--sample-interval")?;
@@ -355,6 +391,7 @@ fn print_status(config: &watch::WatchConfig) -> Result<()> {
         status.health.session_turns,
         status.health.session_tools
     );
+    println!("Transcripts:    {} imported", status.health.imported_files);
     println!("Import errors:  {}", status.health.import_errors);
     println!("Schema version: {}", status.health.schema_version);
     if !status.events.is_empty() {

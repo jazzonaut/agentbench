@@ -10,7 +10,7 @@ pub mod records;
 pub mod schema;
 pub mod writer;
 
-pub use records::{Event, Level, Record, Sample};
+pub use records::{Event, Level, Record, Sample, ToolCall, ToolVersion, Turn, Watermark};
 pub use writer::Sink;
 
 use crate::model::Inventory;
@@ -115,7 +115,11 @@ pub struct Reader {
 }
 
 impl Reader {
-    fn open(path: &Path, machine_id: String) -> Result<Self> {
+    /// Open a read-only view of a database by path.
+    ///
+    /// Public so a collector thread can open its own: the transcript importer has to recover where it
+    /// left off, and a fresh connection per thread is both cheaper and safer than sharing one.
+    pub fn open(path: &Path, machine_id: String) -> Result<Self> {
         let conn = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -301,6 +305,110 @@ mod tests {
             .query_row("SELECT count(*) FROM machines", [], |row| row.get(0))
             .unwrap();
         assert_eq!(machines, 1);
+    }
+
+    /// Every session record kind through the real writer, including the one that must not duplicate.
+    #[test]
+    fn session_records_round_trip_through_the_writer() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("watch.db");
+        let store = Store::open(&path, &inventory()).unwrap();
+        let sink = store.sink();
+
+        let turn = |uuid: &str| records::Turn {
+            uuid: uuid.into(),
+            request_id: "req_1".into(),
+            session_id: "session-1".into(),
+            ts: 1_700_000_000_000,
+            project: Some("D:\\Work".into()),
+            branch: Some("main".into()),
+            model: Some("claude-opus-5".into()),
+            effort: Some("high".into()),
+            service_tier: Some("standard".into()),
+            first_response_ms: Some(4_200),
+            input_tokens: 10,
+            output_tokens: 20,
+            cache_read: 900,
+            cache_create: 30,
+        };
+        // Two rows of one request, which is what a resumed import produces.
+        assert!(sink.send(turn("row-one")));
+        assert!(sink.send(turn("row-two")));
+        assert!(sink.send(records::ToolCall {
+            uuid: "result-row".into(),
+            ts: 1_700_000_000_000,
+            project: Some("D:\\Work".into()),
+            tool: "Read".into(),
+            duration_ms: 11,
+            ok: true,
+        }));
+        assert!(sink.send(records::ToolVersion {
+            ts: 1_700_000_000_000,
+            tool: "claude-code".into(),
+            version: "2.1.187".into(),
+        }));
+        assert!(sink.send(records::Watermark {
+            path: "D:\\one.jsonl".into(),
+            size: 4096,
+            mtime: 17,
+            rows_ok: 40,
+            rows_error: 1,
+        }));
+        // The same transcript read again, further along.
+        assert!(sink.send(records::Watermark {
+            path: "D:\\one.jsonl".into(),
+            size: 8192,
+            mtime: 18,
+            rows_ok: 10,
+            rows_error: 0,
+        }));
+        drop(sink);
+        let machine = store.machine_id().to_string();
+        store.shutdown().unwrap();
+
+        let reopened = Store::open(&path, &inventory()).unwrap();
+        let reader = reopened.reader().unwrap();
+        let health = queries::health(reader.conn(), &machine).unwrap();
+        assert_eq!(health.session_turns, 1, "one request is one turn");
+        assert_eq!(health.session_tools, 1);
+        assert_eq!(health.imported_files, 1);
+        assert_eq!(health.import_errors, 1);
+
+        let (uuid, response, tokens): (String, i64, i64) = reader
+            .conn()
+            .query_row(
+                "SELECT uuid, first_response_ms, output_tokens FROM session_turns",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(uuid, "row-one", "the first row read wins");
+        assert_eq!(response, 4_200);
+        assert_eq!(tokens, 20, "cumulative usage is recorded once, not summed");
+
+        let marks = queries::sessions::watermarks(reader.conn()).unwrap();
+        assert_eq!(
+            marks.len(),
+            1,
+            "a transcript has one position, not a history"
+        );
+        assert_eq!(marks[0].size, 8192, "the position advances");
+        let (rows_ok, rows_error): (i64, i64) = reader
+            .conn()
+            .query_row(
+                "SELECT rows_ok, rows_error FROM import_watermark",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(rows_ok, 50, "row tallies accumulate across passes");
+        assert_eq!(rows_error, 1);
+
+        let versions: i64 = reader
+            .conn()
+            .query_row("SELECT count(*) FROM tool_versions", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(versions, 1);
     }
 
     #[test]

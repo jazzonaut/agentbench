@@ -4,7 +4,11 @@
 //! prints on the command line.
 
 use crate::watch::{
-    serve::{assets, response::Req, response::Resp},
+    serve::{
+        assets,
+        handlers::series,
+        response::{Req, Resp},
+    },
     store::{Reader, queries},
 };
 use anyhow::Result;
@@ -45,10 +49,7 @@ pub fn build(reader: &Reader, event_limit: usize) -> Result<Status> {
         collecting: sample_age_ms.is_some_and(|age| age < STALE_AFTER_MS),
         sample_age_ms,
         health,
-        series: queries::SampleSeries::ALL
-            .iter()
-            .map(|series| series.wire_name())
-            .collect(),
+        series: series::known_series(),
         events: queries::recent_events(reader.conn(), event_limit)?,
     })
 }

@@ -1,10 +1,14 @@
 // uPlot wiring for a single-series time chart.
 //
 // Deliberately one series per chart and one y-axis. Two measures on two scales in one frame is the
-// most common charting mistake there is; later phases stack more charts and synchronise their cursors
-// instead of overlaying incomparable scales.
+// most common charting mistake there is. Charts stack instead, and share a cursor: reading straight
+// down one vertical line across system CPU and agent tool latency is how a slow afternoon gets
+// explained, and it is the reason these are separate frames rather than one crowded one.
 
 import { token, clockTime, dateTime } from './format.js';
+
+/** One cursor across every chart on the page. */
+const CURSOR_GROUP = uPlot.sync('agentbench');
 
 /** Break the line wherever sampling stopped, rather than drawing through the gap.
  *
@@ -30,7 +34,7 @@ function toSeries(points, gapMs) {
 }
 
 /** Options shared by every chart, reading colours from CSS tokens. */
-function options(width, format) {
+function options(width, format, label) {
   return {
     width,
     height: 220,
@@ -42,6 +46,9 @@ function options(width, format) {
       y: true,
       points: { size: 6, width: 1.5 },
       drag: { x: true, y: false },
+      // Only time is shared. Matching the y position across charts of different measures would
+      // draw a line implying a relationship between percentages and milliseconds.
+      sync: { key: CURSOR_GROUP.key, scales: ['x', null] },
     },
     legend: { live: true },
     scales: { x: { time: true } },
@@ -65,7 +72,7 @@ function options(width, format) {
     series: [
       { value: (_self, seconds) => (seconds === null ? '—' : dateTime(seconds * 1000)) },
       {
-        label: 'value',
+        label,
         // Thin mark. Width is about legibility, not emphasis.
         stroke: token('--series-1'),
         width: 1.5,
@@ -79,9 +86,10 @@ function options(width, format) {
 /**
  * A resizable single-series chart.
  *
- * `format` is shared with the tiles so the tooltip and the tile can never disagree.
+ * `format` is shared with the tiles so the tooltip and the tile can never disagree, and `label` names
+ * the measure in the tooltip, since one chart's line is never explained by a legend.
  */
-export function createChart(element, format) {
+export function createChart(element, format, label = 'value') {
   let plot = null;
   let current = [[], []];
 
@@ -92,7 +100,7 @@ export function createChart(element, format) {
       plot.setData(current);
       return;
     }
-    plot = new uPlot(options(width(), format), current, element);
+    plot = new uPlot(options(width(), format, label), current, element);
   };
 
   // Re-lay-out on container resize rather than on window resize: the panel can change width

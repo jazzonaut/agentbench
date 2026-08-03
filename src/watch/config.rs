@@ -26,6 +26,11 @@ pub const DEFAULT_PORT: u16 = 7878;
 /// sampling is not silently defeated by an unchanged idle interval.
 pub const IDLE_INTERVAL_RATIO: u32 = 6;
 
+/// Floor on the transcript poll interval.
+///
+/// A pass stats every transcript, so polling in a tight loop would turn a free stream into a busy one.
+const SHORTEST_POLL: Duration = Duration::from_secs(1);
+
 /// Validated daemon configuration.
 #[derive(Debug, Clone)]
 pub struct WatchConfig {
@@ -66,8 +71,16 @@ pub struct CollectConfig {
 
 #[derive(Debug, Clone)]
 pub struct SessionsConfig {
-    /// Directories scanned for Claude Code transcripts. Used from phase 2.
+    /// Whether transcripts are read at all.
+    ///
+    /// Turning this off costs the daemon its only source of real agent timings, but the transcripts
+    /// are the one input that is not the daemon's own to begin with, so refusing to read them has to
+    /// be a single switch rather than a search through the code.
+    pub enabled: bool,
+    /// Directories scanned for Claude Code transcripts.
     pub roots: Vec<PathBuf>,
+    /// How often to look for transcripts that have changed.
+    pub poll_interval: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -185,8 +198,12 @@ probe_interval = "15m"
 # scratch_dir = "D:/Stuff/.agentbench-scratch"
 
 [sessions]
+# Reading transcripts costs nothing and is where the real agent timings come from.
+enabled = true
 # Claude Code transcript directories. "~" is expanded.
 roots = ["~/.claude/projects"]
+# How often to check for transcripts that have changed.
+poll_interval = "30s"
 
 [retention]
 # Raw samples are rolled up to one-minute aggregates after this many days.
@@ -237,7 +254,9 @@ struct FileCollect {
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct FileSessions {
+    enabled: Option<bool>,
     roots: Option<Vec<String>>,
+    poll_interval: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -297,6 +316,7 @@ impl FileConfig {
                 scratch_dir: self.collect.scratch_dir.as_deref().map(expand_home),
             },
             sessions: SessionsConfig {
+                enabled: self.sessions.enabled.unwrap_or(true),
                 roots: self
                     .sessions
                     .roots
@@ -304,6 +324,9 @@ impl FileConfig {
                     .iter()
                     .map(|root| expand_home(root))
                     .collect(),
+                // A shorter poll would find a live transcript's newest rows sooner, but nothing on
+                // the page changes fast enough to notice, and each pass stats every transcript.
+                poll_interval: interval(self.sessions.poll_interval, "30s")?.max(SHORTEST_POLL),
             },
             retention: RetentionConfig {
                 samples_raw_days: self.retention.samples_raw_days.unwrap_or(14),

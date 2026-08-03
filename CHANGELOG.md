@@ -11,11 +11,19 @@ All notable changes to AgentBench are documented here. The project follows [Sema
   versioned local SQLite database.
 - Loopback-only web dashboard with live tiles and an interactive history chart, all assets embedded so
   it works with no network access.
-- `agentbench dashboard --status` for checking collection health, row counts, and recent daemon events
-  without starting anything.
+- Real session metrics imported from local Claude Code transcripts: tool latency, prompt-to-first-
+  response intervals, token counts and cache hit ratios, with the whole existing history backfilled on
+  first run so the charts start full rather than empty. Nothing is read but timings, token counts,
+  model names, project paths and branches; prompts, code and tool output are skipped.
+- Read-only file-tool latency (`Read`, `Grep`, `Glob`, `Edit`) charted alongside system CPU, with one
+  cursor shared across both charts so a slow afternoon can be read down a single vertical line.
+- A "Today" summary on the dashboard: requests, tool calls, sessions, projects, output tokens, cache
+  hit rate and median file-tool latency, counted since local midnight.
+- `agentbench dashboard --status` for checking collection health, row counts, imported transcripts,
+  and recent daemon events without starting anything.
 - `watch.toml` configuration, written with commented defaults on first run, overridable per run by
-  `--port`, `--data-dir`, `--no-serve`, `--sample-interval`, `--sample-interval-idle`, and
-  `--probe-interval`.
+  `--port`, `--data-dir`, `--no-serve`, `--sample-interval`, `--sample-interval-idle`,
+  `--probe-interval`, `--no-sessions`, and `--sessions-root`.
 - Single-instance locking so two collectors cannot double-count the same machine.
 - `docs/adr/` recording architectural decisions and their rejected alternatives.
 

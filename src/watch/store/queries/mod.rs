@@ -8,8 +8,10 @@
 //! operational log.
 
 pub mod samples;
+pub mod sessions;
 
 pub use samples::{Latest, SampleSeries, latest, series};
+pub use sessions::{SessionSeries, Today, session_series};
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
@@ -30,6 +32,8 @@ pub struct Health {
     pub probe_runs: i64,
     pub session_turns: i64,
     pub session_tools: i64,
+    /// Transcripts with a recorded import position.
+    pub imported_files: i64,
     pub import_errors: i64,
     pub last_sample_ts: Option<i64>,
     pub first_sample_ts: Option<i64>,
@@ -61,6 +65,7 @@ pub fn health(conn: &Connection, machine_id: &str) -> Result<Health> {
         probe_runs: count("SELECT count(*) FROM probe_runs WHERE machine_id = ?1")?,
         session_turns: count("SELECT count(*) FROM session_turns WHERE machine_id = ?1")?,
         session_tools: count("SELECT count(*) FROM session_tools WHERE machine_id = ?1")?,
+        imported_files: sessions::imported_files(conn)?,
         import_errors: conn.query_row(
             "SELECT coalesce(sum(rows_error), 0) FROM import_watermark",
             [],

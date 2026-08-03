@@ -82,6 +82,7 @@ CREATE TABLE session_turns (
     model         TEXT,
     effort        TEXT,
     service_tier  TEXT,
+    -- Renamed to first_response_ms by v2; see ALTER_V2.
     ttft_ms       INTEGER,
     input_tokens  INTEGER NOT NULL DEFAULT 0,
     output_tokens INTEGER NOT NULL DEFAULT 0,
@@ -138,4 +139,23 @@ CREATE TABLE events (
     message TEXT NOT NULL
 );
 CREATE INDEX idx_events_ts ON events(ts);
+"#;
+
+/// Session-stream corrections, applied when the transcript importer arrived.
+///
+/// Two things the v1 shape got wrong, both learned from real transcripts:
+///
+/// `ttft_ms` promised a time to first *token*. What a transcript can actually yield is the interval
+/// to the first assistant *message*, which for a thinking model contains the entire thinking block —
+/// a median of about fifteen seconds against sub-second network latency. Keeping the old name would
+/// have every chart and tooltip explaining that the number does not mean what it says.
+///
+/// A turn is identified by its API request, not by the row that happened to be read first. One
+/// request emits several assistant rows, so the unique index is what makes an interrupted import
+/// idempotent: resuming mid-file cannot invent a second turn for a request already recorded.
+pub const ALTER_V2: &str = r#"
+ALTER TABLE session_turns RENAME COLUMN ttft_ms TO first_response_ms;
+ALTER TABLE session_turns ADD COLUMN session_id TEXT;
+ALTER TABLE session_turns ADD COLUMN request_id TEXT;
+CREATE UNIQUE INDEX idx_session_turns_request ON session_turns(machine_id, request_id);
 "#;

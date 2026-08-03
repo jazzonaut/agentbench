@@ -27,7 +27,23 @@ struct Daemon {
 }
 
 impl Daemon {
+    /// Start with transcript importing switched off.
+    ///
+    /// What most tests want: the transcript directory of whoever runs the suite is somebody's real
+    /// work, not a fixture, and importing hundreds of megabytes of it would be both slow and rude.
     fn start(extra: &[&str]) -> Self {
+        Self::spawn(extra, &["--no-sessions"])
+    }
+
+    /// Start importing transcripts from `root`, and from nowhere else.
+    fn start_with_transcripts(root: &Path) -> Self {
+        Self::spawn(
+            &[],
+            &["--sessions-root", root.to_str().expect("utf-8 path")],
+        )
+    }
+
+    fn spawn(extra: &[&str], sessions: &[&str]) -> Self {
         let data_dir = tempfile::tempdir().expect("temp data dir");
         // Port 0 is not usable here because the daemon prints its URL rather than exposing it, so
         // pick a free port up front and hand it over.
@@ -42,6 +58,7 @@ impl Daemon {
             // Sample fast so the first observation lands promptly.
             .arg("--sample-interval")
             .arg("200ms")
+            .args(sessions)
             .args(extra)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -192,7 +209,7 @@ fn the_daemon_collects_serves_and_shuts_down_cleanly() {
     assert_eq!(status["collecting"], true, "{status}");
     assert_eq!(
         status["health"]["schema_version"].as_i64(),
-        Some(1),
+        Some(2),
         "{status}"
     );
     assert!(
@@ -237,6 +254,93 @@ fn the_daemon_collects_serves_and_shuts_down_cleanly() {
     for asset in ["/assets/app.js", "/assets/chart.js", "/assets/format.js"] {
         assert!(!daemon.get(asset).is_empty(), "{asset} should be served");
     }
+}
+
+/// The session stream end to end: a transcript on disk becomes a chart and a tile.
+#[test]
+fn transcripts_are_imported_charted_and_summarised() {
+    let transcripts = tempfile::tempdir().expect("temp transcripts dir");
+    let project = transcripts.path().join("D--Stuff-Example");
+    std::fs::create_dir_all(&project).expect("create project dir");
+
+    // Timestamps have to be recent: the range the dashboard asks for ends now, and the tiles count
+    // activity since local midnight.
+    let base = chrono::Utc::now() - chrono::Duration::seconds(5);
+    let at = |offset_ms: i64| {
+        (base + chrono::Duration::milliseconds(offset_ms))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    };
+    let transcript = format!(
+        r#"{{"type":"user","uuid":"p1","timestamp":"{prompt}","message":{{"content":"go"}}}}
+{{"type":"assistant","uuid":"a1","parentUuid":"p1","requestId":"req_1","timestamp":"{answer}","sessionId":"s1","cwd":"D:\\Stuff\\Example","gitBranch":"main","version":"2.1.187","effort":"high","message":{{"model":"claude-opus-5","usage":{{"input_tokens":100,"output_tokens":42,"cache_read_input_tokens":900,"cache_creation_input_tokens":0,"service_tier":"standard"}},"content":[{{"type":"tool_use","id":"t1","name":"Read"}}]}}}}
+{{"type":"user","uuid":"r1","sourceToolAssistantUUID":"a1","timestamp":"{result}","cwd":"D:\\Stuff\\Example","toolUseResult":{{"file":"x"}},"message":{{"content":[{{"type":"tool_result","tool_use_id":"t1"}}]}}}}
+"#,
+        prompt = at(0),
+        answer = at(1_500),
+        result = at(1_511),
+    );
+    std::fs::write(project.join("session.jsonl"), &transcript).expect("write transcript");
+
+    let daemon = Daemon::start_with_transcripts(transcripts.path());
+    daemon.wait_until_listening();
+
+    let status = daemon.wait_for_status("the transcript is imported", |status| {
+        status["health"]["session_turns"].as_i64().unwrap_or(0) > 0
+    });
+    assert_eq!(
+        status["health"]["session_tools"].as_i64(),
+        Some(1),
+        "{status}"
+    );
+    assert_eq!(
+        status["health"]["imported_files"].as_i64(),
+        Some(1),
+        "{status}"
+    );
+    assert_eq!(
+        status["health"]["import_errors"].as_i64(),
+        Some(0),
+        "{status}"
+    );
+    assert!(
+        status["series"]
+            .as_array()
+            .is_some_and(|series| series.iter().any(|name| name == "tool_read_ms")),
+        "derived series should be advertised: {status}"
+    );
+
+    // The derived series is bucketed and charts the latency between the two rows.
+    let series: serde_json::Value =
+        serde_json::from_str(&daemon.get("/api/series?metric=tool_read_ms")).expect("series json");
+    assert!(series["bucket_ms"].as_i64().unwrap_or(0) > 0, "{series}");
+    let points = series["points"].as_array().expect("points array");
+    assert_eq!(points.len(), 1, "{series}");
+    assert_eq!(points[0]["value"].as_f64(), Some(11.0), "{series}");
+
+    // And the same numbers appear in the tiles, counted since local midnight.
+    let live: serde_json::Value =
+        serde_json::from_str(&daemon.get("/api/live")).expect("live json");
+    let today = &live["today"];
+    let day_start = live["day_start_ts"].as_i64().expect("day start");
+    if base.timestamp_millis() >= day_start {
+        assert_eq!(today["turns"].as_i64(), Some(1), "{live}");
+        assert_eq!(today["tool_calls"].as_i64(), Some(1), "{live}");
+        assert_eq!(today["sessions"].as_i64(), Some(1), "{live}");
+        assert_eq!(today["output_tokens"].as_i64(), Some(42), "{live}");
+        assert_eq!(today["tool_read_p50_ms"].as_f64(), Some(11.0), "{live}");
+        // 900 of 1000 prompt tokens came from the cache.
+        assert_eq!(today["cache_hit_ratio"].as_f64(), Some(0.9), "{live}");
+    }
+
+    // An unchanged transcript is not read again, which is what the watermark is for.
+    let status = daemon.wait_for_status("the importer settles", |status| {
+        status["health"]["session_turns"].as_i64() == Some(1)
+    });
+    assert_eq!(
+        status["health"]["session_turns"].as_i64(),
+        Some(1),
+        "{status}"
+    );
 }
 
 #[test]
@@ -308,7 +412,7 @@ fn status_reads_a_database_written_by_a_previous_run() {
         "status failed: {stdout}{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(stdout.contains("Schema version: 1"), "{stdout}");
+    assert!(stdout.contains("Schema version: 2"), "{stdout}");
     assert!(stdout.contains("samples"), "{stdout}");
     assert!(stdout.contains("Import errors:  0"), "{stdout}");
 }
@@ -324,6 +428,7 @@ fn collection_works_with_the_server_disabled() {
         .arg(data_dir.path())
         .arg("--sample-interval")
         .arg("200ms")
+        .arg("--no-sessions")
         .stdout(Stdio::piped())
         .spawn()
         .expect("spawn collector");

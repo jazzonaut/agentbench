@@ -95,7 +95,8 @@ agentbench dashboard --status
 Useful flags: `--port`, `--data-dir`, `--no-serve` to collect without opening a socket, and
 `--sample-interval` / `--probe-interval` to raise resolution while investigating a regression.
 Lowering `--sample-interval` also lowers the idle cadence proportionally, so a faster setting is not
-silently defeated when the machine is quiet.
+silently defeated when the machine is quiet. `--no-sessions` stops it reading transcripts, and
+`--sessions-root DIR` points it at transcripts somewhere other than `~/.claude/projects`.
 
 ### What it collects
 
@@ -106,9 +107,30 @@ silently defeated when the machine is quiet.
   machine is idle.
 - **Probes** *(from a later release)*: micro-scale reruns of the same workloads `bench` uses, at the
   same metric names, so thresholds and comparisons carry over. Never any paid API call.
-- **Real session metrics** *(from a later release)*: tool-execution latency and time-to-first-token
-  derived from your own Claude Code transcripts, so the charts reflect measured usage rather than a
-  proxy for it.
+- **Real session metrics**: tool latency, response intervals, and token accounting derived from your
+  own Claude Code transcripts, so the charts reflect measured usage rather than a proxy for it.
+
+### Session metrics, and what each one is worth
+
+Transcripts record no durations, so every session metric is an interval between two rows. They differ
+sharply in how directly they measure the machine, and the dashboard charts them accordingly:
+
+| Series | What it is | What confounds it |
+|---|---|---|
+| `tool_read_ms` | Median latency of `Read`, `Grep`, `Glob` and `Edit` | Little. This is the clean filesystem signal, and it is the one charted by default |
+| `tool_bash_ms` | Median `Bash` latency | Dominated by how long the command legitimately took, and by waiting for permission |
+| `first_response_ms` | Prompt to the first assistant message | **Not** a time to first token: it contains the whole thinking block, and a prompt typed while the agent was working waits in a queue first. Medians of seven to eight seconds are normal and say nothing about your network |
+| `output_tokens` | Tokens produced per bucket | Measures how much you asked for, not how fast anything was |
+| `cache_hit_ratio` | Prompt tokens served from cache | None, once deduplicated |
+
+Failed, refused and interrupted tool calls are recorded but excluded from the latency series: each one
+returned early or spent its time waiting for a person, so including them would make a bad afternoon
+look like a fast machine.
+
+Reading is incremental and free of load: transcripts are already on disk, each is read from where the
+last pass stopped, and an unchanged one is not opened at all. Subagent transcripts count too. On a
+first run the whole history is imported — a few hundred megabytes takes well under a second — so the
+charts have weeks of real data the moment you start, rather than being empty until data accrues.
 
 ### Storage, privacy, and lifecycle
 
@@ -121,6 +143,11 @@ The HTTP server binds `127.0.0.1` only and refuses to bind anything else. That r
 load-bearing: **unlike every exported report, the local database stores real project paths and git
 branch names**, because a dashboard that cannot tell you which project was slow is not much use.
 Nothing is uploaded, and report and comparison output continue to hash paths as before.
+
+Transcripts are read, never copied. What is stored from them is timings, token counts, model names,
+and the project path and branch a session ran in — no prompts, no code, no command output, and nothing
+from any tool's result. If you would rather it did not read them at all, `--no-sessions` or
+`enabled = false` under `[sessions]` in `watch.toml` turns the whole stream off.
 
 There is no service installer, and AgentBench changes no OS configuration on its own. To start the
 collector at login, register it with your platform's own scheduler.

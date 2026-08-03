@@ -86,6 +86,8 @@
     border-radius: 8px;
     padding: 14px 14px 6px;
   }
+  /* Stacked charts read as one instrument, so the gap between them is a seam, not a margin. */
+  .card + .card { margin-top: 10px; }
   .card-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
   /* One series needs no legend box; the title names it. */
   .card-title { font-size: 13px; font-weight: 600; }
@@ -140,17 +142,33 @@
     <div class="tiles" id="tiles"></div>
   </section>
 
+  <section aria-labelledby="today-heading">
+    <h2 id="today-heading">Today</h2>
+    <div class="tiles" id="today"></div>
+  </section>
+
   <section aria-labelledby="history-heading">
     <h2 id="history-heading">History</h2>
     <div class="ranges" id="ranges" role="group" aria-label="Time range"></div>
+    <!-- Stacked frames sharing one cursor: hovering either reads the same instant in both. -->
     <div class="card">
       <div class="card-head">
         <span class="card-title">System CPU</span>
         <span class="card-note">percent of all cores · hover for values</span>
       </div>
-      <div id="chart"></div>
-      <p class="empty" id="chart-empty" hidden>
+      <div id="chart-cpu"></div>
+      <p class="empty" data-empty-for="chart-cpu" hidden>
         No samples in this range yet. Leave the daemon running and refresh.
+      </p>
+    </div>
+    <div class="card">
+      <div class="card-head">
+        <span class="card-title">Agent file-tool latency</span>
+        <span class="card-note">median per bucket · Read, Grep, Glob, Edit</span>
+      </div>
+      <div id="chart-tools"></div>
+      <p class="empty" data-empty-for="chart-tools" hidden>
+        No tool calls in this range. Transcripts are imported on startup and every 30 seconds.
       </p>
     </div>
   </section>
