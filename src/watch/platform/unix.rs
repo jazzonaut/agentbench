@@ -10,6 +10,22 @@ use std::{env, fs::File, os::unix::io::AsRawFd, path::PathBuf};
 #[cfg(target_os = "linux")]
 const BACKGROUND_NICE: libc::c_int = 10;
 
+/// The type this platform's `setpriority` takes for its first argument.
+///
+/// Not `c_int` everywhere, which is what this used to assume. glibc declares the parameter as
+/// `__priority_which_t`, an enum, and `libc` 0.2.189 started reflecting that as `u32` — so a signature
+/// fixed at `c_int` stopped compiling on `x86_64-unknown-linux-gnu` while remaining correct on macOS and
+/// on musl, both of which declare a plain `int`. An alias rather than a cast at the call site, so the
+/// mismatch is impossible rather than papered over, and so a future divergence shows up here.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+type PriorityWhich = u32;
+
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos"),
+    not(all(target_os = "linux", target_env = "gnu"))
+))]
+type PriorityWhich = libc::c_int;
+
 /// Linux's power-supply class, where mains adapters advertise whether they are supplying power.
 #[cfg(target_os = "linux")]
 const POWER_SUPPLY_DIR: &str = "/sys/class/power_supply";
@@ -163,7 +179,7 @@ pub(super) fn is_elevated() -> bool {
 
 /// Apply one `setpriority` call to the caller, naming it for the refusal message.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn set_nice(which: libc::c_int, value: libc::c_int, called: &str) -> Capability {
+fn set_nice(which: PriorityWhich, value: libc::c_int, called: &str) -> Capability {
     // SAFETY: setpriority with who=0 targets the caller and takes no pointers.
     let result = unsafe { libc::setpriority(which, 0, value) };
     if result == 0 {

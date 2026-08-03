@@ -357,6 +357,14 @@ mod tests {
         PathBuf::from(value)
     }
 
+    /// Assemble a path from components rather than writing it as a string, so these run the same on every
+    /// platform. A backslash is not a separator on Unix, so `r"D:\...\target\release\x.exe"` arrives there
+    /// as one long component and every assertion about its shape silently tests nothing — which is exactly
+    /// how the first version of these two tests passed on Windows and failed on macOS.
+    fn exe(parts: &[&str]) -> PathBuf {
+        parts.iter().collect()
+    }
+
     #[test]
     fn a_directory_already_present_is_recognised() {
         let path = r"C:\Windows;C:\Users\x\AppData\Local\Programs\AgentBench;C:\Tools";
@@ -434,31 +442,44 @@ mod tests {
 
     #[test]
     fn a_build_directory_is_recognised_as_not_durable() {
-        for path in [
-            r"D:\Stuff\AgentBench\target\release\agentbench.exe",
-            r"D:\Stuff\AgentBench\target\debug\agentbench.exe",
-            r"D:\Stuff\AgentBench\target\x86_64-pc-windows-msvc\release\agentbench.exe",
-            "/home/x/agentbench/target/release/agentbench",
+        for parts in [
+            &["Stuff", "AgentBench", "target", "release", "agentbench"][..],
+            &["Stuff", "AgentBench", "target", "debug", "agentbench"][..],
+            &[
+                "Stuff",
+                "AgentBench",
+                "target",
+                "x86_64-pc-windows-msvc",
+                "release",
+                "agentbench",
+            ][..],
+            &["home", "x", "agentbench", "target", "release", "agentbench"][..],
         ] {
+            let path = exe(parts);
             assert!(
-                in_build_tree(Path::new(path)),
-                "{path} should be a build path"
+                in_build_tree(&path),
+                "{} should be a build path",
+                path.display()
             );
         }
     }
 
     #[test]
     fn an_installed_directory_is_not_mistaken_for_a_build_one() {
-        for path in [
-            r"C:\Users\x\AppData\Local\Programs\AgentBench\agentbench.exe",
-            r"C:\Program Files\AgentBench\agentbench.exe",
+        for parts in [
+            &["AppData", "Local", "Programs", "AgentBench", "agentbench"][..],
+            &["Program Files", "AgentBench", "agentbench"][..],
             // A directory that merely happens to be called "release" is not a Cargo profile directory.
-            r"C:\Tools\release\agentbench.exe",
-            "/usr/local/bin/agentbench",
+            &["Tools", "release", "agentbench"][..],
+            &["usr", "local", "bin", "agentbench"][..],
+            // A profile directory with nothing above it has no room for a `target`.
+            &["release", "agentbench"][..],
         ] {
+            let path = exe(parts);
             assert!(
-                !in_build_tree(Path::new(path)),
-                "{path} should not be a build path"
+                !in_build_tree(&path),
+                "{} should not be a build path",
+                path.display()
             );
         }
     }
