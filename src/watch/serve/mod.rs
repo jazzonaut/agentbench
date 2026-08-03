@@ -9,7 +9,7 @@ pub mod response;
 pub mod router;
 
 use crate::watch::{
-    config::ServerConfig,
+    config::{AnalysisConfig, ServerConfig},
     store::{Level, Sink, Store},
 };
 use anyhow::{Context, Result};
@@ -25,6 +25,34 @@ use std::{
 
 /// How often the accept loop checks for shutdown while idle.
 const SHUTDOWN_POLL: Duration = Duration::from_millis(250);
+
+/// The little a handler needs to know that is not in the database.
+///
+/// Passed in rather than read from a global, and kept to what is genuinely needed: a handler that could
+/// reach the whole configuration would eventually reach for the data directory or the bind address, and the
+/// read-only guarantee on this layer is worth more than the convenience.
+#[derive(Debug, Clone, Copy)]
+pub struct Settings {
+    /// Trailing window the verdicts compare today against, in whole local days.
+    pub baseline_window_days: u32,
+}
+
+impl From<&AnalysisConfig> for Settings {
+    fn from(config: &AnalysisConfig) -> Self {
+        Self {
+            baseline_window_days: config.baseline_window_days,
+        }
+    }
+}
+
+impl Default for Settings {
+    /// The shipped window, for tests and for anything that has no configuration to hand.
+    fn default() -> Self {
+        Self {
+            baseline_window_days: 7,
+        }
+    }
+}
 
 /// Bound server, so the caller can report the real port before serving begins.
 pub struct Server {
@@ -65,7 +93,7 @@ impl Server {
     ///
     /// Each request gets a fresh read-only connection. At the volume a single local viewer generates,
     /// opening one per request is cheaper than the machinery of a pool.
-    pub fn serve(self, store: &Store, sink: &Sink, shutdown: Arc<AtomicBool>) {
+    pub fn serve(self, store: &Store, sink: &Sink, shutdown: Arc<AtomicBool>, settings: Settings) {
         while !shutdown.load(Ordering::Relaxed) {
             let request = match self.inner.recv_timeout(SHUTDOWN_POLL) {
                 Ok(Some(request)) => request,
@@ -80,7 +108,7 @@ impl Server {
                 }
             };
             let response = match store.reader() {
-                Ok(reader) => router::route(&Req::parse(request.url()), &reader),
+                Ok(reader) => router::route(&Req::parse(request.url()), &reader, settings),
                 Err(error) => Resp::error(503, &format!("database unavailable: {error}")),
             };
             if let Err(error) = respond(request, &response) {

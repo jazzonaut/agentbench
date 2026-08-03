@@ -159,3 +159,18 @@ ALTER TABLE session_turns ADD COLUMN session_id TEXT;
 ALTER TABLE session_turns ADD COLUMN request_id TEXT;
 CREATE UNIQUE INDEX idx_session_turns_request ON session_turns(machine_id, request_id);
 "#;
+
+/// The two columns `samples_1m` was missing, added when something finally started writing to it.
+///
+/// The v1 table summarised five of the seven passive series the dashboard advertises. Nothing wrote to
+/// it until retention arrived, so nothing noticed — but left alone, a thirty-day chart of system CPU
+/// would have kept its history while the same chart of process count stopped dead at the retention
+/// boundary, with nothing on the page to explain the difference. The table has never held a row on any
+/// machine, so widening it costs nothing and needs no backfill.
+///
+/// Both are nullable for the same reason their raw counterparts are: a sample taken before agent
+/// discovery had found anything records no agent RSS, and absent is not zero.
+pub const ALTER_V3: &str = r#"
+ALTER TABLE samples_1m ADD COLUMN process_count_avg INTEGER;
+ALTER TABLE samples_1m ADD COLUMN agent_rss_max INTEGER;
+"#;

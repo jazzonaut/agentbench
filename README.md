@@ -139,11 +139,13 @@ moves when a security scanner or filesystem filter driver gets into the path.
 
 **Probes are not skipped when the machine is busy.** Waiting for an idle moment would collect nothing on
 exactly the days you care about. Instead every probe is stamped with what it was competing with — CPU,
-scanner CPU, whether an agent was working, whether you are on battery — read both immediately before
-and immediately after the measurement, so a probe clobbered halfway through is not filed as a clean
-one. The dashboard's **uncontended probes only** filter is where that tag gets used, and `--status`
-reports how many of your runs were clean, because a verdict computed from four points is worth
-knowing about.
+scanner CPU, whether an agent was working, whether you are on battery — read once, immediately before the
+measurement. That reading claims only "what this measurement began in", and the limit is real: something
+that starts half a second into a probe is missed. Reading again afterwards was tried and abandoned, because
+the closing CPU delta spans the probe and so reports the probe's own footprint as contention — on an idle
+sixteen-core machine it tagged 17 of 24 runs as contended. The dashboard's **uncontended probes only**
+filter is where the tag gets used, and `--status` reports how many of your runs were clean, because a
+verdict computed from four points is worth knowing about.
 
 Probe values and `bench` values are stored side by side under different sources and are **never
 averaged together**. The same workload over 200 files and over 5,000 answers the same question at
@@ -188,6 +190,61 @@ last pass stopped, and an unchanged one is not opened at all. Subagent transcrip
 first run the whole history is imported — a few hundred megabytes takes well under a second — so the
 charts have weeks of real data the moment you start, rather than being empty until data accrues.
 
+### Today vs baseline
+
+The page's middle section, and the point of collecting any of this: today's numbers against the days
+before them, with a word for each. `--status` prints the same thing.
+
+The comparison is deliberately coarse-grained. Each of the previous seven local days is reduced to **one
+value** — the median of that day's uncontended measurements — and the band is the median and median
+absolute deviation across those seven numbers. The unit is the day because the question is about days: a
+band computed from six hundred individual probes measures the ordinary spread *within* a day, which is wide
+enough that a genuinely slow week would sit comfortably inside it and be reported as normal.
+
+Five series are judged:
+
+| Series | Why it earns a verdict |
+|---|---|
+| `probe:filesystem.small_file_ops_s` | The one that moves when a scanner or filter driver gets into the path |
+| `probe:filesystem.sequential_write_mib_s` | Disk throughput, at a fixed 8 MiB working set |
+| `probe:sqlite.lookup_ms` | Indexed read latency — microseconds on a healthy machine |
+| `probe:cpu.single_mops_s` | Thermal throttling and power-plan changes show up here first |
+| `tool_read_ms` | What your agent actually experienced, from your own transcripts |
+
+Everything else is charted and none of it is judged, which is a decision rather than an omission.
+`first_response_ms` mixes queue wait, thinking time and network latency, so a verdict on it would report
+the model's mood as a property of your machine. `tool_bash_ms` is mostly how long commands legitimately
+took. Token counts and cache ratios describe what you asked the agent to do.
+
+Three things every verdict discloses, because a number without them is not a finding:
+
+- **The count behind it.** Days, and measurements across those days. A day contributing fewer than three
+  measurements is dropped entirely — a median of two numbers is one of them — and fewer than four
+  contributing days produces **no verdict** rather than a confident one. On a busy week the comparable
+  subset can be small, and that is exactly when you would want to know.
+- **When the band is a convention rather than a measurement.** Seven near-identical days have a median
+  absolute deviation of zero, and a band of zero width would declare every later day either better or
+  worse. The band therefore has a floor of 5% of the baseline median, and says when the floor is what it
+  used. Measured against real probe values on an idle machine, per-probe spread is 1–10% and the
+  day-to-day spread of a daily median is well under 1%, so 5% sits above the noise without hiding
+  anything a machine would actually do.
+- **What powered the numbers.** Battery runs are counted, not excluded — a laptop that lives unplugged
+  still has a capability trend worth watching. But if today ran mostly on battery and the baseline mostly
+  on mains, the verdict says so in words, because a laptop unplugged this morning reads as degraded for a
+  reason that has nothing to do with the machine.
+
+### What changed, drawn on the charts
+
+Every chart carries marks for the things that explain a step in a line, listed underneath so the frames
+stay readable:
+
+- **Tool version changes**, as a dashed rule at the first sighting of each version. This is what turns "it
+  got slower on Tuesday" into "it got slower when it was upgraded on Tuesday". Versions come from your
+  transcripts, so this works retroactively over your whole history.
+- **Foreground runs**, as a shaded band spanning the run. A three-minute `bench` is a cliff in the passive
+  series and this is what labels it. A run that was interrupted, or is still going, is drawn open-ended
+  rather than waiting for an end that is not coming.
+
 ### Storage, privacy, and lifecycle
 
 State lives in one directory: `%LOCALAPPDATA%\agentbench\` on Windows,
@@ -204,6 +261,19 @@ Transcripts are read, never copied. What is stored from them is timings, token c
 and the project path and branch a session ran in — no prompts, no code, no command output, and nothing
 from any tool's result. If you would rather it did not read them at all, `--no-sessions` or
 `enabled = false` under `[sessions]` in `watch.toml` turns the whole stream off.
+
+The database does not grow without limit. Passive samples arrive every few seconds, so after
+`samples_raw_days` (14 by default, under `[retention]`) each whole minute of them is summarised into one
+row and the raw samples are deleted. Charts cross that boundary without being asked to: a range reaching
+back past it continues out of the summary, and the response says which part of the line is summarised and
+whether each point is that minute's mean or its peak — a swap chart keeps peaks, because a thirty-second
+burst is the event, while memory in use keeps its average. Two of the seven passive series had no column in
+the summary table before this existed; both were added rather than letting those charts stop dead at the
+boundary.
+
+Nothing else is pruned. Probe runs, session metrics and run markers arrive slowly and are the whole point
+of keeping a record, so a year of them is a few tens of megabytes and worth every byte. Retention is
+considered hourly and does nothing whenever there is nothing old enough, which is most of the time.
 
 Probes write into `probe-scratch/` inside the data directory, or inside `scratch_dir` if you set one.
 It is emptied when the daemon starts and after every probe, so a daemon killed mid-workload does not

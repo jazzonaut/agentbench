@@ -453,6 +453,7 @@ fn print_status(config: &watch::WatchConfig) -> Result<()> {
     println!("Transcripts:    {} imported", status.health.imported_files);
     println!("Import errors:  {}", status.health.import_errors);
     println!("Schema version: {}", status.health.schema_version);
+    print_verdicts(config);
     if !status.events.is_empty() {
         println!("\nRecent events:");
         for event in &status.events {
@@ -460,4 +461,72 @@ fn print_status(config: &watch::WatchConfig) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Today against its trailing baseline, as `--status` reports it.
+///
+/// Failures are printed rather than propagated. A verdict is the most derived thing in the tool and the
+/// least essential to `--status`, whose actual job is to answer "is collection working?" — so a query that
+/// cannot be answered says so on one line and leaves the counts above it intact.
+fn print_verdicts(config: &watch::WatchConfig) {
+    let comparisons = match watch::verdicts(config) {
+        Ok(comparisons) => comparisons,
+        Err(error) => {
+            println!("\nToday vs baseline: unavailable ({error:#})");
+            return;
+        }
+    };
+    println!(
+        "\nToday vs baseline (previous {} days, uncontended probes only):",
+        comparisons.window_days
+    );
+    for comparison in &comparisons.comparisons {
+        let value = comparison
+            .today
+            .map(|value| format_measurement(value, comparison.unit))
+            .unwrap_or_else(|| "—".to_string());
+        let change = comparison
+            .delta_percent
+            .map(|delta| format!(" ({delta:+.1}%)"))
+            .unwrap_or_default();
+        println!(
+            "  {:<26} {:<9} {value}{change}",
+            comparison.label,
+            comparison.verdict.as_str(),
+        );
+        // The count behind a figure and any caveat on it are part of the finding, not a footnote: a
+        // reader deciding whether to investigate needs both on the same screen.
+        if let Some(baseline) = &comparison.baseline {
+            println!(
+                "  {:<26} baseline {} from {} day(s), {} measurement(s)",
+                "",
+                format_measurement(baseline.median, comparison.unit),
+                baseline.days,
+                baseline.observations
+            );
+        }
+        if let Some(note) = &comparison.note {
+            println!("  {:<26} {note}", "");
+        }
+    }
+}
+
+/// Print a measurement with enough precision to be readable at whatever scale it happens to be.
+///
+/// One fixed number of decimal places cannot serve this set. A probe inserts three hundred thousand SQLite
+/// rows a second and looks one up in four *microseconds*; printed to one decimal place the first is noise
+/// and the second is "0.0 ms" for ever. Found by running the daemon and reading `--status`, which is the
+/// only place this class of fault ever shows up.
+fn format_measurement(value: f64, unit: &str) -> String {
+    let magnitude = value.abs();
+    let digits = if magnitude >= 100.0 {
+        0
+    } else if magnitude >= 1.0 {
+        1
+    } else if magnitude >= 0.01 {
+        3
+    } else {
+        5
+    };
+    format!("{value:.digits$} {unit}")
 }

@@ -158,8 +158,8 @@ machine look faster the more went wrong. On real data they are 3.3% of calls.
 | 1 | Spine: config, store with migrations, sampler, `events`, `--status`, one live tile and one chart | **done** |
 | 2 | Sessions: transcript parsing, derivation, watermarks, full backfill | **done** |
 | 3 | Probes: micro workloads, covariates, run markers | **done** |
-| 4 | Analysis: baseline, verdicts, annotations, rollup and retention | next |
-| 5 | Ship: README/CHANGELOG polish, autostart docs | mostly done in 1 |
+| 4 | Analysis: baseline, verdicts, annotations, rollup and retention | **done** |
+| 5 | Ship: README/CHANGELOG polish, autostart docs | mostly done in 1 and 4 |
 
 ### Deviations from the plan as executed
 
@@ -289,6 +289,113 @@ machine look faster the more went wrong. On real data they are 3.3% of calls.
   child process. The derivation now lives in one place, which it has to: that value is the primary key of
   the `machines` table, and two spellings of it would silently split one machine's history in two.
 
+- **The baseline's unit is the day, not the measurement.** Decision 12 said "trailing 7-day median/MAD
+  band" without saying what the band is over, and the two readings behave completely differently. Pooling
+  the window's individual runs — about 670 at the default cadence — produces a band that measures the
+  *within-day* spread, which on real data is 1–10% per probe; a genuinely slow week sits inside it and
+  reports as normal. Reducing each day to one value and taking median/MAD across those seven numbers
+  measures day-to-day variance, which is what a day-over-day verdict is asking about. The cost is that
+  seven numbers make a coarse MAD, which is what forces the floor below.
+- **The band has a relative floor, and that floor is load-bearing rather than cosmetic.** A MAD over seven
+  daily values is frequently *exactly zero* — measured on this machine, `sqlite.lookup_ms` had a
+  day-to-day MAD of 0.0 and the others were 0.03–1.0% of their medians. A band of zero width declares every
+  subsequent day either better or worse than history, which is a verdict generator rather than a verdict.
+  The floor is 5% of the baseline median, and `width_is_floor` is reported so a reader is told when the band
+  is a convention instead of a measurement. Validated by seeding a real database with real collected values
+  as previous days: today read `normal` on all four probe series with deltas of 0.0–0.7%, and the floor was
+  what defined the band in every one of them. The honest caveat is that seeded days drawn from one
+  afternoon understate true day-to-day variance, so in real use the measured spread will bind more often
+  than the floor — which is the intended regime, with the floor protecting the degenerate case.
+- **Battery runs are reported, not excluded.** The covariate exists to be filtered at analysis time, and
+  three filters were available: exclude known-battery runs, match today's dominant power source, or count
+  everything and disclose the mix. Excluding was rejected because a laptop that lives unplugged would never
+  reach a verdict at all — the feature would be dead exactly where capability drift matters most. The
+  decision was to count everything and, when today's majority power source differs from the baseline's, say
+  so in words beside the verdict. The accepted cost is explicit: a laptop unplugged this morning reads as
+  degraded, and the caveat rather than the filter is what tells the reader why.
+- **A verdict declines rather than guesses.** A day contributing fewer than three measurements is dropped
+  entirely, because a median of two numbers is one of them, and fewer than four contributing days yields
+  `Insufficient` — a distinct outcome from `Normal`, since "behaving as usual" and "nobody knows" warrant
+  different responses. Every verdict carries the day count *and* the measurement count behind it, because
+  seven days of two probes each is not a week of evidence and the day count alone is flattering.
+- **`first_response_ms` and `tool_bash_ms` are charted and deliberately not judged.** Both were candidates
+  for the curated set and both would have been false-alarm generators: the first contains the whole thinking
+  block, so a verdict on it reports the model's mood as a property of the machine, and the second is
+  dominated by how long commands legitimately took and by waits for a human to grant permission. Token
+  counts and cache ratios describe what was asked of the agent. This is asserted in a test so the exclusion
+  cannot be quietly undone.
+- **Annotations needed no table.** Decision 12 promised version annotations and the design implied storing
+  them; both sources — `tool_versions` from phase 2 and `run_markers` from phase 3 — were already being
+  collected for exactly this purpose, so annotations are a query over facts rather than a fourth stream. A
+  version's mark is the *first* sighting of it, since the importer records the running version on every
+  transcript row it reads and a mark per sighting would paint the axis solid. Run marks are returned for runs
+  *overlapping* the range rather than starting inside it: a stress run that began before the window is the
+  explanation for everything in it, and a mark drawn only at its start would be off-screen when it matters.
+- **Retention runs on the writer thread, as an instruction rather than a row.** The single-writer rule is
+  what makes this database intelligible, and a bulk summarise-and-delete issued from a second connection is
+  precisely the race it exists to prevent. `Record::Maintenance` therefore travels the same channel as
+  every sample, and the writer commits the batch first and then does the housekeeping in transactions of its
+  own — a fortnight of backlog must not be welded to whatever samples happened to be queued beside it. A
+  failure is logged and swallowed: retention is the least important thing the daemon does, and propagating
+  the error would take the writer thread down and stop every stream.
+- **`samples_1m` was two columns short, and nothing had noticed because nothing wrote to it.** The v1 table
+  summarised five of the seven passive series the dashboard advertises. Left alone, a thirty-day chart of
+  system CPU would have kept its history while the same chart of process count stopped dead at the retention
+  boundary with nothing on the page to explain the difference. Migration v3 adds `process_count_avg` and
+  `agent_rss_max`; the table has never held a row on any machine, so widening it needed no backfill.
+- **A summarised minute is never rewritten.** The cutoff is aligned down to a minute boundary so a
+  summarised bucket is always whole, and a late sample landing in a minute already rolled up is pruned
+  without being merged. Merging would mean averaging an average, which is a number that is neither the mean
+  of the minute nor anything else. It takes a clock going backwards to reach this case, and losing one
+  sample is a better outcome than a corrupted summary.
+- **A chart that reads from two tables has to say so.** A rolled-up point is a summary of sixty seconds, and
+  which summary depends on the series: memory in use keeps its average because the average is what the
+  machine was living with, while swap and scanner CPU keep their peak because a thirty-second burst *is* the
+  event. The response therefore reports `resolution` (`raw` / `rollup` / `mixed`) and the reducer, and the
+  page notes it under the chart. Mixed is the normal case for any range spanning the boundary, not an error.
+- **Two display faults were found by running the daemon and reading the output, again.** `sqlite.lookup_ms`
+  is genuinely four or five microseconds on a healthy machine, and both surfaces rendered it as "0 ms" —
+  the web formatter was written for tool latencies in the tens of milliseconds, and `--status` printed one
+  decimal place. A metric in the judged set that reads zero for ever is worse than one that is absent. Every
+  unit test passed throughout, for the same reason as in phase 3: they asserted formatting against numbers
+  they chose themselves.
+- **A gap threshold floored at a fraction of the requested range was built and reverted, and the underlying
+  limitation is still open.** The problem is real: a range whose cadence changed within it has a median
+  spacing set by the dense half, against which every sparse point is an outage and becomes an island between
+  two breaks — and an island has no line segment to belong to, so a chart holding seventy-two points can
+  render as an empty frame. Flooring the threshold at a forty-eighth of the *requested* range fixed that and
+  immediately drew a confident straight line across a ninety-second daemon restart, because the request was
+  for forty-eight hours while the plot had auto-ranged to nine minutes. The server cannot know what the
+  client will auto-range to, so the threshold has no business consulting the request, and interpolating
+  through unobserved time is the worse of the two failures. Reverted to the cadence rule.
+  Point markers were also left on uPlot's automatic rule rather than switched off, which is an improvement in
+  its own right — four probes in an hour-wide view are now visible instead of being three faint segments —
+  but it does **not** rescue the island case: twelve points ten minutes apart are about two pixels apart in a
+  forty-eight-hour plot, too dense for uPlot to mark and with no segment to join. Verified by screenshot, not
+  assumed. The mixed-cadence range therefore still renders its minority-cadence stretch as blank, and the
+  real fix is per-neighbourhood gap detection rather than one threshold for the whole series.
+- **The y-axis width is measured rather than fixed.** A hardcoded 52 pixels fits `30.0%` and clips
+  `7,129 ops/s` to `000 ops/s`, which reads as a chart of small numbers rather than as a truncated label.
+- **The percentile convention moved into `model`.** It was hand-rolled in `Metric::distribution` and again
+  in the session series reducer, and a baseline needed a third copy. A p50 on a chart, a p50 in a printed
+  report and a p50 behind a verdict have to be the same number, and a reader comparing two of them has no
+  way to discover that they were not.
+- **Local-day arithmetic has one home.** `clock::local_day_start_ms` was deleted and `analysis::day` owns
+  it, because the live tiles count "today" and the baselines count the days before it — if those two
+  disagreed about when today started, the page would show a figure the verdict beside it was not computed
+  from. `Day` carries a start and an end rather than a start and a constant, since two days a year are 23 or
+  25 hours long.
+- **The retention startup delay was set to sixty seconds and then to ten.** Sixty was conservative without
+  a reason that survived scrutiny: startup is a socket bind and a primed sampler, well under a second
+  between them, and a longer delay only means a daemon someone runs for a few minutes at a time never gets
+  round to it. Ten seconds also makes the wiring testable inside a normal integration test, which sixty did
+  not.
+- **Verdict and retention integration tests seed history rather than waiting for it.** A verdict needs days
+  of data and retention needs samples older than both its window and the minute in progress; neither can be
+  produced by waiting. Both tests write through the real `Store` before the daemon opens the directory, so
+  the rows are exactly the shape the daemon produces — including the machine id, which has to match or the
+  daemon reads none of them.
+
 ### ratatui and the MSRV
 
 **Decided: adopt ratatui 0.30. MSRV is 1.88, and is now verified.**
@@ -316,7 +423,15 @@ test targets would only invite a failure the day a dev-dependency raises its own
 The general lesson is worth keeping: a version constraint that nothing executes is a guess with a
 number in it.
 
-### Open questions carried into phase 4
+### Questions phase 4 answered
+
+- **"What a verdict does when the uncontended subset is too small" is now a number.** Fewer than three
+  measurements in a day drops the day; fewer than four contributing days declines the verdict. Both are
+  reported rather than implied, and `--status` prints the counts beside every figure.
+- **Whether the baseline should filter on power was decided as "no, disclose".** Recorded above with the
+  reasoning and the accepted cost.
+
+### Open questions carried into phase 5 and beyond
 
 - **Whether `agentbench top` or the `bench` progress display is rewritten first.** The progress display
   is currently a static text list where gauges and a sparkline would help most; `top` already works.
@@ -326,11 +441,23 @@ number in it.
 - **Whether subagent activity should be distinguishable from the session that spawned it.** Both are
   real work on this machine and both are imported, but a heavy workflow's tool calls currently blend
   into the parent project's numbers, and neither table records which is which.
-- **What a verdict does when the uncontended subset is too small.** Phase 3 collects the tag and phase 4
-  has to act on it. The accepted-costs section already says a verdict must report the sample count behind
-  each baseline and decline to compute a band from too few points, but "too few" is now a number someone
-  has to choose, and `--status` reports the clean count precisely so that choice can be made against real
-  data rather than guessed at.
+- **How to break a line when the cadence changed inside the range.** One threshold for the whole series
+  cannot serve two cadences, and the two wrong answers are both known: the median leaves the sparse stretch
+  blank, and a range-relative floor interpolates across real outages. A per-neighbourhood rule — compare each
+  spacing to its local neighbours rather than to the series median — would answer it. Worth doing when
+  somebody actually changes `--probe-interval` mid-history and notices; today it needs that to happen
+  deliberately.
+- **Whether the 5% band floor survives a real week.** It was validated against real values standing in for
+  previous days, which understates day-to-day variance. The question it cannot answer is what the *true*
+  day-to-day MAD of a daily median is across reboots, thermal states and background load. A week of real
+  collection settles it: if the measured spread routinely exceeds the floor, the floor is doing only its
+  intended degenerate-case job; if it does not, 5% is the de facto sensitivity of the whole feature and
+  deserves to be chosen deliberately rather than inherited.
+- **Whether `memory.write_gib_s` is measuring what it claims.** A release-build probe reports about
+  0.07 GiB/s on a machine that should manage two orders of magnitude more. It is not in the judged set so it
+  did not block this phase, but the workload is shared with `bench`, which means either the probe's 64 MiB
+  scale is too small to measure bandwidth or the benchmark has been reporting the same wrong number all
+  along. Worth measuring before anything is changed, since a fix moves published report values.
 - **Whether run markers should suppress probes while a foreground run is in flight.** Today a probe that
   lands during a `bench` run is collected and tagged contended by its own covariates, which is consistent
   and costs nothing. The alternative — the marker telling the prober to skip — trades a correctly-tagged

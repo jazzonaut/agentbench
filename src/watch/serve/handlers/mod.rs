@@ -7,6 +7,8 @@
 //! [`Resp`]: crate::watch::serve::response::Resp
 //! [`Reader`]: crate::watch::store::Reader
 
+pub mod annotations;
 pub mod live;
 pub mod series;
 pub mod status;
+pub mod verdicts;

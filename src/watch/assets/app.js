@@ -25,8 +25,11 @@ const dom = {
   subtitle: document.getElementById('subtitle'),
   tiles: document.getElementById('tiles'),
   today: document.getElementById('today'),
+  verdicts: document.getElementById('verdicts'),
+  verdictsNote: document.getElementById('verdicts-note'),
   ranges: document.getElementById('ranges'),
   uncontended: document.getElementById('uncontended'),
+  marks: document.getElementById('marks'),
   statusLine: document.getElementById('status-line'),
   events: document.querySelector('#events tbody'),
 };
@@ -42,9 +45,14 @@ const CHARTS = [
   { id: 'chart-probe-fs', metric: 'probe:filesystem.small_file_ops_s', label: 'probe throughput' },
 ].map((config) => {
   const element = document.getElementById(config.id);
+  const note = element.closest('.card')?.querySelector('.card-note') ?? null;
   const panel = {
     ...config,
     unit: '',
+    note,
+    // The note as authored in the markup, so a resolution caveat can be appended and later removed
+    // without the original wording being lost after the first poll.
+    baseNote: note?.textContent.trim() ?? '',
     empty: document.querySelector(`[data-empty-for="${config.id}"]`),
   };
   // The closure reads `panel.unit` on every call rather than capturing it, so the first response can
@@ -158,6 +166,81 @@ function renderToday(today, dayStart) {
   );
 }
 
+/** One series judged against its trailing baseline.
+ *
+ *  Every tile states the evidence as well as the finding. A verdict drawn from four probes on three days is
+ *  a different thing from one drawn from ninety on seven, and a reader deciding whether to go and look at
+ *  the machine needs to be able to tell them apart without opening the API.
+ */
+function verdictTile(comparison) {
+  const format = unitFormatter(comparison.unit);
+  const node = document.createElement('div');
+  node.className = `verdict ${comparison.verdict}`;
+
+  const head = document.createElement('div');
+  head.className = 'verdict-head';
+  const value = document.createElement('span');
+  value.className = 'verdict-value';
+  value.textContent = comparison.today === null ? '—' : format(comparison.today);
+  const word = document.createElement('span');
+  word.className = `verdict-word ${comparison.verdict}`;
+  // The word is always present: the colour of the rule is a second encoding, never the only one.
+  word.textContent = comparison.verdict === 'insufficient'
+    ? 'no verdict'
+    : comparison.delta_percent === null
+      ? comparison.verdict
+      : `${comparison.verdict} ${comparison.delta_percent >= 0 ? '+' : ''}${comparison.delta_percent.toFixed(1)}%`;
+  head.append(value, word);
+
+  const label = document.createElement('div');
+  label.className = 'verdict-label';
+  label.textContent = comparison.baseline === null
+    ? comparison.label
+    : `${comparison.label} · baseline ${format(comparison.baseline.median)} over ${count(comparison.baseline.days)} day(s)`;
+
+  node.append(head, label);
+  const evidence = comparison.baseline === null
+    ? null
+    : `${count(comparison.today_observations)} today, ${count(comparison.baseline.observations)} in the baseline`;
+  for (const text of [evidence, comparison.note ?? null]) {
+    if (!text) continue;
+    const line = document.createElement('div');
+    line.className = 'verdict-note';
+    line.textContent = text;
+    node.append(line);
+  }
+  return node;
+}
+
+function renderVerdicts(payload) {
+  dom.verdicts.replaceChildren();
+  for (const comparison of payload.comparisons) {
+    dom.verdicts.append(verdictTile(comparison));
+  }
+  const judged = payload.comparisons.filter((one) => one.verdict !== 'insufficient').length;
+  dom.verdictsNote.textContent = judged === 0
+    ? `Since ${dateTime(payload.day_start_ms)}, against the previous ${payload.window_days} days. Nothing has enough comparable measurements to judge yet.`
+    : `Since ${dateTime(payload.day_start_ms)}, against the median of the previous ${payload.window_days} days. Only uncontended probes count.`;
+}
+
+/** Name the marks drawn on the charts, in reading order. */
+function renderMarks(annotations) {
+  dom.marks.replaceChildren();
+  if (annotations.length === 0) return;
+  for (const mark of annotations) {
+    const item = document.createElement('li');
+    const swatch = document.createElement('span');
+    swatch.className = `mark-swatch ${mark.kind}`;
+    const text = document.createElement('span');
+    // Dated, not just clocked. Ranges run to a week, and two marks a day apart both reading "10:48" is
+    // worse than no label at all — it invites a reader to line up the wrong one with a step in a chart.
+    text.textContent = `${mark.label} · ${dateTime(mark.ts)}`;
+    if (mark.detail) item.title = mark.detail;
+    item.append(swatch, text);
+    dom.marks.append(item);
+  }
+}
+
 function renderStatus(status) {
   const fresh = status.collecting;
   dom.statusLine.replaceChildren();
@@ -239,9 +322,16 @@ function renderRanges() {
 
 async function loadLive() {
   try {
-    const [live, status] = await Promise.all([api('/api/live'), api('/api/status')]);
+    // Verdicts are polled with the tiles rather than with the history: they are about today, and today
+    // changes while you are looking at it.
+    const [live, status, verdicts] = await Promise.all([
+      api('/api/live'),
+      api('/api/status'),
+      api('/api/verdicts'),
+    ]);
     renderTiles(live);
     renderToday(live.today, live.day_start_ts);
+    renderVerdicts(verdicts);
     renderStatus(status);
     dom.subtitle.textContent = `machine ${live.machine_id.slice(0, 12)} · uPlot ${status.uplot_version}`;
   } catch (error) {
@@ -249,11 +339,33 @@ async function loadLive() {
   }
 }
 
+/** A note explaining a line whose character changes partway along it. */
+function resolutionNote(series) {
+  if (!series.resolution || series.resolution === 'raw') return null;
+  const summary = series.rollup_reducer === 'max'
+    ? 'per-minute peaks'
+    : 'per-minute averages';
+  return series.resolution === 'rollup'
+    ? `${summary} · older samples have been summarised`
+    : `${summary} before the step in cadence · recent samples are unsummarised`;
+}
+
 async function loadHistory() {
   const to = Date.now();
   const from = to - selectedRange.ms;
   // Only probe series carry contention, so the filter is appended only where it means something.
   const contended = dom.uncontended.checked ? '&contended=exclude' : '';
+
+  // Marks are shared by every frame, so they are fetched once and handed to all of them. A failure here
+  // leaves the charts drawn and unannotated rather than taking the history down.
+  let annotations = [];
+  try {
+    annotations = (await api(`/api/annotations?from=${from}&to=${to}`)).annotations;
+  } catch {
+    annotations = [];
+  }
+  renderMarks(annotations);
+
   // Each chart loads independently, so one failing metric leaves the others readable.
   await Promise.all(
     CHARTS.map(async (panel) => {
@@ -262,8 +374,12 @@ async function loadHistory() {
         const query = `metric=${encodeURIComponent(panel.metric)}&from=${from}&to=${to}${filter}`;
         const series = await api(`/api/series?${query}`);
         if (series.unit) panel.unit = series.unit;
+        panel.chart.setAnnotations(annotations);
         panel.chart.update(series.points, series.gap_ms);
         panel.empty.hidden = series.points.length > 0;
+        const note = resolutionNote(series);
+        if (note && panel.note) panel.note.textContent = `${panel.baseNote} · ${note}`;
+        else if (panel.note) panel.note.textContent = panel.baseNote;
       } catch (error) {
         panel.empty.hidden = false;
         panel.empty.textContent = `Could not load ${panel.metric}: ${error.message}`;

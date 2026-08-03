@@ -231,6 +231,21 @@ pub struct ToolVersion {
     pub version: String,
 }
 
+/// Housekeeping the writer performs, rather than a row it stores.
+///
+/// Retention travels the same channel as everything else for one reason: the writer is the only thing in
+/// the process that may mutate the database, and a bulk summarise-and-delete issued from another connection
+/// is precisely the race that rule exists to make impossible. Sending an instruction keeps the guarantee
+/// intact without a second lock or a second connection.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct Maintenance {
+    /// Summarise and prune raw samples older than this instant.
+    ///
+    /// An absolute instant rather than an age, so the decision about what "old" means is made once by
+    /// whoever holds the configuration, and the writer neither reads it nor has to agree about the clock.
+    pub samples_before_ms: i64,
+}
+
 /// How far one transcript has been imported.
 ///
 /// `size` is a byte offset, not merely a change detector: transcripts are append-only, so the next
@@ -255,6 +270,7 @@ pub enum Record {
     ToolCall(ToolCall),
     ToolVersion(ToolVersion),
     Watermark(Watermark),
+    Maintenance(Maintenance),
 }
 
 impl Record {
@@ -264,6 +280,10 @@ impl Record {
     /// later. A dropped session row is lost for good: its watermark advances past it and no later pass
     /// will look at that byte range again. A dropped probe run is worse still — the machine has already
     /// been loaded to produce it, and the next one is fifteen minutes away.
+    ///
+    /// A maintenance instruction would in fact be harmless to drop, since another follows in an hour. It
+    /// is not droppable anyway, because "only a sample may be discarded" is a rule worth being able to
+    /// state without exceptions, and waiting a moment once an hour costs nothing.
     pub fn is_droppable(&self) -> bool {
         matches!(self, Self::Sample(_))
     }
@@ -314,5 +334,11 @@ impl From<ToolVersion> for Record {
 impl From<Watermark> for Record {
     fn from(value: Watermark) -> Self {
         Self::Watermark(value)
+    }
+}
+
+impl From<Maintenance> for Record {
+    fn from(value: Maintenance) -> Self {
+        Self::Maintenance(value)
     }
 }

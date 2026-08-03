@@ -10,7 +10,7 @@ use crate::watch::{
     serve::response::{Req, Resp},
     store::{
         Reader,
-        queries::{self, ProbeSeries, SampleSeries, SessionSeries},
+        queries::{self, ProbeSeries, Reducer, Resolution, SampleSeries, SessionSeries},
     },
 };
 use serde::Serialize;
@@ -91,6 +91,15 @@ struct Series {
     unit: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     lower_is_better: Option<bool>,
+    /// Which tables a passive series was read from, absent where the question does not arise.
+    ///
+    /// Passive samples are the only stream retention summarises, so probe runs and derived session series
+    /// have no resolution to report and say nothing rather than saying "raw" and implying a choice.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resolution: Option<Resolution>,
+    /// How the rolled-up stretch of the range was summarised, when some of it was.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rollup_reducer: Option<Reducer>,
     truncated: bool,
     points: Vec<queries::Point>,
 }
@@ -120,16 +129,21 @@ pub fn handle(req: &Req, reader: &Reader) -> Resp {
     match series {
         Requested::Sample(sample) => {
             match queries::series(reader.conn(), reader.machine_id(), sample, from, to, limit) {
-                Ok(points) => Resp::json(&Series {
+                Ok(rows) => Resp::json(&Series {
                     metric: series.wire_name(),
                     from,
                     to,
-                    gap_ms: gap_threshold_ms(&points),
-                    bucket_ms: None,
+                    // Derived from the points as they came back, so a range that crosses the retention
+                    // boundary breaks its line on the change of cadence as well as on any real outage.
+                    gap_ms: gap_threshold_ms(&rows.points),
+                    bucket_ms: (rows.resolution != Resolution::Raw)
+                        .then_some(queries::samples::ROLLUP_BUCKET_MS),
                     unit: None,
                     lower_is_better: None,
-                    truncated: points.len() >= limit,
-                    points,
+                    resolution: Some(rows.resolution),
+                    rollup_reducer: rows.reducer,
+                    truncated: rows.truncated,
+                    points: rows.points,
                 }),
                 Err(error) => Resp::error(500, &format!("series query failed: {error}")),
             }
@@ -160,6 +174,8 @@ pub fn handle(req: &Req, reader: &Reader) -> Resp {
                     bucket_ms: None,
                     unit: Some(probe.spec.unit),
                     lower_is_better: Some(probe.spec.lower_is_better),
+                    resolution: None,
+                    rollup_reducer: None,
                     truncated: false,
                     points,
                 }),
@@ -188,6 +204,8 @@ pub fn handle(req: &Req, reader: &Reader) -> Resp {
                     bucket_ms: Some(bucket),
                     unit: None,
                     lower_is_better: None,
+                    resolution: None,
+                    rollup_reducer: None,
                     truncated: false,
                     points,
                 }),
@@ -204,8 +222,17 @@ fn bucket_ms(from: i64, to: i64) -> i64 {
 
 /// Infer a gap threshold from the observed cadence.
 ///
-/// Uses the median inter-point spacing rather than the configured interval, because the cadence
-/// changes with machine idleness and history may span several configurations.
+/// Uses the median inter-point spacing rather than the configured interval, because the cadence changes with
+/// machine idleness and a range may span several configurations.
+///
+/// A range whose cadence changed *within* it — a fortnight of quarter-hourly probes beside an afternoon at
+/// `--probe-interval 1s` — has a median of a second or two, against which every one of the older points
+/// looks like an outage and becomes an island between two breaks. That is a real effect and it is left
+/// alone here, because the alternative was worse: a floor tied to the requested range drew a confident
+/// straight line across a ninety-second daemon restart, since the request was for forty-eight hours while
+/// the plot had auto-ranged to nine minutes. Breaking the line is the honest answer in both cases, and an
+/// island is made visible by the chart's point markers rather than by loosening the threshold that decides
+/// what counts as unobserved time.
 fn gap_threshold_ms(points: &[queries::Point]) -> i64 {
     if points.len() < 3 {
         return DEFAULT_WINDOW_MS;
@@ -254,6 +281,21 @@ mod tests {
     fn duplicate_timestamps_cannot_produce_a_zero_threshold() {
         let series = points(&[0, 0, 0, 0]);
         assert!(gap_threshold_ms(&series) > 0);
+    }
+
+    /// A restart in the middle of a range still breaks the line, whatever range was requested.
+    ///
+    /// The regression this guards against was a threshold floored at a fraction of the *requested* range: a
+    /// forty-eight-hour request whose data spanned nine minutes got an hour-wide threshold, and drew a
+    /// straight confident line across the minute and a half the daemon was not running.
+    #[test]
+    fn a_short_outage_in_a_dense_series_is_still_a_gap() {
+        let series = points(&[1_000, 1_000, 1_000, 90_000, 1_000, 1_000]);
+        let threshold = gap_threshold_ms(&series);
+        assert!(
+            threshold < 90_000,
+            "a ninety-second outage must not be interpolated across: {threshold}"
+        );
     }
 
     #[test]

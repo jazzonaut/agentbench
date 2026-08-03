@@ -59,8 +59,19 @@ impl Daemon {
         )
     }
 
+    /// Start against a data directory that already holds a database.
+    ///
+    /// The only way to test anything that depends on history: a verdict needs days of it and retention needs
+    /// samples older than its window, and neither can be produced by waiting.
+    fn start_in(data_dir: tempfile::TempDir, extra: &[&str]) -> Self {
+        Self::spawn_in(data_dir, extra, &["--no-sessions", "--no-probes"])
+    }
+
     fn spawn(extra: &[&str], sessions: &[&str]) -> Self {
-        let data_dir = tempfile::tempdir().expect("temp data dir");
+        Self::spawn_in(tempfile::tempdir().expect("temp data dir"), extra, sessions)
+    }
+
+    fn spawn_in(data_dir: tempfile::TempDir, extra: &[&str], sessions: &[&str]) -> Self {
         // Port 0 is not usable here because the daemon prints its URL rather than exposing it, so
         // pick a free port up front and hand it over.
         let port = free_port();
@@ -166,6 +177,52 @@ impl Drop for Daemon {
     }
 }
 
+/// Schema version this build migrates a database to.
+fn schema_version() -> u32 {
+    agentbench::watch::store::migrations::target_version()
+}
+
+/// Write records into a dashboard database before any daemon has opened it.
+///
+/// Goes through the real [`Store`] rather than raw SQL, so the rows are exactly the shape the daemon
+/// produces — including the machine id, which has to match or the daemon will read none of them.
+///
+/// [`Store`]: agentbench::watch::store::Store
+fn seed(data_dir: &Path, records: Vec<agentbench::watch::store::Record>) {
+    use agentbench::watch::store::Store;
+    let inventory = agentbench::system::inventory(false);
+    let store = Store::open(&data_dir.join("watch.db"), &inventory).expect("open seeded database");
+    let sink = store.sink();
+    for record in records {
+        assert!(sink.send(record), "the seed queue should not be full");
+    }
+    drop(sink);
+    store.shutdown().expect("commit the seeded rows");
+}
+
+/// One probe run measuring small-file throughput, as the prober would have written it.
+fn seeded_probe(ts: i64, ops: f64) -> agentbench::watch::store::Record {
+    use agentbench::watch::store::{Covariates, MetricSource, ProbeMetric, ProbeRun};
+    ProbeRun {
+        ts,
+        covariates: Covariates {
+            cpu_percent: Some(3.0),
+            scanner_percent: Some(0.1),
+            agent_active: false,
+            contended: false,
+            on_battery: Some(false),
+        },
+        metrics: vec![ProbeMetric {
+            name: "filesystem.small_file_ops_s".into(),
+            value: ops,
+            unit: "ops/s".into(),
+            lower_is_better: false,
+            source: MetricSource::Probe,
+        }],
+    }
+    .into()
+}
+
 /// A short-lived command for `profile` to launch.
 ///
 /// The test binary's own executable, so the test depends on nothing being installed and the child exits
@@ -232,9 +289,11 @@ fn the_daemon_collects_serves_and_shuts_down_cleanly() {
         status["health"]["samples"].as_i64().unwrap_or(0) > 0
     });
     assert_eq!(status["collecting"], true, "{status}");
+    // Against the version this build migrates to, not a literal: what matters is that the daemon reports
+    // the schema it actually applied, and a literal here goes stale on every migration.
     assert_eq!(
         status["health"]["schema_version"].as_i64(),
-        Some(2),
+        Some(i64::from(schema_version())),
         "{status}"
     );
     assert!(
@@ -516,6 +575,193 @@ fn a_foreground_run_does_not_create_a_dashboard_database() {
     );
 }
 
+/// A verdict, end to end: seeded days go through the real writer, the real local-day bucketing and the
+/// real endpoint.
+///
+/// This is the test the phase before this one did not have. Every unit test of the classification rule
+/// passed while the numbers fed to it were wrong, so the rule is checked here against data that travelled
+/// the whole way rather than against arguments a test chose.
+#[test]
+fn verdicts_compare_today_against_a_seeded_baseline() {
+    use agentbench::watch::analysis::day;
+
+    let data_dir = tempfile::tempdir().expect("temp data dir");
+    let today = day::today();
+    let mut records = Vec::new();
+    // Five settled days at 4,000 ops/s. Four runs each: enough for a day to have a median at all.
+    for previous in day::preceding(today, 5) {
+        for offset in 0..4 {
+            records.push(seeded_probe(
+                previous.start_ms + offset * 3_600_000,
+                4_000.0,
+            ));
+        }
+    }
+    // Today, at half that. Offsets in seconds so the run stamps stay in the past whatever time it is.
+    for offset in 0..4 {
+        records.push(seeded_probe(today.start_ms + offset * 1_000, 2_000.0));
+    }
+    seed(data_dir.path(), records);
+
+    let daemon = Daemon::start_in(data_dir, &[]);
+    daemon.wait_until_listening();
+    let payload: serde_json::Value =
+        serde_json::from_str(&daemon.get("/api/verdicts")).expect("valid json");
+
+    let small_files = payload["comparisons"]
+        .as_array()
+        .expect("comparisons")
+        .iter()
+        .find(|one| one["metric"] == "probe:filesystem.small_file_ops_s")
+        .expect("the curated set includes small-file operations");
+
+    assert_eq!(small_files["verdict"], "worse", "{small_files}");
+    assert_eq!(small_files["today"].as_f64(), Some(2_000.0));
+    assert_eq!(small_files["baseline"]["median"].as_f64(), Some(4_000.0));
+    assert_eq!(small_files["baseline"]["days"].as_i64(), Some(5));
+    assert_eq!(
+        small_files["baseline"]["observations"].as_i64(),
+        Some(20),
+        "the count behind the band is part of the finding"
+    );
+    assert_eq!(small_files["today_observations"].as_i64(), Some(4));
+    let delta = small_files["delta_percent"].as_f64().expect("a delta");
+    assert!((delta + 50.0).abs() < 1e-6, "{delta}");
+    assert_eq!(payload["window_days"], 7);
+    assert_eq!(payload["day_start_ms"].as_i64(), Some(today.start_ms));
+
+    // Five identical days have no measurable spread, and the band says so rather than pretending to.
+    assert_eq!(small_files["baseline"]["width_is_floor"], true);
+    assert!(
+        small_files["note"]
+            .as_str()
+            .is_some_and(|note| note.contains("minimum width")),
+        "{small_files}"
+    );
+
+    // A series with no seeded history reaches no verdict rather than reporting that all is well.
+    let cpu = payload["comparisons"]
+        .as_array()
+        .expect("comparisons")
+        .iter()
+        .find(|one| one["metric"] == "probe:cpu.single_mops_s")
+        .expect("single-core CPU is judged too");
+    assert_eq!(cpu["verdict"], "insufficient", "{cpu}");
+
+    // The same numbers reach the command line, from the same analysis.
+    let temp = daemon.stop();
+    let output = Command::cargo_bin("agentbench")
+        .expect("built binary")
+        .args(["dashboard", "--status", "--data-dir"])
+        .arg(temp.path())
+        .output()
+        .expect("run status");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Today vs baseline"), "{stdout}");
+    assert!(stdout.contains("small-file operations"), "{stdout}");
+    assert!(stdout.contains("worse"), "{stdout}");
+    assert!(stdout.contains("(-50.0%)"), "{stdout}");
+}
+
+/// Retention, end to end: the worker is spawned, its instruction reaches the writer, and the chart survives.
+///
+/// Seeded rather than waited for. Samples have to be older than the retention window and older than the
+/// minute in progress, and no amount of waiting produces that within a test's patience.
+#[test]
+fn retention_summarises_old_samples_and_the_series_survives_it() {
+    use agentbench::watch::store::Sample;
+
+    let data_dir = tempfile::tempdir().expect("temp data dir");
+    // Two days old, so any retention window of a day or more covers them. Aligned to a minute boundary so
+    // that twenty-four samples at a five-second cadence fall into exactly two buckets rather than
+    // straddling three, which would make the assertion below depend on the time the test happened to run.
+    let old =
+        (agentbench::watch::store::now_ms() - 2 * 24 * 60 * 60 * 1000).div_euclid(60_000) * 60_000;
+    let records: Vec<agentbench::watch::store::Record> = (0..24)
+        .map(|index| {
+            Sample {
+                // Five-second cadence across two minutes: twelve samples per bucket.
+                ts: old + index * 5_000,
+                cpu_percent: 10.0 + index as f32,
+                used_memory: 1 << 30,
+                total_memory: 16 << 30,
+                used_swap: 0,
+                process_count: 400,
+                scanner_cpu: None,
+                agent_cpu: None,
+                agent_rss: None,
+                agent_processes: None,
+            }
+            .into()
+        })
+        .collect();
+    seed(data_dir.path(), records);
+    std::fs::write(
+        data_dir.path().join("watch.toml"),
+        "[retention]\nsamples_raw_days = 1\n",
+    )
+    .expect("write the retention window");
+
+    let daemon = Daemon::start_in(data_dir, &[]);
+    daemon.wait_until_listening();
+    // The pass reports itself through the operational log, which is how a daemon behind a scheduler
+    // explains what it did to data nobody watched it touch.
+    let status = daemon.wait_for_status("a retention pass runs", |status| {
+        status["events"]
+            .as_array()
+            .is_some_and(|events| events.iter().any(|event| event["source"] == "retention"))
+    });
+    let report = status["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .find(|event| event["source"] == "retention")
+        .and_then(|event| event["message"].as_str())
+        .expect("a retention message")
+        .to_string();
+    assert!(report.contains("rolled up 2 minute(s)"), "{report}");
+    assert!(report.contains("pruned 24 raw sample(s)"), "{report}");
+
+    // The point of the exercise: the two-day-old stretch is still chartable, now as summarised minutes.
+    let from = old - 60_000;
+    let to = old + 5 * 60_000;
+    let series: serde_json::Value = serde_json::from_str(&daemon.get(&format!(
+        "/api/series?metric=cpu_percent&from={from}&to={to}"
+    )))
+    .expect("valid json");
+    assert_eq!(series["resolution"], "rollup", "{series}");
+    assert_eq!(series["rollup_reducer"], "mean");
+    assert_eq!(series["bucket_ms"], 60_000);
+    let points = series["points"].as_array().expect("points");
+    assert_eq!(points.len(), 2, "two summarised minutes: {series}");
+    assert!(
+        points
+            .iter()
+            .all(|point| point["value"].as_f64().is_some_and(|value| value > 0.0)),
+        "{series}"
+    );
+
+    // The default window reaches back past the boundary, so it is the mixed case: summarised minutes at the
+    // old end, untouched samples at the new one, in one ordered series with nothing repeated across the join.
+    let spanning: serde_json::Value =
+        serde_json::from_str(&daemon.get("/api/series?metric=cpu_percent")).expect("valid json");
+    assert_eq!(spanning["resolution"], "mixed", "{spanning}");
+    let stamps: Vec<i64> = spanning["points"]
+        .as_array()
+        .expect("points")
+        .iter()
+        .filter_map(|point| point["ts"].as_i64())
+        .collect();
+    assert!(
+        stamps.windows(2).all(|pair| pair[0] < pair[1]),
+        "the join must not reorder or repeat an instant: {stamps:?}"
+    );
+    assert!(
+        stamps.first().is_some_and(|first| *first <= old + 60_000),
+        "the summarised end must be present: {stamps:?}"
+    );
+}
+
 #[test]
 fn a_second_daemon_on_the_same_data_dir_refuses_to_start() {
     let first = Daemon::start(&[]);
@@ -585,7 +831,10 @@ fn status_reads_a_database_written_by_a_previous_run() {
         "status failed: {stdout}{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(stdout.contains("Schema version: 2"), "{stdout}");
+    assert!(
+        stdout.contains(&format!("Schema version: {}", schema_version())),
+        "{stdout}"
+    );
     assert!(stdout.contains("samples"), "{stdout}");
     assert!(stdout.contains("Import errors:  0"), "{stdout}");
 }

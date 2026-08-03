@@ -121,13 +121,7 @@ impl Metric {
     ) -> Self {
         let mut sorted: Vec<f64> = values.iter().copied().filter(|v| v.is_finite()).collect();
         sorted.sort_by(f64::total_cmp);
-        let percentile = |p: f64| -> Option<f64> {
-            if sorted.is_empty() {
-                return None;
-            }
-            let index = ((sorted.len() - 1) as f64 * p).round() as usize;
-            sorted.get(index).copied()
-        };
+        let percentile = |p: f64| percentile_of_sorted(&sorted, p);
         let mean = if sorted.is_empty() {
             0.0
         } else {
@@ -147,9 +141,56 @@ impl Metric {
     }
 }
 
+/// Percentile of a sample, by the one convention the whole tool shares.
+///
+/// `index = round((n - 1) * p)`, on values sorted ascending. Stated once and used everywhere, because a
+/// p50 on a dashboard chart, a p50 in a printed report and a p50 behind a day-over-day verdict have to
+/// be the same number — a reader comparing two of them has no way to discover that they were not.
+///
+/// The caller sorts, so a function that already holds sorted data does not sort it twice.
+pub fn percentile_of_sorted(sorted: &[f64], p: f64) -> Option<f64> {
+    if sorted.is_empty() {
+        return None;
+    }
+    let index = ((sorted.len() - 1) as f64 * p.clamp(0.0, 1.0)).round() as usize;
+    sorted.get(index).copied()
+}
+
+/// [`percentile_of_sorted`] for values that are not sorted yet.
+///
+/// Non-finite values are dropped rather than sorted into an arbitrary position, matching
+/// [`Metric::distribution`]: a NaN is a measurement that failed, not a large or a small one.
+pub fn percentile(values: &[f64], p: f64) -> Option<f64> {
+    let mut sorted: Vec<f64> = values
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .collect();
+    sorted.sort_by(f64::total_cmp);
+    percentile_of_sorted(&sorted, p)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Metric;
+    use super::{Metric, percentile, percentile_of_sorted};
+
+    #[test]
+    fn the_percentile_convention_is_index_round_n_minus_one_times_p() {
+        let sorted = [1.0, 2.0, 3.0, 4.0, 5.0];
+        assert_eq!(percentile_of_sorted(&sorted, 0.5), Some(3.0));
+        assert_eq!(percentile_of_sorted(&sorted, 0.0), Some(1.0));
+        assert_eq!(percentile_of_sorted(&sorted, 1.0), Some(5.0));
+        // Four values: (4 - 1) * 0.5 = 1.5, which rounds up to the upper middle.
+        assert_eq!(percentile_of_sorted(&[1.0, 2.0, 3.0, 4.0], 0.5), Some(3.0));
+        assert_eq!(percentile_of_sorted(&[], 0.5), None);
+    }
+
+    #[test]
+    fn percentile_sorts_and_drops_failed_measurements() {
+        assert_eq!(percentile(&[5.0, 1.0, 3.0], 0.5), Some(3.0));
+        assert_eq!(percentile(&[3.0, f64::NAN, 1.0], 0.5), Some(3.0));
+        assert_eq!(percentile(&[f64::NAN], 0.5), None);
+    }
 
     #[test]
     fn distribution_calculates_stable_percentiles() {

@@ -128,7 +128,21 @@ impl SessionSeries {
     }
 }
 
+/// One bucket of a derived series, and how many rows it was reduced from.
+///
+/// The weight is not decoration. A bucket's median is a fact about the machine only in proportion to what
+/// it was computed from, and a baseline that treated a day of two tool calls as equal to a day of nine
+/// hundred would be reporting the noise of the quiet day as a change in the machine.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Bucket {
+    pub ts: i64,
+    pub value: f64,
+    pub observations: usize,
+}
+
 /// Bucketed points for one derived series, oldest first.
+///
+/// The chart form: [`session_buckets`] without the weights, which no chart has a use for.
 pub fn session_series(
     conn: &Connection,
     machine_id: &str,
@@ -137,6 +151,26 @@ pub fn session_series(
     to_ms: i64,
     bucket_ms: i64,
 ) -> Result<Vec<Point>> {
+    Ok(
+        session_buckets(conn, machine_id, series, from_ms, to_ms, bucket_ms)?
+            .into_iter()
+            .map(|bucket| Point {
+                ts: bucket.ts,
+                value: bucket.value,
+            })
+            .collect(),
+    )
+}
+
+/// Bucketed values for one derived series with their weights, oldest first.
+pub fn session_buckets(
+    conn: &Connection,
+    machine_id: &str,
+    series: SessionSeries,
+    from_ms: i64,
+    to_ms: i64,
+    bucket_ms: i64,
+) -> Result<Vec<Bucket>> {
     let bucket_ms = bucket_ms.max(1);
     let mut statement = conn.prepare_cached(series.sql())?;
     let mut rows = statement.query(rusqlite::params![
@@ -171,9 +205,16 @@ pub fn session_series(
 }
 
 /// Collapse one bucket, clearing it for the next.
-fn reduce(bucket: i64, values: &mut Vec<(f64, f64)>, aggregation: Aggregation) -> Point {
+///
+/// The median goes through [`crate::model::percentile`], which is where the tool's one percentile
+/// convention lives: these values are read beside the p50s printed in benchmark reports, and a median
+/// that meant something slightly different here would be a trap rather than a comparison.
+fn reduce(bucket: i64, values: &mut Vec<(f64, f64)>, aggregation: Aggregation) -> Bucket {
     let value = match aggregation {
-        Aggregation::Median => median(values),
+        Aggregation::Median => {
+            let numerators: Vec<f64> = values.iter().map(|(numerator, _)| *numerator).collect();
+            crate::model::percentile(&numerators, 0.5).unwrap_or(0.0)
+        }
         Aggregation::Sum => values.iter().map(|(numerator, _)| numerator).sum(),
         Aggregation::Ratio => {
             let numerator: f64 = values.iter().map(|(num, _)| num).sum();
@@ -185,24 +226,13 @@ fn reduce(bucket: i64, values: &mut Vec<(f64, f64)>, aggregation: Aggregation) -
             }
         }
     };
+    let observations = values.len();
     values.clear();
-    Point { ts: bucket, value }
-}
-
-/// Middle value.
-///
-/// Deliberately the same convention as [`Metric::distribution`], which reports the percentiles in
-/// every benchmark report: probe and session values are read side by side with those, and a p50 that
-/// meant one thing on a chart and another in a report would be a trap rather than a comparison.
-///
-/// [`Metric::distribution`]: crate::model::Metric::distribution
-fn median(values: &mut [(f64, f64)]) -> f64 {
-    if values.is_empty() {
-        return 0.0;
+    Bucket {
+        ts: bucket,
+        value,
+        observations,
     }
-    values.sort_by(|left, right| left.0.total_cmp(&right.0));
-    let index = (((values.len() - 1) as f64) * 0.5).round() as usize;
-    values[index].0
 }
 
 #[cfg(test)]
@@ -334,5 +364,40 @@ mod tests {
         let conn = fixture();
         assert!(!values(&conn, SessionSeries::ToolReadMs, 0).is_empty());
         assert!(!values(&conn, SessionSeries::ToolReadMs, -5).is_empty());
+    }
+
+    /// What a baseline needs and a chart does not: how much each bucket rests on.
+    #[test]
+    fn buckets_report_the_number_of_rows_behind_each_value() {
+        let conn = fixture();
+        let buckets = session_buckets(
+            &conn,
+            MACHINE,
+            SessionSeries::ToolReadMs,
+            0,
+            i64::MAX,
+            MINUTE,
+        )
+        .unwrap();
+        assert_eq!(buckets.len(), 2);
+        assert_eq!(buckets[0].observations, 5, "five reads in the first minute");
+        assert_eq!(buckets[1].observations, 1);
+        // The chart form must be the same numbers with the weights dropped, never a second computation.
+        let points = session_series(
+            &conn,
+            MACHINE,
+            SessionSeries::ToolReadMs,
+            0,
+            i64::MAX,
+            MINUTE,
+        )
+        .unwrap();
+        assert_eq!(
+            points.iter().map(|point| point.value).collect::<Vec<_>>(),
+            buckets
+                .iter()
+                .map(|bucket| bucket.value)
+                .collect::<Vec<_>>()
+        );
     }
 }

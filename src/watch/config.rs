@@ -115,13 +115,19 @@ pub struct SessionsConfig {
 
 #[derive(Debug, Clone)]
 pub struct RetentionConfig {
-    /// Days of raw samples kept before rolling up to one-minute aggregates.
+    /// Days of raw samples kept before being summarised into one-minute aggregates and pruned.
+    ///
+    /// Applies to the passive stream alone. Probe runs, session metrics and run markers arrive slowly and are
+    /// the whole point of keeping a record, so nothing prunes them.
     pub samples_raw_days: u32,
 }
 
 #[derive(Debug, Clone)]
 pub struct AnalysisConfig {
-    /// Trailing window used as the comparison baseline. Used from phase 4.
+    /// Trailing window of whole local days today is compared against.
+    ///
+    /// Days rather than hours, because the comparison is between days: each contributes one value and the
+    /// band is the spread across those values.
     pub baseline_window_days: u32,
 }
 

@@ -117,6 +117,59 @@ pub fn probe_series(
     Ok(points)
 }
 
+/// One comparable probe measurement, with the covariate a verdict has to disclose.
+///
+/// Distinct from [`Point`] because a baseline owes its reader more than a value. Power source is carried
+/// through rather than filtered on: a laptop that always runs on battery still has a capability trend
+/// worth watching, so the runs are kept and the mix behind each figure is reported instead.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ProbeValue {
+    pub ts: i64,
+    pub value: f64,
+    /// Absent where the platform would not say, which is neither "on mains" nor "on battery".
+    pub on_battery: Option<bool>,
+}
+
+/// Uncontended runs of one series in a range, oldest first.
+///
+/// Always uncontended: this is the population a day-over-day comparison is allowed to use, and making
+/// that a parameter would invite a caller to compare today's clean runs against a week that included
+/// every run a compiling machine produced.
+pub fn comparable_values(
+    conn: &Connection,
+    machine_id: &str,
+    series: ProbeSeries,
+    from_ms: i64,
+    to_ms: i64,
+) -> Result<Vec<ProbeValue>> {
+    let mut statement = conn.prepare_cached(
+        "SELECT r.ts, m.value, r.on_battery
+           FROM probe_metrics m
+           JOIN probe_runs r ON r.id = m.run_id
+          WHERE r.machine_id = ?1 AND r.ts >= ?2 AND r.ts <= ?3
+            AND m.name = ?4 AND m.source = ?5
+            AND r.contended = 0
+          ORDER BY r.ts LIMIT ?6",
+    )?;
+    let mut rows = statement.query(rusqlite::params![
+        machine_id,
+        from_ms,
+        to_ms,
+        series.spec.name,
+        series.source.as_str(),
+        MAX_ROWS as i64,
+    ])?;
+    let mut values = Vec::new();
+    while let Some(row) = rows.next()? {
+        values.push(ProbeValue {
+            ts: row.get(0)?,
+            value: row.get(1)?,
+            on_battery: row.get::<_, Option<i64>>(2)?.map(|value| value != 0),
+        });
+    }
+    Ok(values)
+}
+
 /// The most recent probe run, for the live tiles.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct LatestProbe {
@@ -321,6 +374,72 @@ mod tests {
     #[test]
     fn a_metric_no_run_measured_is_an_empty_series_rather_than_an_error() {
         assert!(values(&fixture(), "probe:cpu.multi_mops_s", false).is_empty());
+    }
+
+    /// What a baseline is allowed to see: the clean runs, and what powered them.
+    #[test]
+    fn comparable_values_are_uncontended_and_carry_their_power_source() {
+        let conn = fixture();
+        let comparable = comparable_values(
+            &conn,
+            MACHINE,
+            probe("probe:filesystem.small_file_ops_s"),
+            0,
+            i64::MAX,
+        )
+        .unwrap();
+        assert_eq!(
+            comparable
+                .iter()
+                .map(|value| value.value)
+                .collect::<Vec<_>>(),
+            vec![4_000.0, 4_200.0],
+            "the contended runs are not a population a verdict may use"
+        );
+        assert_eq!(comparable[0].on_battery, Some(false));
+
+        // An unknown power source stays unknown rather than being read as mains.
+        conn.execute(
+            "INSERT INTO probe_runs (machine_id, ts, contended, cpu_at, scanner_at, agent_active,
+                 on_battery) VALUES (?1, 5000, 0, 1.0, NULL, 0, NULL)",
+            [MACHINE],
+        )
+        .unwrap();
+        let run_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO probe_metrics (run_id, name, value, unit, lower_is_better, source)
+             VALUES (?1, 'filesystem.small_file_ops_s', 4100.0, 'ops/s', 0, 'probe')",
+            [run_id],
+        )
+        .unwrap();
+        let with_unknown = comparable_values(
+            &conn,
+            MACHINE,
+            probe("probe:filesystem.small_file_ops_s"),
+            0,
+            i64::MAX,
+        )
+        .unwrap();
+        assert_eq!(with_unknown.len(), 3);
+        assert_eq!(with_unknown[2].on_battery, None);
+    }
+
+    /// A benchmark's full-scale value must not reach a baseline built from probes.
+    #[test]
+    fn comparable_values_respect_the_source_prefix() {
+        let conn = fixture();
+        let benches = comparable_values(
+            &conn,
+            MACHINE,
+            probe("bench:filesystem.small_file_ops_s"),
+            0,
+            i64::MAX,
+        )
+        .unwrap();
+        assert!(
+            benches.is_empty(),
+            "the fixture's only benchmark run was contended: {benches:?}"
+        );
     }
 
     #[test]

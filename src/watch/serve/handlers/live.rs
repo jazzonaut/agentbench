@@ -1,7 +1,7 @@
 //! `GET /api/live` — the most recent observation, probe and session activity, for the live tiles.
 
 use crate::watch::{
-    clock,
+    analysis::day,
     serve::response::{Req, Resp},
     store::{Reader, queries},
 };
@@ -26,7 +26,9 @@ pub fn handle(_req: &Req, reader: &Reader) -> Resp {
         Err(error) => return Resp::error(500, &format!("live query failed: {error}")),
     };
     let now = crate::watch::store::now_ms();
-    let day_start = clock::local_day_start_ms();
+    // The same day boundary the baselines use, from the same place, so a tile and the verdict beside it
+    // are never counting different days.
+    let day_start = day::today().start_ms;
     // Session history is optional: a machine that has never run Claude Code still has live tiles, so
     // a failure here reports no activity rather than taking the whole payload down.
     let today = queries::sessions::today(reader.conn(), reader.machine_id(), day_start, now).ok();

@@ -11,8 +11,8 @@ pub mod schema;
 pub mod writer;
 
 pub use records::{
-    Covariates, Event, Level, MetricSource, ProbeMetric, ProbeRun, Record, RunMarker, Sample,
-    ToolCall, ToolVersion, Turn, Watermark,
+    Covariates, Event, Level, Maintenance, MetricSource, ProbeMetric, ProbeRun, Record, RunMarker,
+    Sample, ToolCall, ToolVersion, Turn, Watermark,
 };
 pub use writer::Sink;
 
@@ -242,7 +242,7 @@ mod tests {
         assert_eq!(latest.ts, 1_700_000_000_000 + 4000);
         assert!((latest.cpu_percent - 14.0).abs() < 1e-6);
 
-        let points = queries::series(
+        let rows = queries::series(
             reader.conn(),
             &machine,
             queries::SampleSeries::CpuPercent,
@@ -251,9 +251,14 @@ mod tests {
             100,
         )
         .unwrap();
-        assert_eq!(points.len(), 5);
+        assert_eq!(rows.points.len(), 5);
+        assert_eq!(
+            rows.resolution,
+            queries::Resolution::Raw,
+            "nothing has been summarised yet"
+        );
         assert!(
-            points.windows(2).all(|w| w[0].ts < w[1].ts),
+            rows.points.windows(2).all(|w| w[0].ts < w[1].ts),
             "series must be returned oldest-first"
         );
     }

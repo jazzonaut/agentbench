@@ -7,12 +7,14 @@
 //! series. What stays here is shared by both — the point type, the health roll-up, and the
 //! operational log.
 
+pub mod annotations;
 pub mod probes;
 pub mod samples;
 pub mod sessions;
 
-pub use probes::{LatestProbe, ProbeSeries, latest_run, probe_series};
-pub use samples::{Latest, SampleSeries, latest, series};
+pub use annotations::{Annotation, AnnotationKind};
+pub use probes::{LatestProbe, ProbeSeries, ProbeValue, latest_run, probe_series};
+pub use samples::{Latest, Reducer, Resolution, SampleSeries, SeriesRows, latest, series};
 pub use sessions::{SessionSeries, Today, session_series};
 
 use anyhow::{Context, Result};

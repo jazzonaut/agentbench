@@ -21,6 +21,10 @@ const MIGRATIONS: &[Migration] = &[
         version: 2,
         sql: super::schema::ALTER_V2,
     },
+    Migration {
+        version: 3,
+        sql: super::schema::ALTER_V3,
+    },
 ];
 
 /// Version this build expects after migrating.
@@ -130,6 +134,30 @@ mod tests {
         assert_eq!(column("ttft_ms"), 0, "the misleading one is gone");
         assert_eq!(column("session_id"), 1);
         assert_eq!(column("request_id"), 1);
+    }
+
+    /// The rollup target has to reach every series the dashboard advertises, on old databases too.
+    #[test]
+    fn a_v2_database_gains_the_rollup_columns_retention_needs() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(crate::watch::store::schema::CREATE_V1)
+            .unwrap();
+        conn.execute_batch(crate::watch::store::schema::ALTER_V2)
+            .unwrap();
+        conn.pragma_update(None, "user_version", 2).unwrap();
+
+        migrate(&mut conn).unwrap();
+
+        for name in ["process_count_avg", "agent_rss_max"] {
+            let found: u32 = conn
+                .query_row(
+                    "SELECT count(*) FROM pragma_table_info('samples_1m') WHERE name = ?1",
+                    [name],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(found, 1, "samples_1m.{name} missing");
+        }
     }
 
     /// The guarantee that keeps token counts honest when an import resumes mid-request.

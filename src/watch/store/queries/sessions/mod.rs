@@ -2,7 +2,7 @@
 
 pub mod series;
 
-pub use series::{SessionSeries, session_series};
+pub use series::{Bucket, SessionSeries, session_buckets, session_series};
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;

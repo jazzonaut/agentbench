@@ -24,9 +24,18 @@ export function count(value) {
   return value === null || value === undefined ? '—' : value.toLocaleString();
 }
 
-/** A latency, kept in the unit a reader can compare: "11 ms", "1.20 s". */
+/** A latency, kept in the unit a reader can compare: "5 µs", "11 ms", "1.20 s".
+ *
+ *  The microsecond branch is not decoration. A probe's SQLite lookup on a working machine is four or five
+ *  microseconds, and rounding that to "0 ms" turns a metric the dashboard judges into a tile that reads
+ *  zero for ever — which is how a chart says "nothing to see here" about a number that is doing its job.
+ */
 export function latency(ms) {
   if (ms === null || ms === undefined) return '—';
+  if (Math.abs(ms) < 1) {
+    const micros = ms * 1000;
+    return `${micros.toFixed(Math.abs(micros) < 10 ? 1 : 0)} µs`;
+  }
   if (ms < 1000) return `${Math.round(ms)} ms`;
   return `${(ms / 1000).toFixed(2)} s`;
 }
@@ -41,8 +50,11 @@ export function unitFormatter(unit) {
   if (unit === 'ms') return latency;
   return (value) => {
     if (value === null || value === undefined) return '—';
-    // Large rates read better whole; small ones lose their meaning rounded.
-    const digits = Math.abs(value) >= 100 ? 0 : 1;
+    // Large rates read better whole; small ones lose their meaning rounded. Probe metrics span
+    // three hundred thousand rows a second and fractions of a GiB, so the precision follows the value
+    // rather than the unit.
+    const magnitude = Math.abs(value);
+    const digits = magnitude >= 100 ? 0 : magnitude >= 1 ? 1 : 3;
     return `${value.toLocaleString(undefined, { maximumFractionDigits: digits })} ${unit}`;
   };
 }

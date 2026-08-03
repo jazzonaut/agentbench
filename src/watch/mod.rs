@@ -1,14 +1,17 @@
 //! The background metrics daemon.
 //!
-//! Layered strictly one way: `collect` produces records, `store` persists and queries them, `serve`
-//! presents them. Nothing depends on `serve`, and `serve` reaches the database only through a
-//! read-only [`Reader`], so a handler cannot write even by accident.
+//! Layered strictly one way: `collect` produces records, `store` persists and queries them, `analysis`
+//! draws conclusions from those queries, and `serve` presents the result. Nothing depends on `serve`,
+//! neither `analysis` nor `serve` can write — both reach the database only through a read-only
+//! [`Reader`] — so a handler cannot mutate history even by accident.
 //!
 //! [`Reader`]: store::Reader
 
+pub mod analysis;
 pub mod clock;
 pub mod collect;
 pub mod config;
+pub mod maintenance;
 pub mod marker;
 pub mod platform;
 pub mod serve;
@@ -76,6 +79,16 @@ pub fn run(config: WatchConfig) -> Result<()> {
         })?;
     }
 
+    // Retention is polite by nature and by priority: the work itself is bulk SQL on the writer's own
+    // connection, and this thread does nothing but ask for it on a timer.
+    let retention_config = config.retention.clone();
+    let retention_sink = sink.clone();
+    let retention_shutdown = shutdown.clone();
+    supervisor.spawn("retention", true, move || {
+        let clock = ShutdownClock::new(SystemClock, retention_shutdown.clone());
+        maintenance::run(&retention_config, &clock, &retention_sink);
+    })?;
+
     if config.sessions.enabled {
         // Reading transcripts is free in the sense that matters: Claude Code has already written
         // them, so this thread does no measuring, only accounting.
@@ -121,7 +134,12 @@ pub fn run(config: WatchConfig) -> Result<()> {
             println!("Data directory:       {}", config.data_dir.display());
             println!("Press Ctrl+C to stop.");
             // Serving occupies this thread; collectors run behind it.
-            server.serve(&store, &sink, shutdown.clone());
+            server.serve(
+                &store,
+                &sink,
+                shutdown.clone(),
+                serve::Settings::from(&config.analysis),
+            );
         }
         None => {
             println!("AgentBench dashboard: collecting only (server disabled)");
@@ -143,6 +161,21 @@ pub fn run(config: WatchConfig) -> Result<()> {
 
 /// Read the current status without starting anything.
 pub fn status(config: &WatchConfig, event_limit: usize) -> Result<Status> {
+    let reader = open_for_reading(config)?;
+    serve::handlers::status::build(&reader, event_limit)
+}
+
+/// Compare today against its trailing baseline without starting anything.
+///
+/// Reads the same database `--status` does, through the same analysis the dashboard's tiles use, so the
+/// command line and the page can never reach different verdicts from the same rows.
+pub fn verdicts(config: &WatchConfig) -> Result<analysis::Comparisons> {
+    let reader = open_for_reading(config)?;
+    analysis::today_against_baseline(&reader, config.analysis.baseline_window_days)
+}
+
+/// Open the configured database read-only, explaining the common case of it not existing yet.
+fn open_for_reading(config: &WatchConfig) -> Result<store::Reader> {
     let path = config.database_path();
     if !path.exists() {
         anyhow::bail!(
@@ -152,8 +185,7 @@ pub fn status(config: &WatchConfig, event_limit: usize) -> Result<Status> {
     }
     let inventory = system::inventory(false);
     let store = Store::open(&path, &inventory)?;
-    let reader = store.reader()?;
-    serve::handlers::status::build(&reader, event_limit)
+    store.reader()
 }
 
 /// Whether another daemon currently holds the instance lock.

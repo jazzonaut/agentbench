@@ -21,6 +21,9 @@
     --series-1: #2a78d6;
     --good: #006300;
     --warn: #eb6834;
+    /* Annotations are context, not data: they sit behind the line and never compete with it. */
+    --annotation: #8c7ab8;
+    --annotation-band: rgba(140, 122, 184, 0.14);
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -35,6 +38,8 @@
       --series-1: #3987e5;
       --good: #0ca30c;
       --warn: #d95926;
+      --annotation: #a898cf;
+      --annotation-band: rgba(168, 152, 207, 0.18);
     }
   }
 
@@ -80,6 +85,30 @@
   .tile-label { color: var(--ink-secondary); font-size: 11px; margin-top: 2px; }
   .tile-value.absent { color: var(--ink-muted); font-weight: 400; font-size: 15px; }
 
+  /* A verdict tile carries a value, a word, a baseline, its evidence and sometimes a caveat, so it needs
+     more room than a tile showing one number. Narrower and the word wraps under the value it qualifies. */
+  #verdicts { grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+
+  /* A verdict tile is a tile with a judgement on it. The word carries the meaning; the rule down the
+     leading edge is a second, redundant encoding of the same thing, never the only one. */
+  .verdict {
+    background: var(--surface-1);
+    border: 1px solid var(--ring);
+    border-left: 3px solid var(--axis);
+    border-radius: 8px;
+    padding: 12px 14px;
+  }
+  .verdict.worse { border-left-color: var(--warn); }
+  .verdict.better { border-left-color: var(--good); }
+  .verdict-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+  .verdict-value { font-size: 19px; font-weight: 600; letter-spacing: -0.02em; }
+  .verdict-word { font-size: 11px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; }
+  .verdict-word.worse { color: var(--warn); }
+  .verdict-word.better { color: var(--good); }
+  .verdict-word.normal, .verdict-word.insufficient { color: var(--ink-muted); }
+  .verdict-label { color: var(--ink-secondary); font-size: 11px; margin-top: 2px; }
+  .verdict-note { color: var(--ink-muted); font-size: 11px; margin-top: 6px; }
+
   .card {
     background: var(--surface-1);
     border: 1px solid var(--ring);
@@ -120,6 +149,21 @@
 
   .empty { color: var(--ink-muted); font-size: 12px; padding: 28px 4px; }
 
+  /* Marks live in the plot; their identity lives here, so the frames stay legible. */
+  .marks { color: var(--ink-secondary); font-size: 11px; margin: 8px 0 0; padding: 0; list-style: none; }
+  .marks li { display: inline-block; margin: 0 14px 2px 0; }
+  .mark-swatch {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    margin-right: 5px;
+    vertical-align: -1px;
+    border: 1px solid var(--annotation);
+  }
+  .mark-swatch.run { background: var(--annotation-band); }
+  /* A rule rather than a block, matching how a version change is drawn. */
+  .mark-swatch.tool_version { width: 0; border-width: 0 0 0 2px; height: 11px; }
+
   footer { color: var(--ink-secondary); font-size: 12px; }
   .status-line { display: flex; flex-wrap: wrap; gap: 14px; margin-bottom: 10px; }
   .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
@@ -150,6 +194,12 @@
   <section aria-labelledby="today-heading">
     <h2 id="today-heading">Today</h2>
     <div class="tiles" id="today"></div>
+  </section>
+
+  <section aria-labelledby="verdicts-heading">
+    <h2 id="verdicts-heading">Today vs baseline</h2>
+    <div class="tiles" id="verdicts"></div>
+    <p class="card-note" id="verdicts-note"></p>
   </section>
 
   <section aria-labelledby="history-heading">
@@ -194,6 +244,7 @@
         No probes in this range yet. The first one runs once a full probe interval has elapsed.
       </p>
     </div>
+    <ul class="marks" id="marks" aria-label="Marked events in this range"></ul>
   </section>
 
   <footer aria-labelledby="health-heading">

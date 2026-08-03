@@ -5,15 +5,15 @@
 
 use crate::watch::{
     serve::{
-        assets,
-        handlers::{live, series, status},
+        Settings, assets,
+        handlers::{annotations, live, series, status, verdicts},
         response::{Req, Resp},
     },
     store::Reader,
 };
 
 /// Route a request to its handler.
-pub fn route(req: &Req, reader: &Reader) -> Resp {
+pub fn route(req: &Req, reader: &Reader, settings: Settings) -> Resp {
     if let Some(asset) = assets::get(&req.path) {
         return asset;
     }
@@ -21,6 +21,8 @@ pub fn route(req: &Req, reader: &Reader) -> Resp {
         "/api/live" => live::handle(req, reader),
         "/api/series" => series::handle(req, reader),
         "/api/status" => status::handle(req, reader),
+        "/api/verdicts" => verdicts::handle(req, reader, settings.baseline_window_days),
+        "/api/annotations" => annotations::handle(req, reader),
         _ => Resp::not_found(),
     }
 }
@@ -64,7 +66,7 @@ mod tests {
 
         fn get(&self, target: &str) -> Resp {
             let reader = self.store.reader().unwrap();
-            route(&Req::parse(target), &reader)
+            route(&Req::parse(target), &reader, Settings::default())
         }
 
         fn json(&self, target: &str) -> Value {
@@ -87,6 +89,8 @@ mod tests {
             "/api/series?metric=probe:filesystem.small_file_ops_s",
             "/api/series?metric=probe:filesystem.small_file_ops_s&contended=exclude",
             "/api/status",
+            "/api/verdicts",
+            "/api/annotations",
         ] {
             let resp = fixture.get(target);
             assert_eq!(resp.status, 200, "{target} -> {}", body(&resp));
@@ -122,6 +126,88 @@ mod tests {
         assert_eq!(status["health"]["run_markers"], 0);
         assert_eq!(status["collecting"], false);
         assert!(status["sample_age_ms"].is_null());
+
+        // A machine with no history reaches no verdict, and says which side is missing rather than
+        // reporting that everything looks normal.
+        let verdicts = fixture.json("/api/verdicts");
+        let comparisons = verdicts["comparisons"].as_array().expect("comparisons");
+        assert!(!comparisons.is_empty(), "the curated set is not empty");
+        for comparison in comparisons {
+            assert_eq!(comparison["verdict"], "insufficient", "{comparison}");
+            assert!(comparison["baseline"].is_null());
+            assert!(
+                comparison["note"]
+                    .as_str()
+                    .is_some_and(|note| !note.is_empty()),
+                "{comparison}"
+            );
+        }
+        assert_eq!(verdicts["window_days"], 7);
+
+        assert!(
+            fixture.json("/api/annotations")["annotations"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+        );
+    }
+
+    /// The endpoints that read a range reject an impossible one rather than guessing.
+    #[test]
+    fn an_inverted_range_is_a_client_error_on_every_endpoint_that_takes_one() {
+        let fixture = Fixture::new();
+        for target in [
+            "/api/series?metric=cpu_percent&from=500&to=100",
+            "/api/annotations?from=500&to=100",
+        ] {
+            assert_eq!(fixture.get(target).status, 400, "{target}");
+        }
+    }
+
+    /// A version change and a marked run come back out of the annotations endpoint.
+    #[test]
+    fn annotations_report_versions_and_marked_runs() {
+        let fixture = Fixture::new();
+        let now = crate::watch::store::now_ms();
+        assert!(fixture.store.sink().send(crate::watch::store::ToolVersion {
+            ts: now - 10_000,
+            tool: "claude-code".into(),
+            version: "2.1.187".into(),
+        }));
+        assert!(fixture.store.sink().send(crate::watch::store::RunMarker {
+            run_id: "run-annotated".into(),
+            kind: "benchmark".into(),
+            preset: Some("quick".into()),
+            started: now - 5_000,
+            ended: Some(now - 1_000),
+            report_path: Some("D:\\reports\\one.json".into()),
+        }));
+
+        let inventory = Inventory {
+            hostname_hash: "hash-router".into(),
+            ..Default::default()
+        };
+        let temp = fixture.close();
+        let store = Store::open(&temp.path().join("watch.db"), &inventory).unwrap();
+        let reader = store.reader().unwrap();
+        let resp = route(
+            &Req::parse(&format!(
+                "/api/annotations?from={}&to={}",
+                now - 60_000,
+                now
+            )),
+            &reader,
+            Settings::default(),
+        );
+        assert_eq!(resp.status, 200, "{}", body(&resp));
+        let payload: Value = serde_json::from_slice(&resp.body).unwrap();
+        let marks = payload["annotations"].as_array().expect("annotations");
+        assert_eq!(marks.len(), 2, "{payload}");
+        let kinds: Vec<&str> = marks
+            .iter()
+            .filter_map(|mark| mark["kind"].as_str())
+            .collect();
+        assert!(kinds.contains(&"tool_version"), "{kinds:?}");
+        assert!(kinds.contains(&"run"), "{kinds:?}");
     }
 
     /// A probe run travels through the real writer and comes back out of the real endpoints.
@@ -162,7 +248,7 @@ mod tests {
         let store = Store::open(&temp.path().join("watch.db"), &inventory).unwrap();
         let reader = store.reader().unwrap();
         let json = |target: &str| -> Value {
-            let resp = route(&Req::parse(target), &reader);
+            let resp = route(&Req::parse(target), &reader, Settings::default());
             assert_eq!(resp.status, 200, "{target}: {}", body(&resp));
             serde_json::from_slice(&resp.body).unwrap()
         };
@@ -213,7 +299,7 @@ mod tests {
         let store = Store::open(&temp.path().join("watch.db"), &inventory).unwrap();
         let reader = store.reader().unwrap();
 
-        let resp = route(&Req::parse("/api/status"), &reader);
+        let resp = route(&Req::parse("/api/status"), &reader, Settings::default());
         let status: Value = serde_json::from_slice(&resp.body).unwrap();
         assert_eq!(status["health"]["run_markers"], 1, "{status}");
     }
@@ -242,12 +328,12 @@ mod tests {
         let store = Store::open(&temp.path().join("watch.db"), &inventory).unwrap();
         let reader = store.reader().unwrap();
 
-        let resp = route(&Req::parse("/api/status"), &reader);
+        let resp = route(&Req::parse("/api/status"), &reader, Settings::default());
         let status: Value = serde_json::from_slice(&resp.body).unwrap();
         assert_eq!(status["health"]["samples"], 1);
         assert_eq!(status["collecting"], true);
 
-        let resp = route(&Req::parse("/api/live"), &reader);
+        let resp = route(&Req::parse("/api/live"), &reader, Settings::default());
         let live: Value = serde_json::from_slice(&resp.body).unwrap();
         assert_eq!(live["sample"]["process_count"], 300);
     }

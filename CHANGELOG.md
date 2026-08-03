@@ -27,10 +27,10 @@ All notable changes to AgentBench are documented here. The project follows [Sema
   sources and are never averaged together: the same workload over 200 files and over 5,000 answers the
   same question at scales two orders of magnitude apart.
 - Every probe is stamped with what the machine was competing with — CPU, security-scanner CPU, whether
-  a coding agent was working, and whether the machine is on battery — read both immediately before and
-  immediately after the measurement, so a probe clobbered halfway through is not filed as a clean one.
-  Probing is never gated on an idle machine; contention is recorded at collection time and excluded at
-  analysis time, which is what the dashboard's "uncontended probes only" filter does.
+  a coding agent was working, and whether the machine is on battery — read once, immediately before the
+  measurement, so the tag claims only what that measurement began in. Probing is never gated on an idle
+  machine; contention is recorded at collection time and excluded at analysis time, which is what the
+  dashboard's "uncontended probes only" filter does.
 - A probe chart on the dashboard and a tile reporting when the last probe ran and whether it was
   contended, sharing the cursor with the system and tool-latency charts.
 - Run markers: `bench`, `profile` and `experiment` record when they started and finished in the
@@ -48,6 +48,28 @@ All notable changes to AgentBench are documented here. The project follows [Sema
   credentials, no cost — has its own switch, `probe_network` / `--no-probe-network`. It is the only
   part of the daemon that leaves the machine, and 96 requests a day in a tool that otherwise uploads
   nothing is worth being able to turn off on its own.
+- A "Today vs baseline" section on the dashboard, and the same verdicts in `--status`. Each of the
+  previous seven local days is reduced to one value — the median of that day's uncontended measurements —
+  and today is compared against the median and median absolute deviation of those daily values. Five
+  series are judged: small-file operations, sequential write, SQLite lookup latency, single-core CPU, and
+  the file-tool latency your agent actually experienced. The confounded series stay charted and unjudged.
+- Every verdict reports the evidence behind it: how many days contributed, how many measurements those
+  days held, and how many of them ran on battery. A day with fewer than three comparable measurements is
+  dropped, fewer than four contributing days produces no verdict rather than a confident one, and a band
+  narrower than 5% of its own median is widened to that floor and says so — seven identical days would
+  otherwise declare every later day a regression.
+- Verdicts state when today's power source disagrees with the baseline's, rather than filtering battery
+  runs out. A laptop that lives unplugged still has a capability trend; one unplugged this morning reads
+  as degraded for a reason that is not the machine.
+- Chart annotations: a dashed rule at the first sighting of each tool version, and a shaded band across
+  each `bench`, `profile` or `experiment` run, listed beneath the charts so the frames stay readable.
+  Versions come from transcripts, so annotations cover the whole backfilled history. Served by
+  `/api/annotations`.
+- Sample retention: after `samples_raw_days` (14 by default) each whole minute of passive samples is
+  summarised into one row and the raw samples are pruned. Charts cross the boundary transparently — a
+  range reaching past it continues out of the summary, and the response reports which part is summarised
+  and whether each point is that minute's mean or its peak. Probe runs, session metrics and run markers
+  are never pruned.
 - Single-instance locking so two collectors cannot double-count the same machine.
 - `docs/adr/` recording architectural decisions and their rejected alternatives.
 
@@ -77,11 +99,20 @@ All notable changes to AgentBench are documented here. The project follows [Sema
   benchmark's own numbers are unchanged.
 - Metric names, units, directions, and descriptions consolidated into a single `metrics` catalog,
   replacing string literals duplicated across benchmarking, comparison, and diagnosis.
+- The percentile convention — `index = round((n - 1) × p)` on sorted values — now lives in one function
+  in `model` rather than being hand-rolled in three places. A p50 on a chart, a p50 in a printed report
+  and a p50 behind a verdict have to be the same number, and a reader comparing two of them has no way to
+  discover that they were not.
 - Process-tree selection and resource aggregation consolidated into one `process_tree` module,
   replacing separate implementations in the profiler and the terminal view.
 
 ### Fixed
 
+- Sub-millisecond latencies are no longer displayed as "0 ms". A probe's SQLite lookup is four or five
+  microseconds on a healthy machine, and the dashboard's latency formatter — written for tool calls in the
+  tens of milliseconds — rounded it to zero on a tile the page now judges. Latencies below a millisecond
+  are shown in microseconds, and `--status` picks its precision from the value rather than always printing
+  one decimal place.
 - The first CPU reading of a collection session no longer records a spurious 100%. `sysinfo` needs two
   refreshes to compute a delta, so the sampler now primes and discards a throwaway reading.
 - Lowering `--sample-interval` now lowers the idle sampling cadence proportionally, instead of leaving

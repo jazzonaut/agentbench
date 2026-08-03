@@ -33,11 +33,71 @@ function toSeries(points, gapMs) {
   return [xs, ys];
 }
 
+/** Draw annotations behind the data.
+ *
+ *  Behind, and in one recessive colour, because an annotation is context: the moment a mark is as loud as
+ *  the line it explains, the chart is about the marks. A run occupied an interval and is drawn as a band; a
+ *  version change happened at an instant and is drawn as a dashed rule. The two are told apart by shape as
+ *  well as by weight, and named in the list beneath the charts rather than labelled in the frame, which at
+ *  a fortnight's range would be a wall of overlapping text.
+ */
+function annotationPlugin(read) {
+  return {
+    hooks: {
+      drawClear: (plot) => {
+        const marks = read();
+        if (marks.length === 0) return;
+        const { ctx } = plot;
+        const top = plot.bbox.top;
+        const height = plot.bbox.height;
+        const stroke = token('--annotation');
+        const band = token('--annotation-band');
+        ctx.save();
+        // Clip to the plotting area so a run that began before the range does not paint the axes.
+        ctx.beginPath();
+        ctx.rect(plot.bbox.left, top, plot.bbox.width, height);
+        ctx.clip();
+        for (const mark of marks) {
+          const x = plot.valToPos(mark.ts / 1000, 'x', true);
+          if (mark.ended !== null && mark.ended !== undefined) {
+            const end = plot.valToPos(mark.ended / 1000, 'x', true);
+            // At least a pixel wide: a two-second run must not vanish entirely.
+            ctx.fillStyle = band;
+            ctx.fillRect(x, top, Math.max(1, end - x), height);
+            continue;
+          }
+          ctx.strokeStyle = stroke;
+          ctx.lineWidth = 1;
+          ctx.setLineDash(mark.kind === 'run' ? [] : [3, 3]);
+          ctx.beginPath();
+          ctx.moveTo(Math.round(x) + 0.5, top);
+          ctx.lineTo(Math.round(x) + 0.5, top + height);
+          ctx.stroke();
+        }
+        ctx.restore();
+      },
+    },
+  };
+}
+
+/** Width the y-axis needs for the labels it is about to draw.
+ *
+ *  uPlot calls this twice per layout: once before it knows the labels, then again with them. The second
+ *  call is the one that can measure, so the first returns the previous width to avoid a jump.
+ */
+function axisWidth(self, values, axisIdx, cycleNum) {
+  if (cycleNum > 1) return self.axes[axisIdx]._size;
+  const longest = (values ?? []).reduce((max, value) => Math.max(max, String(value).length), 0);
+  // Six pixels per character at 11px plus a gutter, floored at the width a percentage needs.
+  return Math.max(52, 14 + longest * 6.5);
+}
+
 /** Options shared by every chart, reading colours from CSS tokens. */
-function options(width, format, label) {
+function options(width, format, label, plugins) {
   return {
     width,
     height: 220,
+    plugins,
     // Recessive frame: the data should be the most prominent thing in the panel.
     padding: [10, 8, 0, 0],
     cursor: {
@@ -65,7 +125,9 @@ function options(width, format, label) {
         grid: { stroke: token('--grid'), width: 1 },
         ticks: { show: false },
         font: '11px ui-sans-serif, system-ui, sans-serif',
-        size: 52,
+        // Measured, not assumed. A fixed 52px fits "30.0%" and clips "7,129 ops/s" to "000 ops/s",
+        // which reads as a chart of tiny numbers rather than as a truncated label.
+        size: axisWidth,
         values: (_self, splits) => splits.map((value) => format(value)),
       },
     ],
@@ -76,7 +138,10 @@ function options(width, format, label) {
         // Thin mark. Width is about legibility, not emphasis.
         stroke: token('--series-1'),
         width: 1.5,
-        points: { show: false },
+        // Markers left on uPlot's automatic rule rather than switched off. It shows them only once points
+        // are far enough apart to be distinguishable, which is also the only case where they are load-
+        // bearing: a lone observation between two gaps has no line segment to belong to, so with markers
+        // off it is drawn as nothing at all.
         value: (_self, value) => format(value),
       },
     ],
@@ -92,15 +157,18 @@ function options(width, format, label) {
 export function createChart(element, format, label = 'value') {
   let plot = null;
   let current = [[], []];
+  let marks = [];
 
   const width = () => Math.max(320, element.clientWidth || element.offsetWidth || 640);
+  // Read through a closure so new annotations redraw with the next frame rather than rebuilding the plot.
+  const plugins = [annotationPlugin(() => marks)];
 
   const render = () => {
     if (plot) {
       plot.setData(current);
       return;
     }
-    plot = new uPlot(options(width(), format, label), current, element);
+    plot = new uPlot(options(width(), format, label, plugins), current, element);
   };
 
   // Re-lay-out on container resize rather than on window resize: the panel can change width
@@ -124,6 +192,11 @@ export function createChart(element, format, label = 'value') {
     update(points, gapMs) {
       current = toSeries(points, gapMs);
       render();
+    },
+    /** Replace the marks drawn behind the data. Redraws only if the plot already exists. */
+    setAnnotations(next) {
+      marks = next ?? [];
+      if (plot) plot.redraw();
     },
     isEmpty() {
       return current[0].length === 0;
