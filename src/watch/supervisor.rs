@@ -274,6 +274,41 @@ mod tests {
         (Sink::new(sender), receiver)
     }
 
+    /// Longest a report is waited for. Generous: the worker logs within microseconds of stopping, and the
+    /// only thing this bound protects against is hanging the suite if it never does.
+    const REPORT_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// Wait for a worker's report to arrive, rather than inferring it from a counter.
+    ///
+    /// The distinction is the whole point. A worker that has been asked to shut down deliberately skips its
+    /// report — stopping is not a fault worth logging — so a test that watched a counter the body bumps
+    /// *before* stopping could reach `shutdown()` first, send the worker down that branch, and then find
+    /// nothing logged. That is a race in the test rather than the code, and on a loaded CI runner it lost.
+    fn wait_for_report(
+        receiver: &std::sync::mpsc::Receiver<crate::watch::store::Record>,
+        source: &str,
+        level: Level,
+        needle: &str,
+    ) -> bool {
+        let deadline = std::time::Instant::now() + REPORT_TIMEOUT;
+        while std::time::Instant::now() < deadline {
+            match receiver.recv_timeout(Duration::from_millis(50)) {
+                Ok(crate::watch::store::Record::Event(event)) => {
+                    if event.source == source
+                        && event.level == level
+                        && event.message.contains(needle)
+                    {
+                        return true;
+                    }
+                }
+                Ok(_) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        false
+    }
+
     #[test]
     fn a_second_lock_on_the_same_path_is_refused() {
         let temp = tempfile::tempdir().unwrap();
@@ -341,17 +376,12 @@ mod tests {
                 counter.fetch_add(1, Ordering::Relaxed);
             })
             .unwrap();
-        for _ in 0..500 {
-            if runs.load(Ordering::Relaxed) >= 1 {
-                break;
-            }
-            thread::sleep(Duration::from_millis(2));
-        }
+        let warned = wait_for_report(&receiver, "flaky", Level::Warn, "stopped unexpectedly");
+        assert!(
+            runs.load(Ordering::Relaxed) >= 1,
+            "the body should have run at least once"
+        );
         supervisor.shutdown().unwrap();
-        let warned = receiver.try_iter().any(|record| {
-            matches!(record, crate::watch::store::Record::Event(event)
-                if event.source == "flaky" && event.message.contains("stopped unexpectedly"))
-        });
         assert!(warned, "an early return must be logged");
     }
 
@@ -403,21 +433,19 @@ mod tests {
                 panic!("process enumeration went wrong");
             })
             .unwrap();
-        for _ in 0..500 {
-            if runs.load(Ordering::Relaxed) >= 1 {
-                break;
-            }
-            thread::sleep(Duration::from_millis(2));
-        }
+        let reported = wait_for_report(
+            &receiver,
+            "panicky",
+            Level::Error,
+            "process enumeration went wrong",
+        );
+        assert!(
+            runs.load(Ordering::Relaxed) >= 1,
+            "the body should have run at least once"
+        );
         supervisor
             .shutdown()
             .expect("a caught panic must not surface as a panicked thread");
-        let reported = receiver.try_iter().any(|record| {
-            matches!(record, crate::watch::store::Record::Event(event)
-                if event.source == "panicky"
-                    && event.level == Level::Error
-                    && event.message.contains("process enumeration went wrong"))
-        });
         assert!(reported, "a panic must be logged with its own message");
     }
 }
