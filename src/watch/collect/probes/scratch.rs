@@ -41,16 +41,29 @@ impl Scratch {
             .join(SCRATCH_DIR)
     }
 
-    /// Create the directory, empty.
-    pub fn prepare(config: &CollectConfig, data_dir: &Path) -> Result<Self> {
+    /// Remove whatever a previous daemon left behind, without creating anything.
+    ///
+    /// Called once when the daemon starts, and *whether or not probes are enabled*. [`Scratch::prepare`]
+    /// clears too, but not until the first probe falls due — fifteen minutes later by default — and never
+    /// at all when probing is switched off, so a daemon killed mid-workload and then restarted with
+    /// `--no-probes` kept its leftovers indefinitely while the README promised the location was emptied at
+    /// startup.
+    pub fn clear(config: &CollectConfig, data_dir: &Path) -> Result<()> {
         let path = Self::location(config, data_dir);
-        // A previous daemon killed mid-probe leaves files behind. Clearing on startup rather than
-        // trusting each workload to clean up keeps the small-file pass measuring an empty directory,
-        // which is what it did the first time and therefore what today's number is comparable to.
         if path.exists() {
             fs::remove_dir_all(&path)
                 .with_context(|| format!("clear scratch directory {}", path.display()))?;
         }
+        Ok(())
+    }
+
+    /// Create the directory, empty.
+    pub fn prepare(config: &CollectConfig, data_dir: &Path) -> Result<Self> {
+        // Cleared here as well as at startup rather than instead of it. A workload killed mid-probe leaves
+        // files behind, and keeping the small-file pass measuring an empty directory is what makes today's
+        // number comparable to the first one it was ever compared against.
+        Self::clear(config, data_dir)?;
+        let path = Self::location(config, data_dir);
         fs::create_dir_all(&path)
             .with_context(|| format!("create scratch directory {}", path.display()))?;
         Ok(Self { path })
@@ -149,6 +162,22 @@ mod tests {
             0,
             "the scratch directory should start empty"
         );
+    }
+
+    /// Startup clears leftovers even when no probe will ever run to clear them.
+    #[test]
+    fn clearing_removes_a_previous_daemons_leftovers_without_creating_the_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let scratch = Scratch::prepare(&config(None), temp.path()).unwrap();
+        let path = scratch.path().to_path_buf();
+        fs::write(path.join("sequential.bin"), b"leftover").unwrap();
+
+        Scratch::clear(&config(None), temp.path()).unwrap();
+        assert!(!path.exists(), "the directory and its contents are gone");
+
+        // Nothing to remove is success, and success does not mean the directory now exists.
+        Scratch::clear(&config(None), temp.path()).unwrap();
+        assert!(!path.exists());
     }
 
     #[test]

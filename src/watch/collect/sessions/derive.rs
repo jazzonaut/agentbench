@@ -24,6 +24,15 @@ pub const CLAUDE_CODE: &str = "claude-code";
 /// transcript — an agent that fired calls it never awaited — not for the ordinary one.
 const MAX_PENDING_TOOLS: usize = 512;
 
+/// Requests remembered per pass, so the same turn is not derived twice.
+///
+/// Bounded for the same reason as [`MAX_PENDING_TOOLS`], and generously: a pass re-reads at most a
+/// megabyte of tail, so an ordinary transcript never approaches this. Overflow clears the whole set rather
+/// than evicting the oldest, which is affordable because the set is an optimisation and not the guarantee —
+/// `(machine_id, request_id)` is unique in the database and the insert ignores conflicts, so the worst a
+/// forgotten request can cost is one redundant insert.
+const MAX_SEEN_REQUESTS: usize = 4_096;
+
 /// Rows accepted between a prompt and the answer that measures it.
 ///
 /// A prompt is usually followed by attachments before the first assistant row, so the chain has to
@@ -64,7 +73,7 @@ pub struct Deriver {
     /// Insertion order, so the bound evicts the oldest rather than an arbitrary entry.
     order: VecDeque<String>,
     prompt: Option<PendingPrompt>,
-    /// Requests already turned into a turn during this pass.
+    /// Requests already turned into a turn during this pass, capped at [`MAX_SEEN_REQUESTS`].
     seen_requests: HashSet<String>,
     version: Option<String>,
 }
@@ -159,6 +168,9 @@ impl Deriver {
             .is_none_or(|model| model == "<synthetic>")
         {
             return None;
+        }
+        if self.seen_requests.len() >= MAX_SEEN_REQUESTS {
+            self.seen_requests.clear();
         }
         if !self.seen_requests.insert(request_id.to_string()) {
             return None;
@@ -362,6 +374,38 @@ mod tests {
         assert_eq!(turns[0].model.as_deref(), Some("claude-opus-5"));
         assert_eq!(turns[0].service_tier.as_deref(), Some("standard"));
         assert_eq!(turns[0].branch.as_deref(), Some("main"));
+    }
+
+    /// The dedupe set is a cache, not the guarantee, so it is allowed to be bounded.
+    ///
+    /// Every other per-pass map here is capped; this one was not, which made a single enormous transcript
+    /// the one input that could grow the deriver without limit. Forgetting a request costs at most a
+    /// redundant insert, since `(machine_id, request_id)` is unique in the database.
+    #[test]
+    fn the_request_dedupe_set_is_bounded() {
+        let mut deriver = Deriver::default();
+        let mut out = Vec::new();
+        for index in 0..=MAX_SEEN_REQUESTS {
+            let line = assistant(
+                &format!("a{index}"),
+                "p1",
+                &format!("req_{index}"),
+                "2026-06-27T00:00:10.000Z",
+                "",
+            );
+            let row: Row = serde_json::from_str(&line).expect(&line);
+            deriver.push(0, &row, &mut out);
+        }
+        assert_eq!(
+            turns(&out).len(),
+            MAX_SEEN_REQUESTS + 1,
+            "every distinct request is still a turn"
+        );
+        assert!(
+            deriver.seen_requests.len() <= MAX_SEEN_REQUESTS,
+            "the set grew to {}",
+            deriver.seen_requests.len()
+        );
     }
 
     #[test]

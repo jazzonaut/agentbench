@@ -76,14 +76,17 @@ pub fn run_with_cancel(
     let started = Instant::now();
     let mut inventory = system::inventory(options.elevated);
     let memory_size = limits.memory_size(inventory.memory_bytes);
-    preflight::ensure_free_space(target, &limits)?;
+    // The volume that has to hold the working set is the one being written to, which is not necessarily the
+    // target directory once `scratch_dir` is set.
+    let scratch_parent = options.scratch_dir.as_deref().unwrap_or(target);
+    preflight::ensure_free_space(scratch_parent, &limits)?;
 
     let stop = Arc::new(AtomicBool::new(false));
     let shared_samples = Arc::new(Mutex::new(Vec::<SystemSample>::new()));
     let mut sampler = SamplerGuard::spawn(stop.clone(), shared_samples.clone(), started);
     let temp = Builder::new()
         .prefix(".agentbench-tmp-")
-        .tempdir_in(target)
+        .tempdir_in(scratch_parent)
         .context("create benchmark temporary directory")?;
     let mut metrics = Vec::new();
     let mut warnings = Vec::new();
@@ -153,6 +156,14 @@ pub fn run_with_cancel(
         } else {
             limits.minimum_duration
         };
+        // The live fixture stays under the target directory even when `scratch_dir` moves the heavy
+        // filesystem work elsewhere. The FileSeek case runs `claude` with its cwd set to the target and
+        // points it at this path, and a fixture outside that tree is one the agent may not be permitted to
+        // read — a scratch location chosen to reduce filesystem noise must not quietly break a paid case.
+        let fixture_home = Builder::new()
+            .prefix(".agentbench-tmp-llm-")
+            .tempdir_in(target)
+            .context("create live-LLM fixture directory")?;
         let live = live_llm::run_suite(
             &live_llm::LiveOptions {
                 route: options.llm_route,
@@ -163,7 +174,7 @@ pub fn run_with_cancel(
                 maximum_total_duration: limits.duration_limit.saturating_sub(LIVE_PHASE_MARGIN),
             },
             target,
-            temp.path(),
+            fixture_home.path(),
             started,
             &cancel,
         )?;

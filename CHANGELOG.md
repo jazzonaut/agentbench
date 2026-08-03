@@ -44,6 +44,25 @@ All notable changes to AgentBench are documented here. The project follows [Sema
   which the `(machine_id, ts)` primary key cannot serve; migration v4 adds the index.
 - Transcript import positions are deleted when the transcript is gone. `import_watermark` had no delete
   path at all, and every row in it is loaded into memory at startup.
+- A failing HTTP accept no longer stops the daemon. `serve` returned on the first error and `watch::run`
+  fell straight through to shutdown, so a transient socket failure ended collection and logged it as
+  "stopping HTTP server". Accepts are now retried, five consecutive failures give the page up explicitly,
+  and collection continues either way.
+- The probe scratch directory is emptied when the daemon starts, which is what the README already claimed.
+  It was emptied when the first probe fell due — fifteen minutes later by default — and never at all when
+  probes were disabled, so a daemon killed mid-workload could keep its leftovers indefinitely.
+- Ctrl+C is no longer delayed by up to five seconds when it arrives during a worker's restart backoff.
+- `compare` no longer panics on a report whose `run_id` is shorter than eight characters, or whose eighth
+  character is multi-byte.
+- An interval like `"999999999999999999999d"` is refused instead of wrapping silently into a short one.
+- `collect.sample_interval`, `collect.sample_interval_idle` and `collect.discovery_interval` have floors,
+  as `probe_interval` and `poll_interval` already did. A millisecond sampling cadence turned the sampler
+  into a spin loop, and discovery enumerates the whole process table; the CLI overrides apply the same
+  floors.
+- A series that exactly fills its point budget is no longer reported as truncated, so a chart stops
+  claiming it is missing history it has every point of.
+- A baseline band whose floor equals its measured spread reports itself as floored rather than measured.
+- The per-pass transcript dedupe set is bounded like every other map beside it.
 
 ### Changed
 
@@ -64,6 +83,18 @@ All notable changes to AgentBench are documented here. The project follows [Sema
   arithmetic.
 - Directories under the sessions roots that cannot be listed are reported once, and again when the
   count changes, instead of being counted and never mentioned.
+- `bench --scratch-dir` moves the filesystem workloads out of the target directory. The default still
+  writes inside it, since the disk numbers are meant to describe that volume, but up to two gigabytes
+  landing inside a repository wakes IDE indexers and file-watching test runners, and the report attributes
+  that to the disk. The live file-seek fixture stays under the target directory, where the agent's working
+  directory is.
+- Elevation is read from the process itself — `geteuid` on Unix, the process token on Windows — rather than
+  by spawning `id -u` or `net session` on every `inventory()`.
+- The dashboard's process-count tile says in its tooltip that the number comes from the sampler's discovery
+  pass and can be up to a minute old.
+- The README's privacy section states what the live file-seek case gives a model access to: read-only tools,
+  no prompts, and anything readable beneath `--target-dir` for the duration of that case.
+- CI runs doctests. `cargo test --all-targets` silently skips them.
 
 ## [0.4.0] - 2026-08-03
 

@@ -27,6 +27,23 @@ use std::{
 /// Delay before a died-unexpectedly worker is restarted.
 const RESTART_BACKOFF: Duration = Duration::from_secs(5);
 
+/// Granularity at which a shutdown request is noticed during a long sleep.
+const SHUTDOWN_POLL: Duration = Duration::from_millis(250);
+
+/// Sleep for `total`, returning early if shutdown is requested.
+///
+/// Workers get this from [`ShutdownClock`]; the supervisor's own restart backoff used to be a bare
+/// `thread::sleep`, so Ctrl+C arriving just after a worker died waited the full five seconds before the
+/// process would exit — a delay with no purpose, since the worker being waited for is not going to start.
+fn sleep_unless_shutdown(shutdown: &AtomicBool, total: Duration) {
+    let mut remaining = total;
+    while !remaining.is_zero() && !shutdown.load(Ordering::Relaxed) {
+        let slice = remaining.min(SHUTDOWN_POLL);
+        thread::sleep(slice);
+        remaining -= slice;
+    }
+}
+
 /// The message carried by a panic, for the two payload types `panic!` actually produces.
 ///
 /// Anything else is reported as unreadable rather than guessed at: the point of the line is to name
@@ -87,7 +104,7 @@ impl<C: Clock> ShutdownClock<C> {
         Self {
             inner,
             shutdown,
-            poll: Duration::from_millis(250),
+            poll: SHUTDOWN_POLL,
         }
     }
 }
@@ -203,7 +220,7 @@ impl Supervisor {
                             RESTART_BACKOFF.as_secs()
                         ),
                     );
-                    thread::sleep(RESTART_BACKOFF);
+                    sleep_unless_shutdown(&shutdown, RESTART_BACKOFF);
                 }
             })
             .with_context(|| format!("spawn {name} thread"))?;
@@ -328,6 +345,38 @@ mod tests {
                 if event.source == "flaky" && event.message.contains("stopped unexpectedly"))
         });
         assert!(warned, "an early return must be logged");
+    }
+
+    /// Ctrl+C during a restart backoff must not wait the backoff out.
+    ///
+    /// A worker that returns immediately puts its thread in the backoff almost at once, which is exactly
+    /// when a user is most likely to give up and interrupt. The bare `thread::sleep` this replaced held
+    /// shutdown for the full five seconds; the assertion is loose enough to survive a loaded CI runner and
+    /// still nowhere near that.
+    #[test]
+    fn shutdown_during_a_restart_backoff_is_not_delayed_by_it() {
+        let (sink, _receiver) = sink();
+        let mut supervisor = Supervisor::new(sink);
+        let runs = Arc::new(AtomicUsize::new(0));
+        let counter = runs.clone();
+        supervisor
+            .spawn("brief", false, move || {
+                counter.fetch_add(1, Ordering::Relaxed);
+            })
+            .unwrap();
+        for _ in 0..500 {
+            if runs.load(Ordering::Relaxed) >= 1 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        let started = std::time::Instant::now();
+        supervisor.shutdown().unwrap();
+        assert!(
+            started.elapsed() < RESTART_BACKOFF,
+            "shutdown waited {:?} of a {RESTART_BACKOFF:?} backoff",
+            started.elapsed()
+        );
     }
 
     /// The failure that used to be invisible until the process exited.

@@ -110,6 +110,20 @@ pub fn on_battery() -> Option<bool> {
     imp::on_battery()
 }
 
+/// Whether this process holds administrative privileges.
+///
+/// One syscall, no child process. Both readings this replaced spawned one — `net session` on Windows and
+/// `id -u` on Unix — for a question the process can answer about itself, and `inventory()` asks it on every
+/// run. `net session` in particular contacts the Server service and can take a noticeable fraction of a
+/// second on a machine where that service is disabled.
+///
+/// False on a platform that cannot be asked. The value gates optional elevated diagnostics and is reported
+/// in the inventory, so under-claiming degrades to "those diagnostics were skipped" while over-claiming
+/// would be a wrong fact in a report.
+pub fn is_elevated() -> bool {
+    imp::is_elevated()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,6 +174,17 @@ mod tests {
         if !applied.is_applied() {
             assert!(applied.reason().is_some_and(|reason| !reason.is_empty()));
         }
+    }
+
+    /// The value cannot be asserted either — CI runs unelevated, a developer's shell might not — but the
+    /// call has to be safe to make and has to agree with itself.
+    #[test]
+    fn elevation_is_read_consistently() {
+        assert_eq!(
+            is_elevated(),
+            is_elevated(),
+            "two adjacent readings disagree, so at least one was not a reading"
+        );
     }
 
     /// Asking is safe on every target, and the answer is a reading rather than a coin toss.

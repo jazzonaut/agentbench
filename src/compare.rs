@@ -80,11 +80,23 @@ pub fn run(baseline_path: &Path, candidate_path: &Path, output: Option<&Path>) -
     Ok(())
 }
 
+/// First eight characters of a run id, or the whole thing when it is shorter.
+///
+/// A report is a file the caller chose, so `run_id` is whatever that file contained. Slicing it to a
+/// fixed eight bytes panicked on a shorter id, and on any id whose eighth byte fell inside a multi-byte
+/// character — a comparison of two hand-edited reports is a strange thing to crash on.
+fn short_run_id(run_id: &str) -> &str {
+    run_id
+        .char_indices()
+        .nth(8)
+        .map_or(run_id, |(index, _)| &run_id[..index])
+}
+
 pub fn comparison_markdown(baseline: &Report, candidate: &Report) -> String {
     let mut output = format!(
         "# AgentBench comparison\n\nBaseline `{}` → candidate `{}`\n\n",
-        &baseline.run_id[..8],
-        &candidate.run_id[..8]
+        short_run_id(&baseline.run_id),
+        short_run_id(&candidate.run_id)
     );
     output.push_str("## Environment differences\n\n");
     difference(
@@ -322,5 +334,15 @@ mod tests {
         assert_eq!(interpretation(&cost, 500.0), "informational");
         let wall = Metric::scalar("llm.direct.latency.wall_ms", 1.0, "ms", true, "live_llm");
         assert_eq!(interpretation(&wall, 500.0), "regression");
+    }
+
+    /// The run id comes out of a file the caller named, so every length has to render.
+    #[test]
+    fn a_short_or_multibyte_run_id_is_abbreviated_rather_than_sliced() {
+        assert_eq!(short_run_id("0123456789abcdef"), "01234567");
+        assert_eq!(short_run_id("0123456"), "0123456");
+        assert_eq!(short_run_id(""), "");
+        // Eight characters, sixteen bytes: the old slice would have split the fifth of them.
+        assert_eq!(short_run_id("αβγδεζηθι"), "αβγδεζηθ");
     }
 }

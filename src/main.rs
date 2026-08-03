@@ -22,6 +22,14 @@ enum Command {
         preset: PresetArg,
         #[arg(long, default_value = ".")]
         target_dir: PathBuf,
+        /// Where the filesystem workloads write. Defaults to inside --target-dir.
+        ///
+        /// The default writes up to two gigabytes inside the repository being measured, which wakes IDE
+        /// indexers and file-watching test runners — noise the report then attributes to the disk. Point
+        /// this at a directory on the same volume to keep the measurement without the watchers. A
+        /// different volume measures a different disk.
+        #[arg(long, verbatim_doc_comment)]
+        scratch_dir: Option<PathBuf>,
         /// Skip the standalone HTTPS probe (live Claude still uses the network).
         #[arg(long)]
         offline: bool,
@@ -184,6 +192,7 @@ fn main() -> Result<()> {
         Command::Bench {
             preset,
             target_dir,
+            scratch_dir,
             offline,
             live_llm,
             no_live_llm,
@@ -198,6 +207,15 @@ fn main() -> Result<()> {
             let target_dir = target_dir.canonicalize().with_context(|| {
                 format!("target directory does not exist: {}", target_dir.display())
             })?;
+            // Resolved here so a mistyped path fails before any load is generated, rather than after the
+            // CPU and memory phases have already run.
+            let scratch_dir = scratch_dir
+                .map(|path| {
+                    path.canonicalize().with_context(|| {
+                        format!("scratch directory does not exist: {}", path.display())
+                    })
+                })
+                .transpose()?;
             let preset = match preset {
                 PresetArg::Quick => bench::Preset::Quick,
                 PresetArg::Standard => bench::Preset::Standard,
@@ -209,6 +227,7 @@ fn main() -> Result<()> {
             let mut options = bench::BenchOptions::for_preset(preset);
             options.offline = offline;
             options.elevated = elevated;
+            options.scratch_dir = scratch_dir;
             options.live_llm = if no_live_llm {
                 false
             } else if live_llm {
@@ -416,7 +435,11 @@ fn run_dashboard(args: DashboardArgs) -> Result<()> {
         config.sessions.roots = sessions_root;
     }
     if let Some(value) = sample_interval {
-        let active = watch::config::parse_duration(&value).context("--sample-interval")?;
+        // Clamped to the configuration's floor for the same reason --probe-interval is: a flag that could
+        // go below the file's minimum would make the minimum decorative.
+        let active = watch::config::parse_duration(&value)
+            .context("--sample-interval")?
+            .max(watch::config::SHORTEST_SAMPLE);
         config.collect.sample_interval = active;
         // Asking for a faster cadence must actually produce one. Left alone, the configured idle
         // interval would keep a quiet machine at its slow default and the override would appear to do
@@ -429,7 +452,9 @@ fn run_dashboard(args: DashboardArgs) -> Result<()> {
     }
     if let Some(value) = sample_interval_idle {
         let idle = watch::config::parse_duration(&value).context("--sample-interval-idle")?;
-        config.collect.sample_interval_idle = idle.max(config.collect.sample_interval);
+        config.collect.sample_interval_idle = idle
+            .max(config.collect.sample_interval)
+            .max(watch::config::SHORTEST_SAMPLE);
     }
     if let Some(value) = probe_interval {
         // Clamped to the configuration's floor for the same reason the file is: a probe is real load, and

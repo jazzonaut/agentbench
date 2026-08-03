@@ -4,12 +4,16 @@ use super::Capability;
 use anyhow::{Context, Result, bail};
 use std::{env, fs::File, os::windows::io::AsRawHandle, path::PathBuf};
 use windows_sys::Win32::{
-    Foundation::{ERROR_LOCK_VIOLATION, GetLastError, HANDLE},
+    Foundation::{CloseHandle, ERROR_LOCK_VIOLATION, GetLastError, HANDLE},
+    Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation},
     Storage::FileSystem::{LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx},
     System::{
         IO::OVERLAPPED,
         Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS},
-        Threading::{GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN},
+        Threading::{
+            GetCurrentProcess, GetCurrentThread, OpenProcessToken, SetThreadPriority,
+            THREAD_MODE_BACKGROUND_BEGIN,
+        },
     },
 };
 
@@ -80,6 +84,36 @@ pub(super) fn on_battery() -> Option<bool> {
         AC_LINE_UNKNOWN => None,
         _ => Some(false),
     }
+}
+
+/// Whether this process is running elevated, from its own token.
+///
+/// `TokenElevation` is the question UAC actually answers: it is true for a process running with a full
+/// administrator token, and false for the filtered token an administrator's ordinary session gets. That is
+/// the distinction the elevated diagnostics need, and it is one call plus a handle rather than the `net
+/// session` child process this replaced.
+pub(super) fn is_elevated() -> bool {
+    let mut token: HANDLE = std::ptr::null_mut();
+    // SAFETY: the current-process pseudo-handle needs no closing, and `token` is a valid out-pointer.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return false;
+    }
+    let mut elevation = TOKEN_ELEVATION::default();
+    let mut returned = 0_u32;
+    // SAFETY: `elevation` outlives the call and its declared length matches the type the information
+    // class returns; `returned` is a valid out-pointer.
+    let ok = unsafe {
+        GetTokenInformation(
+            token,
+            TokenElevation,
+            (&raw mut elevation).cast(),
+            size_of::<TOKEN_ELEVATION>() as u32,
+            &mut returned,
+        )
+    };
+    // SAFETY: `token` was opened by the call above and is not used again.
+    unsafe { CloseHandle(token) };
+    ok != 0 && elevation.TokenIsElevated != 0
 }
 
 fn apply(mode: i32, verb: &str) -> Capability {

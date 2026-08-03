@@ -107,14 +107,27 @@ pub fn series(
     )?;
     let raw_start = raw_from.unwrap_or(i64::MAX);
 
+    // One row past what the caller asked for. That extra row is the whole difference between "there is
+    // more history than would fit" and "the range happened to hold exactly this many points": comparing
+    // the returned count against the limit cannot tell those apart, and used to report a chart as missing
+    // data it had all of.
+    let capacity = limit.saturating_add(1);
+
     let mut points = if to_ms >= raw_start {
-        series::raw_points(conn, machine_id, kind, from_ms.max(raw_start), to_ms, limit)?
+        series::raw_points(
+            conn,
+            machine_id,
+            kind,
+            from_ms.max(raw_start),
+            to_ms,
+            capacity,
+        )?
     } else {
         Vec::new()
     };
-    let raw_count = points.len();
+    let raw_fetched = points.len();
 
-    let budget = limit.saturating_sub(raw_count);
+    let budget = capacity.saturating_sub(raw_fetched);
     let rolled = if budget > 0 && from_ms < raw_start {
         series::rollup_points(
             conn,
@@ -127,11 +140,15 @@ pub fn series(
     } else {
         Vec::new()
     };
-    let rolled_count = rolled.len();
 
     // Both halves arrive newest-first; appending the older half and reversing once yields oldest-first
-    // across the join without sorting.
+    // across the join without sorting. Trimming before the reverse spends the budget newest-first, which
+    // is the end a reader is looking at.
     points.extend(rolled);
+    let truncated = points.len() > limit;
+    points.truncate(limit);
+    let raw_count = raw_fetched.min(points.len());
+    let rolled_count = points.len() - raw_count;
     points.reverse();
 
     Ok(SeriesRows {
@@ -142,7 +159,7 @@ pub fn series(
             _ => Resolution::Mixed,
         },
         reducer: (rolled_count > 0).then(|| kind.reducer()),
-        truncated: points.len() >= limit,
+        truncated,
         points,
     })
 }
@@ -260,6 +277,22 @@ mod tests {
             Resolution::Mixed,
             "five raw points leave one of the budget for the rollup"
         );
+    }
+
+    /// A range that exactly fills the budget is complete, not truncated.
+    ///
+    /// The old test — count against limit — cannot tell an exact fit from a cut, and reported the chart as
+    /// missing history it had every point of.
+    #[test]
+    fn a_budget_that_exactly_fits_the_range_is_not_reported_as_truncated() {
+        let rows = read(0, i64::MAX, 15);
+        assert_eq!(rows.points.len(), 15, "the fixture holds fifteen points");
+        assert!(!rows.truncated);
+
+        // One point short of the range is the genuine case, and it still says so.
+        let cut = read(0, i64::MAX, 14);
+        assert_eq!(cut.points.len(), 14);
+        assert!(cut.truncated);
     }
 
     /// Each series has to name a rollup column that exists, or its history ends at the boundary.

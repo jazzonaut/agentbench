@@ -152,6 +152,15 @@ pub(super) fn on_battery() -> Option<bool> {
     None
 }
 
+/// Root is euid 0, which the process can read about itself.
+///
+/// The effective uid rather than the real one: it is what the kernel checks, so a setuid binary's answer
+/// matches what it will actually be allowed to do.
+pub(super) fn is_elevated() -> bool {
+    // SAFETY: geteuid cannot fail, takes no arguments and touches no memory.
+    unsafe { libc::geteuid() == 0 }
+}
+
 /// Apply one `setpriority` call to the caller, naming it for the refusal message.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn set_nice(which: libc::c_int, value: libc::c_int, called: &str) -> Capability {

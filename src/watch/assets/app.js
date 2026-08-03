@@ -79,9 +79,18 @@ async function api(path) {
   return payload;
 }
 
-function tile(value, label, absent = false) {
+/** One live number and what it is.
+ *
+ *  `hint` becomes the tile's tooltip, for a caveat that belongs with the number but would crowd the label.
+ *  Kept out of the label rather than out of the page: a value whose freshness differs from the poll it
+ *  arrived on has to say so somewhere.
+ */
+function tile(value, label, absent = false, hint = null) {
   const node = document.createElement('div');
   node.className = 'tile';
+  if (hint) {
+    node.title = hint;
+  }
   const valueNode = document.createElement('div');
   valueNode.className = absent ? 'tile-value absent' : 'tile-value';
   valueNode.textContent = value;
@@ -129,7 +138,14 @@ function renderTiles(live) {
     tile(percent(sample.cpu_percent), 'system CPU'),
     tile(gib(sample.used_memory), memoryLabel),
     tile(gib(sample.used_swap), 'swap in use'),
-    tile(count(sample.process_count), 'processes'),
+    // Counted during the sampler's process-discovery pass, not on every sample, so this number is up to a
+    // discovery interval old — a minute by default — however often the tile itself refreshes.
+    tile(
+      count(sample.process_count),
+      'processes',
+      false,
+      'Counted when the sampler last enumerated the process table, so it can be up to a minute old.',
+    ),
     // Absent is not zero: a missing scanner means none was found, not that it used no CPU.
     sample.scanner_cpu === null
       ? tile('none found', 'security scanner', true)

@@ -51,6 +51,20 @@ pub fn run(config: WatchConfig) -> Result<()> {
         None
     };
 
+    // Emptied at startup rather than when the first probe falls due, and whether or not probes are
+    // enabled: a daemon killed mid-workload leaves files behind, and the promise that the location starts
+    // empty should not depend on waiting a probe interval for it or on probing being switched on at all.
+    // A failure here is reported and survived — it is a reason for the next probe to try again, not a
+    // reason to refuse to collect.
+    if let Err(error) = collect::probes::scratch::Scratch::clear(&config.collect, &config.data_dir)
+    {
+        sink.log(
+            Level::Warn,
+            "daemon",
+            format!("could not clear the probe scratch directory: {error:#}"),
+        );
+    }
+
     let mut supervisor = Supervisor::new(sink.clone());
     let shutdown = supervisor.shutdown_flag();
     install_signal_handler(shutdown.clone());
@@ -128,28 +142,30 @@ pub fn run(config: WatchConfig) -> Result<()> {
         ),
     );
 
-    match server {
-        Some(server) => {
-            println!("AgentBench dashboard: {}", server.url());
-            println!("Data directory:       {}", config.data_dir.display());
-            println!("Press Ctrl+C to stop.");
-            // Serving occupies this thread; collectors run behind it.
-            server.serve(
-                &store,
-                &sink,
-                shutdown.clone(),
-                serve::Settings::from(&config.analysis).watching(store.writer_health()),
-            );
-        }
-        None => {
-            println!("AgentBench dashboard: collecting only (server disabled)");
-            println!("Data directory:       {}", config.data_dir.display());
-            println!("Press Ctrl+C to stop.");
-            let clock = ShutdownClock::new(SystemClock, shutdown.clone());
-            while !shutdown.load(Ordering::Relaxed) {
-                clock.sleep(config.collect.sample_interval);
-            }
-        }
+    if let Some(server) = server {
+        println!("AgentBench dashboard: {}", server.url());
+        println!("Data directory:       {}", config.data_dir.display());
+        println!("Press Ctrl+C to stop.");
+        // Serving occupies this thread; collectors run behind it.
+        server.serve(
+            &store,
+            &sink,
+            shutdown.clone(),
+            serve::Settings::from(&config.analysis).watching(store.writer_health()),
+        );
+    } else {
+        println!("AgentBench dashboard: collecting only (server disabled)");
+        println!("Data directory:       {}", config.data_dir.display());
+        println!("Press Ctrl+C to stop.");
+    }
+
+    // Reached either because there was never a server or because the one there was gave up on its
+    // listener. Both are the same situation from here: the collectors are the daemon, and the page is how
+    // it is read. Falling through to shutdown — which is what used to happen — turned a broken socket into
+    // a stopped daemon and logged it as "stopping HTTP server".
+    let clock = ShutdownClock::new(SystemClock, shutdown.clone());
+    while !shutdown.load(Ordering::Relaxed) {
+        clock.sleep(config.collect.sample_interval);
     }
 
     sink.log(Level::Info, "daemon", "shutting down");

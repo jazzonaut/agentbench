@@ -183,24 +183,13 @@ fn config_fingerprints() -> BTreeMap<String, String> {
     result
 }
 
-#[cfg(windows)]
+/// Whether this process holds administrative privileges.
+///
+/// Delegated rather than reimplemented, for the same reason [`power_source`] is. Both readings this
+/// replaced spawned a child process — `net session` and `id -u` — to answer a question the process can ask
+/// about itself, on a path `inventory()` runs on every invocation.
 fn is_elevated() -> bool {
-    Command::new("net")
-        .arg("session")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-#[cfg(unix)]
-fn is_elevated() -> bool {
-    Command::new("id")
-        .arg("-u")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim() == "0")
-        .unwrap_or(false)
+    crate::watch::platform::is_elevated()
 }
 
 #[cfg(windows)]

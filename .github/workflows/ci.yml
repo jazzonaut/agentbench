@@ -66,4 +66,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked --all-targets
+      # `--all-targets` silently excludes doctests, and this codebase documents behaviour in doc comments
+      # heavily enough that an example which no longer compiles is a real thing to catch.
+      - run: cargo test --locked --doc
       - run: cargo run --locked -- --version

@@ -29,6 +29,13 @@ use std::{
 /// How often the accept loop checks for shutdown while idle.
 const SHUTDOWN_POLL: Duration = Duration::from_millis(250);
 
+/// Consecutive accept failures tolerated before the server stops trying.
+///
+/// An accept can fail transiently — a descriptor limit reached, a peer that aborted between the SYN and
+/// the handshake — and one of those is no reason to spend the rest of the session without a dashboard.
+/// Sustained failure is a different thing, and retrying it forever would log a line per attempt.
+const ACCEPT_FAILURE_LIMIT: u32 = 5;
+
 /// The little a handler needs to know that is not in the database.
 ///
 /// Passed in rather than read from a global, and kept to what is genuinely needed: a handler that could
@@ -112,21 +119,43 @@ impl Server {
     ///
     /// Each request gets a fresh read-only connection. At the volume a single local viewer generates,
     /// opening one per request is cheaper than the machinery of a pool.
+    ///
+    /// Returning means the dashboard is gone, not that the daemon is: the caller keeps collecting. Losing
+    /// the page is an inconvenience; losing the history because the page's listener broke is the failure
+    /// this daemon exists to avoid.
     pub fn serve(self, store: &Store, sink: &Sink, shutdown: Arc<AtomicBool>, settings: Settings) {
         let port = self.address.port();
+        let mut accept_failures = 0_u32;
         while !shutdown.load(Ordering::Relaxed) {
             let request = match self.inner.recv_timeout(SHUTDOWN_POLL) {
                 Ok(Some(request)) => request,
-                Ok(None) => continue,
+                // A timeout is proof the listener is healthy, so it clears the failure run too.
+                Ok(None) => {
+                    accept_failures = 0;
+                    continue;
+                }
                 Err(error) => {
+                    accept_failures += 1;
+                    if accept_failures >= ACCEPT_FAILURE_LIMIT {
+                        sink.log(
+                            Level::Error,
+                            "serve",
+                            format!(
+                                "accept failed {accept_failures} times in a row, so the dashboard is \
+                                 no longer being served; collection continues: {error}"
+                            ),
+                        );
+                        return;
+                    }
                     sink.log(
                         Level::Warn,
                         "serve",
-                        format!("accept failed, stopping HTTP server: {error}"),
+                        format!("accept failed, retrying: {error}"),
                     );
-                    return;
+                    continue;
                 }
             };
+            accept_failures = 0;
             // Checked before the database is even opened: a rebound request is not a request for this
             // server, and answering it at all is the whole of the vulnerability.
             let response = if origin::is_own_host(host_header(&request), port) {

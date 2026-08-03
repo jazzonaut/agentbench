@@ -41,6 +41,29 @@ pub const IDLE_INTERVAL_RATIO: u32 = 6;
 /// antivirus and filter drivers. Ten seconds is still far finer than anything on the page moves.
 const SHORTEST_POLL: Duration = Duration::from_secs(10);
 
+/// Floor on the passive sampling interval, active or idle.
+///
+/// A tick is cheap but not free: a narrowed CPU and memory refresh, plus a refresh of every watched pid.
+/// At the millisecond intervals this used to accept, the sampler becomes a spin loop writing thousands of
+/// rows a second into the table retention has to prune — the tool becoming the load it exists to find.
+/// One second matches [`SHORTEST_PROBE`]: short enough for a test to drive the loop, long enough to be a
+/// floor.
+///
+/// Public because the CLI overrides have to apply the same floor. A flag that could go below the file's
+/// minimum would make the minimum decorative.
+pub const SHORTEST_SAMPLE: Duration = Duration::from_secs(1);
+
+/// Floor on the process-discovery interval.
+///
+/// Every pass enumerates the whole process table, which on Windows is the most expensive thing this tool
+/// does per unit time, and the sampler is built to avoid doing it per tick. Five seconds is the shortest
+/// interval at which that design still means anything.
+///
+/// The resolved value is additionally never shorter than the sampling interval. Discovery is decided
+/// inside a tick, so a shorter interval cannot produce more passes than there are ticks anyway; clamping
+/// makes the configured value say what the sampler will actually do.
+const SHORTEST_DISCOVERY: Duration = Duration::from_secs(5);
+
 /// Floor on the probe interval.
 ///
 /// A probe is a second and a half of real load. Back-to-back probing would stop being background
@@ -200,14 +223,20 @@ pub fn parse_duration(value: &str) -> Result<Duration> {
     let amount: u64 = digits
         .parse()
         .with_context(|| format!("interval {trimmed:?} has an unreadable number"))?;
+    // Checked rather than bare arithmetic: `"999999999999999999999d"` parses as a `u64` and used to wrap
+    // silently in a release build, turning an absurd interval into a plausible one. A configuration error
+    // has to fail as one.
     let seconds = match unit.trim() {
         "ms" => return Ok(Duration::from_millis(amount)),
-        "s" | "" => amount,
-        "m" => amount * 60,
-        "h" => amount * 3_600,
-        "d" => amount * 86_400,
+        "s" | "" => Some(amount),
+        "m" => amount.checked_mul(60),
+        "h" => amount.checked_mul(3_600),
+        "d" => amount.checked_mul(86_400),
         other => bail!("interval {trimmed:?} has unknown unit {other:?}; use ms, s, m, h, or d"),
     };
+    let seconds = seconds.with_context(|| {
+        format!("interval {trimmed:?} is longer than this program can represent")
+    })?;
     Ok(Duration::from_secs(seconds))
 }
 
@@ -331,11 +360,12 @@ impl FileConfig {
                 .with_context(|| format!("server.bind {text:?} is not an IP address"))?,
             None => IpAddr::V4(Ipv4Addr::LOCALHOST),
         };
-        let sample_interval = interval(self.collect.sample_interval, "5s")?;
-        let sample_interval_idle = interval(self.collect.sample_interval_idle, "30s")?;
-        if sample_interval.is_zero() || sample_interval_idle.is_zero() {
-            bail!("collect sample intervals must be greater than zero");
-        }
+        // Clamped rather than rejected, like the probe and poll intervals: the value is a preference, not
+        // a claim about the data, so collecting slightly less often than asked beats refusing to start.
+        // The floor also subsumes the zero this used to reject separately.
+        let sample_interval = interval(self.collect.sample_interval, "5s")?.max(SHORTEST_SAMPLE);
+        let sample_interval_idle =
+            interval(self.collect.sample_interval_idle, "30s")?.max(SHORTEST_SAMPLE);
         if sample_interval_idle < sample_interval {
             bail!(
                 "collect.sample_interval_idle ({sample_interval_idle:?}) must not be shorter than \
@@ -352,7 +382,9 @@ impl FileConfig {
                 sample_interval,
                 sample_interval_idle,
                 idle_cpu_percent: self.collect.idle_cpu_percent.unwrap_or(10.0),
-                discovery_interval: interval(self.collect.discovery_interval, "60s")?,
+                discovery_interval: interval(self.collect.discovery_interval, "60s")?
+                    .max(SHORTEST_DISCOVERY)
+                    .max(sample_interval),
                 agent_process_names: self
                     .collect
                     .agent_process_names
@@ -445,6 +477,48 @@ mod tests {
         for bad in ["", "m", "abc", "10y", "-5s"] {
             assert!(parse_duration(bad).is_err(), "{bad:?} should be rejected");
         }
+    }
+
+    /// The unit multiply used to wrap, so a number too large to mean anything became a small interval.
+    #[test]
+    fn a_duration_too_large_to_represent_is_refused_rather_than_wrapped() {
+        let error = parse_duration("184467440737095517d")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("longer than"), "{error}");
+        // The largest whole day count that still fits, to show the boundary is not off by one.
+        assert!(parse_duration("213503982334d").is_ok());
+    }
+
+    /// A millisecond cadence is a spin loop, and zero is not a cadence at all.
+    #[test]
+    fn absurdly_short_sampling_intervals_are_clamped_to_the_floor() {
+        let file: FileConfig =
+            toml::from_str("[collect]\nsample_interval = \"1ms\"\nsample_interval_idle = \"0s\"\n")
+                .unwrap();
+        let config = file.resolve(PathBuf::from("/tmp/agentbench")).unwrap();
+        assert_eq!(config.collect.sample_interval, SHORTEST_SAMPLE);
+        assert_eq!(config.collect.sample_interval_idle, SHORTEST_SAMPLE);
+    }
+
+    /// Discovery walks the whole process table, which is the one thing the sampler is built around not
+    /// doing per tick.
+    #[test]
+    fn discovery_is_clamped_to_its_floor_and_never_runs_faster_than_sampling() {
+        let file: FileConfig =
+            toml::from_str("[collect]\ndiscovery_interval = \"100ms\"\n").unwrap();
+        let config = file.resolve(PathBuf::from("/tmp/agentbench")).unwrap();
+        assert_eq!(config.collect.discovery_interval, SHORTEST_DISCOVERY);
+
+        let slow: FileConfig =
+            toml::from_str("[collect]\nsample_interval = \"30s\"\ndiscovery_interval = \"10s\"\n")
+                .unwrap();
+        let config = slow.resolve(PathBuf::from("/tmp/agentbench")).unwrap();
+        assert_eq!(
+            config.collect.discovery_interval,
+            Duration::from_secs(30),
+            "rediscovering between two ticks buys nothing"
+        );
     }
 
     #[test]

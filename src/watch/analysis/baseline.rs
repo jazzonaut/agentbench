@@ -105,7 +105,9 @@ impl Baseline {
             high: median + half_width,
             days: values.len(),
             observations: days.iter().map(|day| day.observations).sum(),
-            width_is_floor: floor > spread,
+            // `>=`, not `>`: on a tie the floor is what set the width, and the degenerate tie — identical
+            // days around a median of zero, so both are zero — is the case the disclosure exists for.
+            width_is_floor: floor >= spread,
         })
     }
 
@@ -172,6 +174,21 @@ mod tests {
             "a 2.5% move must not be a finding"
         );
         assert!(!baseline.contains(4300.0));
+    }
+
+    /// The tie: a series that sat at zero every day has a floor of zero and a spread of zero.
+    ///
+    /// Nothing about that band is a measurement, which is exactly what `width_is_floor` is for. Comparing
+    /// the two with `>` reported it as a measured spread.
+    #[test]
+    fn a_band_whose_floor_equals_its_spread_is_reported_as_floored() {
+        let baseline = Baseline::from_days(&days(&[0.0; 5])).unwrap();
+        assert_eq!(baseline.mad, 0.0);
+        assert_eq!(baseline.high, baseline.low);
+        assert!(
+            baseline.width_is_floor,
+            "a zero-width band is a convention, not a spread: {baseline:?}"
+        );
     }
 
     /// Where the spread is real, it governs, and the band says so.

@@ -358,11 +358,24 @@ Findings use documented thresholds and always include evidence, confidence, limi
 
 AgentBench verifies at least twice the generated-file working set is free. Press `q`, Escape, or Ctrl+C in the benchmark TUI for cooperative cancellation and temporary-directory cleanup.
 
+Those files are written inside `--target-dir` by default, because the disk numbers are meant to describe the
+volume your code lives on. That also means up to two gigabytes land inside a repository, where an IDE
+indexer, a `tsc --watch` or a file-watching test runner will wake up and compete — noise the report then
+attributes to the disk. `--scratch-dir` moves the workload files out of the watched tree; keep it on the same
+volume, or the filesystem figures describe a different disk. The live file-seek fixture stays under
+`--target-dir` regardless, since that is where the agent's working directory is.
+
 If live calls finish or hit their cost cap before the preset minimum, the remaining standard duration runs a sustained small-file seek/read workload while resource sampling continues. This preserves comparable three-minute thermal, storage, memory, and background-scanner observation windows.
 
 ## Reports and privacy
 
 Every run writes a versioned JSON report and adjacent Markdown summary. Reports include hashed host/path/config fingerprints so two machines can reveal mismatches without exporting their values. Raw config contents, environment values, source paths, prompts, and command arguments are excluded.
+
+The live-LLM file-seek case is the one part of a benchmark that gives a model access to your files. It runs
+`claude` with read-only tools (`Read`, `Glob`, `Grep`), no write or execute tools, permission prompts
+suppressed, and its working directory set to `--target-dir`. The prompt points at a generated fixture, but
+the model is not confined to it: anything readable beneath the target directory is within reach for the
+duration of that case. Run it against a directory you are willing to show a model, or pass `--no-live-llm`.
 
 Schema version 1 is represented by the public Serde types in `src/model.rs`. `compare` refuses incompatible schema versions, run kinds, or benchmark presets rather than producing misleading deltas.
 
