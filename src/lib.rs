@@ -11,6 +11,7 @@ pub mod profile;
 pub mod report;
 pub mod system;
 pub mod ui;
+pub mod watch;
 
 /// Version of the public report format represented by the Serde types in [`model`].
 ///

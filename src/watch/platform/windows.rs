@@ -1,0 +1,78 @@
+//! Windows implementations: `%LOCALAPPDATA%`, `LockFileEx`, and per-thread background mode.
+
+use super::Capability;
+use anyhow::{Context, Result, bail};
+use std::{env, fs::File, os::windows::io::AsRawHandle, path::PathBuf};
+use windows_sys::Win32::{
+    Foundation::{ERROR_LOCK_VIOLATION, GetLastError, HANDLE},
+    Storage::FileSystem::{LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx},
+    System::{
+        IO::OVERLAPPED,
+        Threading::{
+            GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN,
+            THREAD_MODE_BACKGROUND_END,
+        },
+    },
+};
+
+pub(super) fn default_data_dir() -> Result<PathBuf> {
+    if let Some(local) = env::var_os("LOCALAPPDATA") {
+        return Ok(PathBuf::from(local));
+    }
+    if let Some(profile) = env::var_os("USERPROFILE") {
+        return Ok(PathBuf::from(profile).join("AppData").join("Local"));
+    }
+    bail!("neither LOCALAPPDATA nor USERPROFILE is set; pass AGENTBENCH_DATA_DIR explicitly")
+}
+
+pub(super) fn try_lock_exclusive(file: &File) -> Result<bool> {
+    let handle = file.as_raw_handle() as HANDLE;
+    let mut overlapped = OVERLAPPED::default();
+    // SAFETY: `handle` is a valid file handle owned by `file` for the duration of the call, and
+    // `overlapped` is a correctly sized, zeroed structure that LockFileEx may write to.
+    let locked = unsafe {
+        LockFileEx(
+            handle,
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            u32::MAX,
+            u32::MAX,
+            &mut overlapped,
+        )
+    };
+    if locked != 0 {
+        return Ok(true);
+    }
+    // SAFETY: called immediately after the failed call on the same thread.
+    let error = unsafe { GetLastError() };
+    if error == ERROR_LOCK_VIOLATION {
+        return Ok(false);
+    }
+    Err(std::io::Error::from_raw_os_error(error as i32))
+        .context("take an exclusive lock on the daemon lock file")
+}
+
+/// `THREAD_MODE_BACKGROUND_BEGIN` lowers CPU *and* I/O priority for this thread alone, which is
+/// exactly the granularity needed: the sampler can be polite while the prober stays honest.
+pub(super) fn set_current_thread_background() -> Capability {
+    apply(THREAD_MODE_BACKGROUND_BEGIN, "enter")
+}
+
+pub(super) fn clear_current_thread_background() -> Capability {
+    apply(THREAD_MODE_BACKGROUND_END, "leave")
+}
+
+fn apply(mode: i32, verb: &str) -> Capability {
+    // SAFETY: GetCurrentThread returns a pseudo-handle to the calling thread that needs no closing,
+    // and `mode` is one of the documented THREAD_PRIORITY constants.
+    let ok = unsafe { SetThreadPriority(GetCurrentThread(), mode) };
+    if ok != 0 {
+        Capability::Applied
+    } else {
+        // SAFETY: called immediately after the failed call on the same thread.
+        let error = unsafe { GetLastError() };
+        Capability::Unsupported(format!(
+            "SetThreadPriority could not {verb} background mode (os error {error})"
+        ))
+    }
+}

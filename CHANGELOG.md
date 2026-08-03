@@ -2,6 +2,43 @@
 
 All notable changes to AgentBench are documented here. The project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- `agentbench dashboard` background collector: continuous passive sampling of CPU, memory, swap,
+  process count, security-scanner CPU, and coding-agent process-tree attribution, stored in a
+  versioned local SQLite database.
+- Loopback-only web dashboard with live tiles and an interactive history chart, all assets embedded so
+  it works with no network access.
+- `agentbench dashboard --status` for checking collection health, row counts, and recent daemon events
+  without starting anything.
+- `watch.toml` configuration, written with commented defaults on first run, overridable per run by
+  `--port`, `--data-dir`, `--no-serve`, `--sample-interval`, `--sample-interval-idle`, and
+  `--probe-interval`.
+- Single-instance locking so two collectors cannot double-count the same machine.
+- `docs/adr/` recording architectural decisions and their rejected alternatives.
+
+### Changed
+
+- **Breaking:** `agentbench dashboard` now starts the background collector and web dashboard. The live
+  terminal view moved to `agentbench top`. Passing the old `--pid`, `--name`, or `--interval-ms` flags
+  to `dashboard` still works for this release and prints a notice pointing at `top`; the shim is
+  removed in 0.5.0.
+- `bench` internals split into `bench/` with one module per workload, so a workload can be reused
+  independently of a preset. No change to emitted metrics.
+- Metric names, units, directions, and descriptions consolidated into a single `metrics` catalog,
+  replacing string literals duplicated across benchmarking, comparison, and diagnosis.
+- Process-tree selection and resource aggregation consolidated into one `process_tree` module,
+  replacing separate implementations in the profiler and the terminal view.
+
+### Fixed
+
+- The first CPU reading of a collection session no longer records a spurious 100%. `sysinfo` needs two
+  refreshes to compute a delta, so the sampler now primes and discards a throwaway reading.
+- Lowering `--sample-interval` now lowers the idle sampling cadence proportionally, instead of leaving
+  a quiet machine at its slow default and appearing to ignore the override.
+
 ## [0.3.0] - 2026-07-31
 
 ### Added

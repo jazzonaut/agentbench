@@ -1,4 +1,4 @@
-use agentbench::{bench, compare, experiment, profile, report, ui};
+use agentbench::{bench, compare, experiment, profile, report, ui, watch};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
@@ -46,8 +46,41 @@ enum Command {
         #[arg(long)]
         output: Option<PathBuf>,
     },
-    /// Show a live system/process dashboard. Press q to quit.
+    /// Collect metrics in the background and serve a local web dashboard.
     Dashboard {
+        /// Port for the loopback HTTP server.
+        #[arg(long)]
+        port: Option<u16>,
+        /// Directory holding the database and configuration. Defaults to the per-user data dir.
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Collect without serving the web UI.
+        #[arg(long)]
+        no_serve: bool,
+        /// Override the passive sampling interval, e.g. 5s.
+        #[arg(long)]
+        sample_interval: Option<String>,
+        /// Override the idle sampling interval, e.g. 30s. Never shorter than --sample-interval.
+        #[arg(long)]
+        sample_interval_idle: Option<String>,
+        /// Override the probe interval, e.g. 15m.
+        #[arg(long)]
+        probe_interval: Option<String>,
+        /// Print collection status and recent daemon events, then exit.
+        #[arg(long)]
+        status: bool,
+        /// Accepted for one release: the live TUI moved to `agentbench top`.
+        #[arg(long, hide = true)]
+        pid: Option<u32>,
+        /// Accepted for one release: the live TUI moved to `agentbench top`.
+        #[arg(long, hide = true)]
+        name: Option<String>,
+        /// Accepted for one release: the live TUI moved to `agentbench top`.
+        #[arg(long, hide = true)]
+        interval_ms: Option<u64>,
+    },
+    /// Show a live system/process TUI. Press q to quit.
+    Top {
         #[arg(long)]
         pid: Option<u32>,
         #[arg(long)]
@@ -168,6 +201,38 @@ fn main() -> Result<()> {
             );
         }
         Command::Dashboard {
+            port,
+            data_dir,
+            no_serve,
+            sample_interval,
+            sample_interval_idle,
+            probe_interval,
+            status,
+            pid,
+            name,
+            interval_ms,
+        } => {
+            // The TUI used to live here. Its distinctive flags identify an old invocation, so
+            // forward it once with a notice rather than starting a web server someone did not ask for.
+            if pid.is_some() || name.is_some() || interval_ms.is_some() {
+                eprintln!(
+                    "note: the live TUI moved to `agentbench top`; `agentbench dashboard` now runs \
+                     the background collector and web dashboard. Forwarding to `top` for this run."
+                );
+                ui::dashboard(pid, name.as_deref(), interval_ms.unwrap_or(500))?;
+            } else {
+                run_dashboard(
+                    port,
+                    data_dir,
+                    no_serve,
+                    sample_interval,
+                    sample_interval_idle,
+                    probe_interval,
+                    status,
+                )?;
+            }
+        }
+        Command::Top {
             pid,
             name,
             interval_ms,
@@ -213,6 +278,90 @@ fn main() -> Result<()> {
             output,
         } => compare::run(&baseline, &candidate, output.as_deref())?,
         Command::InternalNoop => {}
+    }
+    Ok(())
+}
+
+/// Load configuration, apply CLI overrides, then either report status or run the daemon.
+fn run_dashboard(
+    port: Option<u16>,
+    data_dir: Option<PathBuf>,
+    no_serve: bool,
+    sample_interval: Option<String>,
+    sample_interval_idle: Option<String>,
+    probe_interval: Option<String>,
+    status: bool,
+) -> Result<()> {
+    let mut config = watch::WatchConfig::load(data_dir)?;
+    if let Some(port) = port {
+        config.server.port = port;
+    }
+    if no_serve {
+        config.server.enabled = false;
+    }
+    if let Some(value) = sample_interval {
+        let active = watch::config::parse_duration(&value).context("--sample-interval")?;
+        config.collect.sample_interval = active;
+        // Asking for a faster cadence must actually produce one. Left alone, the configured idle
+        // interval would keep a quiet machine at its slow default and the override would appear to do
+        // nothing at all. Clamp idle to the shipped active:idle ratio, never below the active value.
+        config.collect.sample_interval_idle = config
+            .collect
+            .sample_interval_idle
+            .min(active * watch::config::IDLE_INTERVAL_RATIO)
+            .max(active);
+    }
+    if let Some(value) = sample_interval_idle {
+        let idle = watch::config::parse_duration(&value).context("--sample-interval-idle")?;
+        config.collect.sample_interval_idle = idle.max(config.collect.sample_interval);
+    }
+    if let Some(value) = probe_interval {
+        config.collect.probe_interval =
+            watch::config::parse_duration(&value).context("--probe-interval")?;
+    }
+
+    if status {
+        print_status(&config)?;
+        return Ok(());
+    }
+    watch::run(config)
+}
+
+/// Human-readable rendering of the same payload `/api/status` returns.
+fn print_status(config: &watch::WatchConfig) -> Result<()> {
+    let status = watch::status(config, 10)?;
+    let age = status
+        .sample_age_ms
+        .map(|ms| format!("{:.0}s ago", ms as f64 / 1000.0))
+        .unwrap_or_else(|| "never".into());
+    println!("Data directory: {}", config.data_dir.display());
+    println!(
+        "Collecting:     {}",
+        if status.collecting { "yes" } else { "no" }
+    );
+    println!(
+        "Daemon running: {}",
+        if watch::is_running(config) {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+    println!("Last sample:    {age}");
+    println!(
+        "Rows:           {} samples, {} probe runs, {} session turns, {} tool calls",
+        status.health.samples,
+        status.health.probe_runs,
+        status.health.session_turns,
+        status.health.session_tools
+    );
+    println!("Import errors:  {}", status.health.import_errors);
+    println!("Schema version: {}", status.health.schema_version);
+    if !status.events.is_empty() {
+        println!("\nRecent events:");
+        for event in &status.events {
+            println!("  [{}] {}: {}", event.level, event.source, event.message);
+        }
     }
     Ok(())
 }

@@ -59,9 +59,13 @@ Run `quick` for a sub-minute system smoke test; add `--live-llm` to include a ro
 To watch Claude from a second terminal:
 
 ```text
-agentbench dashboard --name claude
-agentbench dashboard --pid 12345
+agentbench top --name claude
+agentbench top --pid 12345
 ```
+
+> **Renamed in 0.4.0.** The live terminal view moved from `agentbench dashboard` to `agentbench top`,
+> and `agentbench dashboard` now runs the background collector described below. The old
+> `dashboard --pid/--name` form still works for one release and prints a notice.
 
 To profile a non-interactive command and its descendants:
 
@@ -70,6 +74,88 @@ agentbench profile --label claude-direct --timeout-seconds 300 --output direct.j
 ```
 
 Arguments, working directories, environment values, prompts, and output are redacted from reports. `--save-command-output` explicitly places a bounded stdout/stderr tail in the local JSON report; do not use it with sensitive material.
+
+## Continuous background collection
+
+`bench` answers "how fast is this machine right now". It cannot answer "is it slower than it was on
+Tuesday, and what changed", because that needs a record that already exists before you start looking.
+`agentbench dashboard` keeps one:
+
+```text
+agentbench dashboard
+```
+
+It prints a loopback URL, collects continuously, and serves live tiles plus historical charts. Stop it
+with Ctrl+C. To check on it without starting anything:
+
+```text
+agentbench dashboard --status
+```
+
+Useful flags: `--port`, `--data-dir`, `--no-serve` to collect without opening a socket, and
+`--sample-interval` / `--probe-interval` to raise resolution while investigating a regression.
+Lowering `--sample-interval` also lowers the idle cadence proportionally, so a faster setting is not
+silently defeated when the machine is quiet.
+
+### What it collects
+
+- **Passive samples**: CPU, memory, swap, process count, security-scanner CPU, and CPU/RSS/process
+  count attributed to your coding-agent process tree. Refreshes are narrowed to the counters actually
+  used and to discovered process ids rather than walking the whole process table, the sampler thread
+  runs at background CPU and I/O priority where the OS supports it, and the cadence backs off when the
+  machine is idle.
+- **Probes** *(from a later release)*: micro-scale reruns of the same workloads `bench` uses, at the
+  same metric names, so thresholds and comparisons carry over. Never any paid API call.
+- **Real session metrics** *(from a later release)*: tool-execution latency and time-to-first-token
+  derived from your own Claude Code transcripts, so the charts reflect measured usage rather than a
+  proxy for it.
+
+### Storage, privacy, and lifecycle
+
+State lives in one directory: `%LOCALAPPDATA%\agentbench\` on Windows,
+`$XDG_DATA_HOME/agentbench/` on Linux, `~/Library/Application Support/agentbench/` on macOS. Override
+it with `--data-dir` or `AGENTBENCH_DATA_DIR`. It holds `watch.db`, a self-documenting `watch.toml`
+written on first run, and a lock file that prevents two daemons from double-counting the same machine.
+
+The HTTP server binds `127.0.0.1` only and refuses to bind anything else. That restriction is
+load-bearing: **unlike every exported report, the local database stores real project paths and git
+branch names**, because a dashboard that cannot tell you which project was slow is not much use.
+Nothing is uploaded, and report and comparison output continue to hash paths as before.
+
+There is no service installer, and AgentBench changes no OS configuration on its own. To start the
+collector at login, register it with your platform's own scheduler.
+
+Windows, user-scoped and without administrator rights — substitute the real path to `agentbench.exe`:
+
+```text
+schtasks /create /tn AgentBenchDashboard /sc onlogon /rl limited /tr "C:\path\to\agentbench.exe dashboard"
+```
+
+Linux, as a systemd user unit — write `~/.config/systemd/user/agentbench-dashboard.service`:
+
+```text
+[Unit]
+Description=AgentBench background collector
+
+[Service]
+ExecStart=%h/.cargo/bin/agentbench dashboard
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+```
+
+then `systemctl --user daemon-reload && systemctl --user enable --now agentbench-dashboard`.
+
+macOS, as a launch agent — write `~/Library/LaunchAgents/dev.agentbench.dashboard.plist` with a
+`ProgramArguments` array of your `agentbench` path plus `dashboard`, then
+`launchctl load ~/Library/LaunchAgents/dev.agentbench.dashboard.plist`.
+
+Remove the collector by deleting the scheduled task, unit, or plist; nothing else is left behind
+except the data directory.
+
+The dashboard embeds [uPlot](https://github.com/leeoniya/uPlot) (MIT); its licence is served at
+`/assets/uplot.LICENSE`. No asset is fetched from the network, so the page works fully offline.
 
 ## Direct-versus-Headroom experiments
 
@@ -114,11 +200,19 @@ Every run writes a versioned JSON report and adjacent Markdown summary. Reports 
 
 Schema version 1 is represented by the public Serde types in `src/model.rs`. `compare` refuses incompatible schema versions, run kinds, or benchmark presets rather than producing misleading deltas.
 
+The background dashboard's SQLite schema is versioned separately via `PRAGMA user_version` and is
+migrated forward automatically. A database written by a newer build is refused rather than
+downgraded, so history that cannot be regenerated is never silently rewritten.
+
 ## Platform limitations
 
 Portable counters are always collected when supported by the OS. Native collectors annotate their provenance and report missing capabilities instead of inventing zeros. Per-process network attribution is intentionally unavailable without kernel tracing. Thermal evidence varies considerably by OS; falling sustained throughput without a temperature/frequency signal is only a suspicion, never a thermal diagnosis.
 
 `--elevated` never prompts for elevation and never changes the machine. Start AgentBench from an elevated terminal if deeper supported checks are desired.
+
+## Design decisions
+
+Architectural decisions and their rejected alternatives are recorded in [`docs/adr/`](docs/adr/).
 
 ## Project policy
 

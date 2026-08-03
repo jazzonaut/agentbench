@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>AgentBench dashboard</title>
+<link rel="stylesheet" href="/assets/uplot.min.css">
+<style>
+  /* Design tokens. Dark mode is designed, not an automatic inversion: each value is the
+     dark-surface-validated counterpart of its light twin, not a flip of it. */
+  :root {
+    --surface-1: #fcfcfb;
+    --plane: #f9f9f7;
+    --ink-primary: #0b0b0b;
+    --ink-secondary: #52514e;
+    --ink-muted: #898781;
+    --grid: #e1e0d9;
+    --axis: #c3c2b7;
+    --ring: rgba(11, 11, 11, 0.10);
+    --series-1: #2a78d6;
+    --good: #006300;
+    --warn: #eb6834;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --surface-1: #1a1a19;
+      --plane: #0d0d0d;
+      --ink-primary: #ffffff;
+      --ink-secondary: #c3c2b7;
+      --ink-muted: #898781;
+      --grid: #2c2c2a;
+      --axis: #383835;
+      --ring: rgba(255, 255, 255, 0.10);
+      --series-1: #3987e5;
+      --good: #0ca30c;
+      --warn: #d95926;
+    }
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    padding: 24px 20px 40px;
+    background: var(--plane);
+    color: var(--ink-primary);
+    font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    font-variant-numeric: tabular-nums;
+  }
+  main { max-width: 1100px; margin: 0 auto; }
+
+  header { display: flex; align-items: baseline; gap: 12px; margin-bottom: 20px; }
+  h1 { font-size: 17px; font-weight: 600; margin: 0; letter-spacing: -0.01em; }
+  .subtitle { color: var(--ink-muted); font-size: 12px; }
+
+  section { margin-bottom: 28px; }
+  h2 {
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--ink-muted);
+    margin: 0 0 10px;
+  }
+
+  .tiles {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 10px;
+  }
+  .tile {
+    background: var(--surface-1);
+    border: 1px solid var(--ring);
+    border-radius: 8px;
+    padding: 12px 14px;
+  }
+  /* Values wear ink tokens, never a series colour: identity is carried by the mark, not the text. */
+  .tile-value { font-size: 21px; font-weight: 600; letter-spacing: -0.02em; }
+  .tile-label { color: var(--ink-secondary); font-size: 11px; margin-top: 2px; }
+  .tile-value.absent { color: var(--ink-muted); font-weight: 400; font-size: 15px; }
+
+  .card {
+    background: var(--surface-1);
+    border: 1px solid var(--ring);
+    border-radius: 8px;
+    padding: 14px 14px 6px;
+  }
+  .card-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+  /* One series needs no legend box; the title names it. */
+  .card-title { font-size: 13px; font-weight: 600; }
+  .card-note { color: var(--ink-muted); font-size: 11px; }
+
+  .ranges { display: flex; gap: 6px; margin-bottom: 10px; }
+  .ranges button {
+    font: inherit;
+    font-size: 12px;
+    /* Comfortable hit target rather than a cramped one. */
+    padding: 6px 12px;
+    min-height: 32px;
+    color: var(--ink-secondary);
+    background: var(--surface-1);
+    border: 1px solid var(--ring);
+    border-radius: 6px;
+    cursor: pointer;
+  }
+  .ranges button[aria-pressed="true"] {
+    color: var(--ink-primary);
+    border-color: var(--axis);
+    font-weight: 600;
+  }
+  .ranges button:focus-visible { outline: 2px solid var(--series-1); outline-offset: 2px; }
+
+  .empty { color: var(--ink-muted); font-size: 12px; padding: 28px 4px; }
+
+  footer { color: var(--ink-secondary); font-size: 12px; }
+  .status-line { display: flex; flex-wrap: wrap; gap: 14px; margin-bottom: 10px; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+  .dot.ok { background: var(--good); }
+  .dot.stale { background: var(--warn); }
+
+  table { border-collapse: collapse; width: 100%; font-size: 12px; }
+  th, td { text-align: left; padding: 4px 10px 4px 0; vertical-align: top; }
+  th { color: var(--ink-muted); font-weight: 600; }
+  td.level-error { color: var(--warn); }
+  td.level-warn { color: var(--warn); }
+
+  .uplot { font-family: inherit; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>AgentBench</h1>
+    <span class="subtitle" id="subtitle">connecting…</span>
+  </header>
+
+  <section aria-labelledby="now-heading">
+    <h2 id="now-heading">Now</h2>
+    <div class="tiles" id="tiles"></div>
+  </section>
+
+  <section aria-labelledby="history-heading">
+    <h2 id="history-heading">History</h2>
+    <div class="ranges" id="ranges" role="group" aria-label="Time range"></div>
+    <div class="card">
+      <div class="card-head">
+        <span class="card-title">System CPU</span>
+        <span class="card-note">percent of all cores · hover for values</span>
+      </div>
+      <div id="chart"></div>
+      <p class="empty" id="chart-empty" hidden>
+        No samples in this range yet. Leave the daemon running and refresh.
+      </p>
+    </div>
+  </section>
+
+  <footer aria-labelledby="health-heading">
+    <h2 id="health-heading">Daemon health</h2>
+    <div class="status-line" id="status-line"></div>
+    <table id="events">
+      <caption class="card-note" style="text-align:left; margin-bottom:6px;">
+        Recent daemon events
+      </caption>
+      <thead><tr><th scope="col">Time</th><th scope="col">Source</th><th scope="col">Message</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </footer>
+</main>
+
+<script src="/assets/uplot.min.js"></script>
+<script type="module" src="/assets/app.js"></script>
+</body>
+</html>
