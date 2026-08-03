@@ -159,7 +159,7 @@ machine look faster the more went wrong. On real data they are 3.3% of calls.
 | 2 | Sessions: transcript parsing, derivation, watermarks, full backfill | **done** |
 | 3 | Probes: micro workloads, covariates, run markers | **done** |
 | 4 | Analysis: baseline, verdicts, annotations, rollup and retention | **done** |
-| 5 | Ship: README/CHANGELOG polish, autostart docs | mostly done in 1 and 4 |
+| 5 | Ship: README/CHANGELOG polish, autostart docs, 0.4.0 | **done** |
 
 ### Deviations from the plan as executed
 
@@ -396,6 +396,30 @@ machine look faster the more went wrong. On real data they are 3.3% of calls.
   the rows are exactly the shape the daemon produces — including the machine id, which has to match or the
   daemon reads none of them.
 
+- **Phase 5's largest finding was that the manifest never moved.** The phase was scoped to prose, since the
+  CLI rename landed in phase 1 and phases 1 and 4 each wrote their own README and CHANGELOG sections. What
+  nothing had caught is that `Cargo.toml` still said `0.3.0` while the README already told readers the
+  terminal view was "renamed in 0.4.0" and the CHANGELOG said the compatibility shim would be "removed in
+  0.5.0". Both statements were true of the release being prepared and false of the crate as it stood, and
+  `release.yml` would have rejected a `v0.4.0` tag for exactly this reason — it compares the tag against
+  `cargo metadata` and greps the CHANGELOG for a matching heading. The version is now `0.4.0` and
+  `[Unreleased]` is dated. The general shape is familiar from the MSRV: a version written in prose but not
+  in the file that defines it is a claim nothing executes.
+- **Two open questions were promoted out of this document into the README.** The mixed-cadence blank stretch
+  and `memory.write_gib_s` were both recorded here as things to fix later, which is the right place for a
+  plan and the wrong place for a caveat a user will hit. The blank frame is visible to anybody who changes
+  `--probe-interval`, and a charted metric reading two orders of magnitude low invites the reader to trust
+  it. The tool's stated posture is to report a missing capability rather than invent a number, and that
+  posture has to extend to numbers it does produce but does not yet believe. Both remain open questions
+  below; the README now says so in the platform limitations, where somebody reading a wrong-looking chart
+  will actually look.
+- **The daemon's platform caveats went to `## Platform limitations`, not into the collection section.** The
+  one-way Unix priority rule, best-effort thread priority, and `on_battery()` returning unknown on
+  unsupported platforms were each documented where they were implemented — inside the long prose on what the
+  collector does and costs. That is the section somebody reads when deciding whether to run it, not the one
+  they read when their platform behaves differently from the description. The README already had a section
+  whose entire subject is "what this OS cannot tell you", and these belonged in it.
+
 ### ratatui and the MSRV
 
 **Decided: adopt ratatui 0.30. MSRV is 1.88, and is now verified.**
@@ -431,7 +455,7 @@ number in it.
 - **Whether the baseline should filter on power was decided as "no, disclose".** Recorded above with the
   reasoning and the accepted cost.
 
-### Open questions carried into phase 5 and beyond
+### Open questions carried past 0.4.0
 
 - **Whether `agentbench top` or the `bench` progress display is rewritten first.** The progress display
   is currently a static text list where gauges and a sparkline would help most; `top` already works.

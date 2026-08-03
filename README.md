@@ -6,7 +6,9 @@
 
 AgentBench is a local, cross-platform diagnostic CLI for answering a deceptively hard question: **why is a coding agent fast on one machine and slow on another?** It combines agent-shaped synthetic workloads, process-tree profiling, optional Headroom/RTK/Tokensave evidence, and offline report comparison.
 
-It does not upload telemetry or change antivirus, proxy, power, or OS settings.
+`agentbench dashboard` answers the companion question — **is this machine slower today than it was last week, and what changed?** It collects passive system samples, a scheduled micro-workload, and real timings from your own Claude Code transcripts into a local database, then serves a loopback web dashboard with day-over-day verdicts. Your existing transcripts are imported on first run, so it starts with months of history rather than waiting to accrue it.
+
+It does not upload telemetry or change antivirus, proxy, power, or OS settings. The collector makes exactly one outbound request, a timed HTTPS round trip carrying no prompt and no credentials, and that request has its own switch.
 
 ## Install
 
@@ -337,6 +339,13 @@ Cases are interleaved with a recorded random seed to reduce cache, load, and tim
 - Installed Claude Code, Headroom, RTK, and Tokensave versions; Headroom `doctor` and `perf` JSON when available.
 - Normal-user OS metrics plus optional capability-gated diagnostics when `--elevated` is requested from an already elevated shell.
 
+Continuously, while `agentbench dashboard` is running:
+
+- Passive CPU, memory, swap, process count, security-scanner CPU, and CPU/RSS/process count attributed to the coding-agent process tree, every few seconds.
+- A micro-workload every 15 minutes feeding the same metric names as the benchmarks above, each run stamped with the contention and power source it began in.
+- Tool latency, prompt-to-first-response intervals, token counts and cache hit ratios derived from local Claude Code transcripts.
+- The start and end of every `bench`, `profile` and `experiment` run, so a foreground load is labelled in the passive series rather than read as a machine getting slower.
+
 Findings use documented thresholds and always include evidence, confidence, limitations, and safe follow-ups. “Possible antivirus contention” is deliberately not reported as proof: compare matched target directories and inspect scanner overlap first.
 
 ## Preset safety limits
@@ -366,6 +375,28 @@ downgraded, so history that cannot be regenerated is never silently rewritten.
 Portable counters are always collected when supported by the OS. Native collectors annotate their provenance and report missing capabilities instead of inventing zeros. Per-process network attribution is intentionally unavailable without kernel tracing. Thermal evidence varies considerably by OS; falling sustained throughput without a temperature/frequency signal is only a suspicion, never a thermal diagnosis.
 
 `--elevated` never prompts for elevation and never changes the machine. Start AgentBench from an elevated terminal if deeper supported checks are desired.
+
+The background collector degrades rather than guesses. Its sampler and transcript threads drop to
+background CPU and I/O priority only where the OS supports it. Power source is read natively on Windows,
+Linux and macOS and recorded as *unknown* everywhere else — never as "on mains", because a laptop on
+battery runs measurably slower for a reason that is not degradation. On Unix that lowered priority is
+never restored, by design: lowering a nice value needs no privileges and raising it back does, so the
+probe thread is *started* at normal priority rather than restored to it. A restore that silently failed
+would make every probe on that thread read slow and report a machine degrading while nothing had changed.
+
+Two limitations of the dashboard are known and unresolved. Neither affects a judged series:
+
+- If you change `--probe-interval` partway through a history, a chart spanning the change renders the
+  minority-cadence stretch as a blank frame instead of a line. The line-break threshold is the series'
+  own median spacing, against which every point at the other cadence looks like an outage. Making the
+  threshold depend on the requested range instead was tried, and it drew a confident straight line across
+  a real ninety-second gap in collection — the worse of the two failures. The fix is per-neighbourhood
+  gap detection.
+- `probe:memory.write_gib_s` reports around 0.07 GiB/s on hardware that should manage orders of magnitude
+  more. The workload is shared with `bench`, so either the probe's 64 MiB working set is too small to
+  measure bandwidth or the benchmark has been reporting the same figure all along. It is charted,
+  deliberately unjudged, and worth measuring before it is worth changing, since a fix moves published
+  report values.
 
 ## Design decisions
 
