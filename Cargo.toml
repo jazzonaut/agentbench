@@ -35,7 +35,7 @@ clap = { version = "4.5", features = ["derive"] }
 crossterm = "0.29"
 ctrlc = "3.4"
 hex = "0.4"
-rand = "0.9"
+rand = "0.10"
 # Blocking, thread-per-request HTTP for the local dashboard. Default features only: no TLS, since
 # the server is loopback-only.
 tiny_http = { version = "0.12", default-features = false }
