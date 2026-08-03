@@ -225,6 +225,9 @@ fn power_source() -> Option<String> {
 
 pub fn native_diagnostics(_elevated_requested: bool) -> (serde_json::Value, Vec<String>) {
     let mut unavailable = Vec::new();
+    // Only Windows and Linux have diagnostics to insert here. macOS contributes to `unavailable`
+    // instead, and so never mutates this map.
+    #[cfg_attr(not(any(windows, target_os = "linux")), allow(unused_mut))]
     let mut data = serde_json::Map::new();
     #[cfg(windows)]
     {

@@ -8,12 +8,12 @@ use std::{env, fs::File, os::unix::io::AsRawFd, path::PathBuf};
 const BACKGROUND_NICE: libc::c_int = 10;
 
 pub(super) fn default_data_dir() -> Result<PathBuf> {
-    if cfg!(target_os = "macos") {
-        if let Some(home) = env::var_os("HOME") {
-            return Ok(PathBuf::from(home)
-                .join("Library")
-                .join("Application Support"));
-        }
+    if cfg!(target_os = "macos")
+        && let Some(home) = env::var_os("HOME")
+    {
+        return Ok(PathBuf::from(home)
+            .join("Library")
+            .join("Application Support"));
     }
     if let Some(xdg) = env::var_os("XDG_DATA_HOME") {
         return Ok(PathBuf::from(xdg));
@@ -43,12 +43,10 @@ pub(super) fn try_lock_exclusive(file: &File) -> Result<bool> {
 /// granularity wanted. Elsewhere it may affect the whole process; the fallback is still an
 /// improvement over competing at normal priority, and I/O priority is left untouched because no
 /// portable interface exists.
+/// Not reversible: `setpriority` will not lower a nice value again without privileges, which is why
+/// no counterpart exists.
 pub(super) fn set_current_thread_background() -> Capability {
     set_nice(BACKGROUND_NICE)
-}
-
-pub(super) fn clear_current_thread_background() -> Capability {
-    set_nice(0)
 }
 
 fn set_nice(value: libc::c_int) -> Capability {

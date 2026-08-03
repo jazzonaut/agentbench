@@ -18,7 +18,3 @@ pub(super) fn try_lock_exclusive(_file: &File) -> Result<bool> {
 pub(super) fn set_current_thread_background() -> Capability {
     Capability::Unsupported("thread priority control is unavailable on this platform".into())
 }
-
-pub(super) fn clear_current_thread_background() -> Capability {
-    Capability::Unsupported("thread priority control is unavailable on this platform".into())
-}

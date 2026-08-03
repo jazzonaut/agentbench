@@ -78,13 +78,14 @@ pub fn try_lock_exclusive(file: &File) -> Result<bool> {
 ///
 /// Applied only to threads whose timing does not matter. Deliberately never applied to the probe
 /// thread: a throttled probe measures the throttle, not the machine.
+///
+/// **One-way on Unix.** Lowering priority needs no privileges; raising it back does. An unprivileged
+/// process cannot undo this, so there is deliberately no counterpart function: a measured thread has
+/// to be started at normal priority rather than restored to it. A restore that silently failed would
+/// be the worst outcome available — every probe on that thread would read slow, consistently, and the
+/// dashboard would report a machine getting worse while nothing about the machine had changed.
 pub fn set_current_thread_background() -> Capability {
     imp::set_current_thread_background()
-}
-
-/// Restore the calling thread to normal scheduling priority.
-pub fn clear_current_thread_background() -> Capability {
-    imp::clear_current_thread_background()
 }
 
 #[cfg(test)]
@@ -124,12 +125,16 @@ mod tests {
         );
     }
 
+    /// Lowering priority is all that is claimed, and all that is testable.
+    ///
+    /// An earlier version asserted that a platform able to lower priority could also restore it. On
+    /// Unix that is simply untrue — raising a nice value back needs privileges an unprivileged daemon
+    /// does not have — and the assertion only ever passed because it had never run on Unix.
     #[test]
     fn background_priority_reports_whether_it_applied() {
         let applied = set_current_thread_background();
-        let restored = clear_current_thread_background();
-        // Both must agree: a platform that can lower priority can also restore it.
-        assert_eq!(applied.is_applied(), restored.is_applied());
+        // A refusal has to explain itself: that reason is logged, and it is the only signal a user
+        // gets that a collector is competing at normal priority.
         if !applied.is_applied() {
             assert!(applied.reason().is_some_and(|reason| !reason.is_empty()));
         }

@@ -32,7 +32,7 @@ mod tests {
     use serde_json::Value;
 
     struct Fixture {
-        _temp: tempfile::TempDir,
+        temp: tempfile::TempDir,
         store: Store,
     }
 
@@ -47,7 +47,19 @@ mod tests {
                 ..Default::default()
             };
             let store = Store::open(&temp.path().join("watch.db"), &inventory).unwrap();
-            Self { _temp: temp, store }
+            Self { temp, store }
+        }
+
+        /// Close the store so the writer commits, keeping the directory it wrote to.
+        ///
+        /// Dropping the whole fixture would take the temporary directory with it. On Windows that
+        /// deletion quietly fails while the database file is still open, so a test could drop the
+        /// fixture and still reopen the database; on Unix the deletion succeeds and the same test
+        /// reopens nothing. Handing the directory back makes the lifetime explicit on both.
+        fn close(self) -> tempfile::TempDir {
+            let Self { temp, store } = self;
+            store.shutdown().expect("the writer should stop cleanly");
+            temp
         }
 
         fn get(&self, target: &str) -> Resp {
@@ -118,13 +130,12 @@ mod tests {
             agent_processes: Some(2),
         });
         // Force the writer to commit by closing the store, then reopen for reading.
-        let path = fixture._temp.path().join("watch.db");
         let inventory = Inventory {
             hostname_hash: "hash-router".into(),
             ..Default::default()
         };
-        drop(fixture);
-        let store = Store::open(&path, &inventory).unwrap();
+        let temp = fixture.close();
+        let store = Store::open(&temp.path().join("watch.db"), &inventory).unwrap();
         let reader = store.reader().unwrap();
 
         let resp = route(&Req::parse("/api/status"), &reader);

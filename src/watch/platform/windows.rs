@@ -8,10 +8,7 @@ use windows_sys::Win32::{
     Storage::FileSystem::{LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx},
     System::{
         IO::OVERLAPPED,
-        Threading::{
-            GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN,
-            THREAD_MODE_BACKGROUND_END,
-        },
+        Threading::{GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN},
     },
 };
 
@@ -54,12 +51,11 @@ pub(super) fn try_lock_exclusive(file: &File) -> Result<bool> {
 
 /// `THREAD_MODE_BACKGROUND_BEGIN` lowers CPU *and* I/O priority for this thread alone, which is
 /// exactly the granularity needed: the sampler can be polite while the prober stays honest.
+///
+/// Windows can undo this with `THREAD_MODE_BACKGROUND_END`, but no counterpart is exposed, because
+/// Unix cannot and a capability that exists on one platform only would be a trap for the caller.
 pub(super) fn set_current_thread_background() -> Capability {
     apply(THREAD_MODE_BACKGROUND_BEGIN, "enter")
-}
-
-pub(super) fn clear_current_thread_background() -> Capability {
-    apply(THREAD_MODE_BACKGROUND_END, "leave")
 }
 
 fn apply(mode: i32, verb: &str) -> Capability {

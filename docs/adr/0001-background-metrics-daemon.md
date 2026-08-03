@@ -136,6 +136,19 @@ machine look faster the more went wrong. On real data they are 3.3% of calls.
    the declared MSRV.
 7. The probe issues ~96 outbound HTTPS requests/day to `api.anthropic.com`. Not telemetry, but it
    warrants explicit documentation and a configuration switch.
+8. **Background priority is one-way on Unix, and phase 3 depends on that.** Lowering a nice value
+   needs no privileges; raising it back does. There is therefore no "restore normal priority"
+   function, and a measured thread must be *started* at normal priority rather than restored to it —
+   which is what decision 6 already requires, but for a reason weaker than the real one. A restore
+   that silently failed would be the worst available outcome: every probe on that thread would read
+   slow, consistently, and the dashboard would report a machine degrading while nothing had changed.
+9. **A Windows-only developer cannot see a Unix failure locally, and CI is the only check.** Three
+   defects sat in phase-0 and phase-1 code until the commits were first pushed: a `clippy` lint in
+   `platform/unix.rs`, an unused `mut` on macOS in `system.rs`, and a test that deleted its own
+   temporary directory and then reopened a database inside it — which passes on Windows, where an
+   open file handle blocks the deletion, and fails on Unix, where it does not. Cross-checking is not
+   an option either: `libsqlite3-sys` and `ring` compile C, so `cargo check --target` needs a cross
+   compiler. Assume any Unix-specific code is unverified until CI says otherwise.
 
 ## Phases
 
