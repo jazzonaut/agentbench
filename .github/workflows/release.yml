@@ -71,6 +71,10 @@ jobs:
           $root = Join-Path dist $package
           New-Item -ItemType Directory -Force -Path $root | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/${{ matrix.binary }}" $root
+          # The windowless build, which is the whole of the tray feature and is Windows-only. Shipping the
+          # console binary alone would leave "start in tray" pointing at an executable the user does not
+          # have, and the logon task it registers would silently start nothing.
+          Copy-Item "target/${{ matrix.target }}/release/agentbench-tray.exe" $root
           Copy-Item README.md, CHANGELOG.md, CONTRIBUTING.md, SECURITY.md, LICENSE $root
           Compress-Archive -Path $root -DestinationPath "dist/$package.zip"
           Remove-Item -Recurse -Force -LiteralPath $root

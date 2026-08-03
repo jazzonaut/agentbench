@@ -6,6 +6,7 @@
 
 pub mod options;
 pub mod preset;
+pub mod progress;
 pub mod workloads;
 
 mod cancel;
@@ -14,6 +15,7 @@ mod sampler;
 
 pub use options::BenchOptions;
 pub use preset::Preset;
+pub use progress::{PHASE_COUNT, Phase, Progress};
 
 use crate::{
     SCHEMA_VERSION, diagnosis, integrations, live_llm,
@@ -36,9 +38,6 @@ use std::{
 use tempfile::Builder;
 use uuid::Uuid;
 
-/// Total phases announced in progress output.
-const PHASE_COUNT: usize = 8;
-
 /// Fallback minimum live-LLM window for presets that declare no minimum duration.
 const DEFAULT_LIVE_MINIMUM: Duration = Duration::from_secs(30);
 
@@ -56,21 +55,26 @@ const PROCESS_LAUNCHES: usize = 10;
 const LOOPBACK_BYTES: usize = 16 << 20;
 
 /// Run a benchmark, installing a Ctrl+C handler for cooperative cancellation.
+///
+/// Announces phases on stdout, which is the right destination for the batch form: no TTY, redirected
+/// output, or `--no-tui`.
 pub fn run(preset: Preset, target: &Path, options: BenchOptions) -> Result<Report> {
     let cancel = Arc::new(AtomicBool::new(false));
     let handler_cancel = cancel.clone();
     let _ = ctrlc::set_handler(move || handler_cancel.store(true, Ordering::Relaxed));
-    run_with_cancel(preset, target, options, cancel)
+    run_with_cancel(preset, target, options, cancel, &Progress::Stdout)
 }
 
-/// Run a benchmark against a caller-owned cancellation flag.
+/// Run a benchmark against a caller-owned cancellation flag and progress sink.
 ///
-/// The TUI uses this so that `q` and Escape share one cancellation path with Ctrl+C.
+/// The TUI uses this so that `q` and Escape share one cancellation path with Ctrl+C, and so that phase
+/// announcements reach a gauge instead of being printed into an alternate screen buffer nobody reads.
 pub fn run_with_cancel(
     preset: Preset,
     target: &Path,
     options: BenchOptions,
     cancel: Arc<AtomicBool>,
+    progress: &Progress,
 ) -> Result<Report> {
     let limits = preset.limits();
     let started = Instant::now();
@@ -91,13 +95,13 @@ pub fn run_with_cancel(
     let mut metrics = Vec::new();
     let mut warnings = Vec::new();
 
-    phase(1, "CPU benchmark");
+    progress.phase(1, "CPU benchmark");
     metrics.extend(workloads::cpu::run(limits.cpu_seconds, &cancel)?);
     check_cancel(&cancel)?;
 
-    phase(
+    progress.phase(
         2,
-        &format!(
+        format!(
             "Memory benchmark ({:.0} MiB)",
             memory_size as f64 / 1_048_576.0
         ),
@@ -105,9 +109,9 @@ pub fn run_with_cancel(
     metrics.extend(workloads::memory::run(memory_size as usize, &cancel)?);
     check_cancel(&cancel)?;
 
-    phase(
+    progress.phase(
         3,
-        &format!(
+        format!(
             "Filesystem benchmark ({:.0} MiB, {} small files)",
             limits.disk_working_set as f64 / 1_048_576.0,
             limits.small_files
@@ -121,10 +125,7 @@ pub fn run_with_cancel(
     )?);
     check_cancel(&cancel)?;
 
-    phase(
-        4,
-        &format!("SQLite benchmark ({} rows)", limits.sqlite_rows),
-    );
+    progress.phase(4, format!("SQLite benchmark ({} rows)", limits.sqlite_rows));
     metrics.extend(workloads::sqlite::run(
         temp.path(),
         limits.sqlite_rows,
@@ -132,11 +133,11 @@ pub fn run_with_cancel(
     )?);
     check_cancel(&cancel)?;
 
-    phase(5, "Process launch benchmark");
+    progress.phase(5, "Process launch benchmark");
     metrics.extend(workloads::process::run(PROCESS_LAUNCHES)?);
     check_cancel(&cancel)?;
 
-    phase(6, "Loopback/network benchmark");
+    progress.phase(6, "Loopback/network benchmark");
     metrics.extend(workloads::network::loopback(LOOPBACK_BYTES)?);
     check_cancel(&cancel)?;
 
@@ -150,7 +151,7 @@ pub fn run_with_cancel(
     let mut profiles = Vec::new();
     let mut llm_runs = Vec::new();
     if options.live_llm {
-        phase(7, "Live Claude benchmark (paid API/subscription traffic)");
+        progress.phase(7, "Live Claude benchmark (paid API/subscription traffic)");
         let minimum = if limits.minimum_duration.is_zero() {
             DEFAULT_LIVE_MINIMUM
         } else {
@@ -183,10 +184,10 @@ pub fn run_with_cancel(
         llm_runs.extend(live.runs);
         warnings.extend(live.warnings);
     } else {
-        phase(7, "Live Claude benchmark skipped (--no-live-llm)");
+        progress.phase(7, "Live Claude benchmark skipped (--no-live-llm)");
     }
 
-    phase(8, "Agent integrations");
+    progress.phase(8, "Agent integrations");
     let (integrations, mut unavailable) = integrations::collect(target, options.elevated);
     for integration in &integrations {
         if let Some(version) = &integration.version {
@@ -255,9 +256,4 @@ pub fn run_with_cancel(
         warnings,
         unavailable,
     })
-}
-
-/// Announce a phase on stdout, matching the `[n/8] label` progress format.
-fn phase(number: usize, label: &str) {
-    println!("[{number}/{PHASE_COUNT}] {label}");
 }

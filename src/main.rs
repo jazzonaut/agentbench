@@ -1,4 +1,4 @@
-use agentbench::{bench, compare, experiment, profile, report, ui, watch};
+use agentbench::{bench, compare, experiment, profile, report, status_report, ui, watch};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
@@ -10,8 +10,13 @@ use std::path::PathBuf;
     about = "Diagnose slow coding-agent environments"
 )]
 struct Cli {
+    /// Absent means the control centre: `agentbench` with no arguments opens a screen rather than printing
+    /// help, because the help is twelve flags long and the screen is how you avoid needing to know them.
+    ///
+    /// The control centre uses the default data directory. Anyone wanting another one is already passing
+    /// `dashboard --data-dir`, and a second copy of that flag up here would collide with it.
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -181,14 +186,23 @@ fn warn_if_measuring_with_a_debug_build() {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    // The control centre is included because it can launch a benchmark, so a debug build has to say so
+    // before the user starts one from it rather than after the numbers are already in the database.
     if matches!(
         cli.command,
-        Command::Bench { .. } | Command::Profile { .. } | Command::Experiment { .. }
-    ) || matches!(cli.command, Command::Dashboard { status: false, .. })
-    {
+        None | Some(
+            Command::Bench { .. }
+                | Command::Profile { .. }
+                | Command::Experiment { .. }
+                | Command::Dashboard { status: false, .. }
+        )
+    ) {
         warn_if_measuring_with_a_debug_build();
     }
-    match cli.command {
+    let Some(command) = cli.command else {
+        return ui::control::run(None);
+    };
+    match command {
         Command::Bench {
             preset,
             target_dir,
@@ -244,6 +258,8 @@ fn main() -> Result<()> {
             options.llm_model = llm_model;
             options.llm_cost_cap_usd = llm_cost_cap_usd;
             options.headroom_port = headroom_port;
+            // No TTY means no screen: a redirected or piped run gets the `[n/8]` phase lines on stdout
+            // instead, which is what a script reading this output expects.
             let use_tui = !no_tui && crossterm::tty::IsTty::is_tty(&std::io::stdout());
             // Marked before the load starts and again after the report is written, so an interrupted run
             // still explains the cliff it left in the dashboard's passive series. Silently a no-op when
@@ -251,8 +267,9 @@ fn main() -> Result<()> {
             let marking = mark_run("benchmark", Some(preset.name()));
             let completed = if use_tui {
                 let tui_options = options.clone();
-                let run =
-                    move |cancel| bench::run_with_cancel(preset, &target_dir, tui_options, cancel);
+                let run = move |cancel, progress| {
+                    bench::run_with_cancel(preset, &target_dir, tui_options, cancel, &progress)
+                };
                 ui::run_task("AgentBench", run)?
             } else {
                 bench::run(preset, &target_dir, options)?
@@ -292,7 +309,7 @@ fn main() -> Result<()> {
                     "note: the live TUI moved to `agentbench top`; `agentbench dashboard` now runs \
                      the background collector and web dashboard. Forwarding to `top` for this run."
                 );
-                ui::dashboard(pid, name.as_deref(), interval_ms.unwrap_or(500))?;
+                ui::top(pid, name.as_deref(), interval_ms.unwrap_or(500))?;
             } else {
                 run_dashboard(DashboardArgs {
                     port,
@@ -313,7 +330,7 @@ fn main() -> Result<()> {
             pid,
             name,
             interval_ms,
-        } => ui::dashboard(pid, name.as_deref(), interval_ms)?,
+        } => ui::top(pid, name.as_deref(), interval_ms)?,
         Command::Profile {
             label,
             timeout_seconds,
@@ -434,34 +451,27 @@ fn run_dashboard(args: DashboardArgs) -> Result<()> {
         // Replaces rather than extends: the point of naming roots is to import those and nothing else.
         config.sessions.roots = sessions_root;
     }
+    // Both interval overrides go through the same clamp the configuration file and the control centre's
+    // save path use. A flag that could go below the file's own minimum would make the minimum decorative,
+    // and three copies of the rule is how one of them ends up disagreeing with the other two.
     if let Some(value) = sample_interval {
-        // Clamped to the configuration's floor for the same reason --probe-interval is: a flag that could
-        // go below the file's minimum would make the minimum decorative.
-        let active = watch::config::parse_duration(&value)
-            .context("--sample-interval")?
-            .max(watch::config::SHORTEST_SAMPLE);
-        config.collect.sample_interval = active;
-        // Asking for a faster cadence must actually produce one. Left alone, the configured idle
-        // interval would keep a quiet machine at its slow default and the override would appear to do
-        // nothing at all. Clamp idle to the shipped active:idle ratio, never below the active value.
-        config.collect.sample_interval_idle = config
-            .collect
-            .sample_interval_idle
-            .min(active * watch::config::IDLE_INTERVAL_RATIO)
-            .max(active);
+        config.collect.sample_interval =
+            watch::config::parse_duration(&value).context("--sample-interval")?;
     }
     if let Some(value) = sample_interval_idle {
-        let idle = watch::config::parse_duration(&value).context("--sample-interval-idle")?;
-        config.collect.sample_interval_idle = idle
-            .max(config.collect.sample_interval)
-            .max(watch::config::SHORTEST_SAMPLE);
+        config.collect.sample_interval_idle =
+            watch::config::parse_duration(&value).context("--sample-interval-idle")?;
     }
+    let (active, idle) = watch::config::clamp_sample_intervals(
+        config.collect.sample_interval,
+        config.collect.sample_interval_idle,
+    );
+    config.collect.sample_interval = active;
+    config.collect.sample_interval_idle = idle;
     if let Some(value) = probe_interval {
-        // Clamped to the configuration's floor for the same reason the file is: a probe is real load, and
-        // back-to-back probing stops being background collection.
-        config.collect.probe_interval = watch::config::parse_duration(&value)
-            .context("--probe-interval")?
-            .max(watch::config::SHORTEST_PROBE);
+        config.collect.probe_interval = watch::config::clamp_probe_interval(
+            watch::config::parse_duration(&value).context("--probe-interval")?,
+        );
     }
 
     if status {
@@ -474,117 +484,12 @@ fn run_dashboard(args: DashboardArgs) -> Result<()> {
 /// Human-readable rendering of the same payload `/api/status` returns.
 ///
 /// One reader for both halves. Opening a second would re-derive the same machine id and re-open the
-/// same file to answer a question the first one could already have answered.
+/// same file to answer a question the first one could already have answered. The wording and the
+/// queries both live in [`status_report`], so this command and the control centre can never reach
+/// different verdicts from the same rows.
 fn print_status(config: &watch::WatchConfig) -> Result<()> {
     let reader = watch::open_for_reading(config)?;
-    let status = watch::status(&reader, 10)?;
-    let age = status
-        .sample_age_ms
-        .map(|ms| format!("{:.0}s ago", ms as f64 / 1000.0))
-        .unwrap_or_else(|| "never".into());
-    println!("Data directory: {}", config.data_dir.display());
-    println!(
-        "Collecting:     {}",
-        if status.collecting { "yes" } else { "no" }
-    );
-    println!(
-        "Daemon running: {}",
-        if watch::is_running(config) {
-            "yes"
-        } else {
-            "no"
-        }
-    );
-    println!("Last sample:    {age}");
-    println!(
-        "Rows:           {} samples, {} session turns, {} tool calls",
-        status.health.samples, status.health.session_turns, status.health.session_tools
-    );
-    // The clean count is reported beside the total because probing is ungated: on a busy week the
-    // comparable subset can be a small fraction of what was collected, and that is the number a baseline
-    // will actually have to work with.
-    println!(
-        "Probes:         {} runs, {} uncontended",
-        status.health.probe_runs, status.health.probe_runs_clean
-    );
-    println!("Marked runs:    {}", status.health.run_markers);
-    println!("Transcripts:    {} imported", status.health.imported_files);
-    println!("Import errors:  {}", status.health.import_errors);
-    println!("Schema version: {}", status.health.schema_version);
-    print_verdicts(&reader, config.analysis.baseline_window_days);
-    if !status.events.is_empty() {
-        println!("\nRecent events:");
-        for event in &status.events {
-            println!("  [{}] {}: {}", event.level, event.source, event.message);
-        }
-    }
+    let report = status_report::Report::build(config, &reader)?;
+    status_report::print(&report);
     Ok(())
-}
-
-/// Today against its trailing baseline, as `--status` reports it.
-///
-/// Failures are printed rather than propagated. A verdict is the most derived thing in the tool and the
-/// least essential to `--status`, whose actual job is to answer "is collection working?" — so a query that
-/// cannot be answered says so on one line and leaves the counts above it intact.
-fn print_verdicts(reader: &watch::store::Reader, window_days: u32) {
-    let comparisons = match watch::verdicts(reader, window_days) {
-        Ok(comparisons) => comparisons,
-        Err(error) => {
-            println!("\nToday vs baseline: unavailable ({error:#})");
-            return;
-        }
-    };
-    println!(
-        "\nToday vs baseline (previous {} days, uncontended probes only):",
-        comparisons.window_days
-    );
-    for comparison in &comparisons.comparisons {
-        let value = comparison
-            .today
-            .map(|value| format_measurement(value, comparison.unit))
-            .unwrap_or_else(|| "—".to_string());
-        let change = comparison
-            .delta_percent
-            .map(|delta| format!(" ({delta:+.1}%)"))
-            .unwrap_or_default();
-        println!(
-            "  {:<26} {:<9} {value}{change}",
-            comparison.label,
-            comparison.verdict.as_str(),
-        );
-        // The count behind a figure and any caveat on it are part of the finding, not a footnote: a
-        // reader deciding whether to investigate needs both on the same screen.
-        if let Some(baseline) = &comparison.baseline {
-            println!(
-                "  {:<26} baseline {} from {} day(s), {} measurement(s)",
-                "",
-                format_measurement(baseline.median, comparison.unit),
-                baseline.days,
-                baseline.observations
-            );
-        }
-        if let Some(note) = &comparison.note {
-            println!("  {:<26} {note}", "");
-        }
-    }
-}
-
-/// Print a measurement with enough precision to be readable at whatever scale it happens to be.
-///
-/// One fixed number of decimal places cannot serve this set. A probe inserts three hundred thousand SQLite
-/// rows a second and looks one up in four *microseconds*; printed to one decimal place the first is noise
-/// and the second is "0.0 ms" for ever. Found by running the daemon and reading `--status`, which is the
-/// only place this class of fault ever shows up.
-fn format_measurement(value: f64, unit: &str) -> String {
-    let magnitude = value.abs();
-    let digits = if magnitude >= 100.0 {
-        0
-    } else if magnitude >= 1.0 {
-        1
-    } else if magnitude >= 0.01 {
-        3
-    } else {
-        5
-    };
-    format!("{value:.digits$} {unit}")
 }

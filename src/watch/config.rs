@@ -240,8 +240,48 @@ pub fn parse_duration(value: &str) -> Result<Duration> {
     Ok(Duration::from_secs(seconds))
 }
 
+/// Apply the floor and the ordering invariant to a pair of sampling intervals.
+///
+/// Shared by the CLI overrides and the control centre's save path, because both can otherwise defeat the
+/// file's own minimum and make it decorative. The idle cadence is the subtle half: asking for faster
+/// sampling has to actually produce it, and left alone a configured idle interval would keep a quiet
+/// machine at its slow default so the override would appear to do nothing at all. Idle is scaled to the
+/// shipped active-to-idle ratio and never allowed below the active value.
+pub fn clamp_sample_intervals(active: Duration, idle: Duration) -> (Duration, Duration) {
+    let active = active.max(SHORTEST_SAMPLE);
+    let idle = idle
+        .min(active * IDLE_INTERVAL_RATIO)
+        .max(active)
+        .max(SHORTEST_SAMPLE);
+    (active, idle)
+}
+
+/// Apply the floor to a probe interval.
+///
+/// A probe is real load, and back-to-back probing stops being background collection.
+pub fn clamp_probe_interval(interval: Duration) -> Duration {
+    interval.max(SHORTEST_PROBE)
+}
+
+/// Render a duration in the units [`parse_duration`] accepts, choosing the coarsest exact one.
+///
+/// Written back into the file rather than a raw second count, so a value the control centre saved still
+/// looks like the values around it and still reads as "15m" rather than "900s".
+pub fn duration_text(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    if seconds == 0 {
+        return format!("{}ms", duration.subsec_millis());
+    }
+    for (unit, size) in [("d", 86_400), ("h", 3_600), ("m", 60)] {
+        if seconds.is_multiple_of(size) {
+            return format!("{}{unit}", seconds / size);
+        }
+    }
+    format!("{seconds}s")
+}
+
 /// Commented defaults written on first run so the file documents itself.
-const DEFAULT_CONFIG_TOML: &str = r#"# AgentBench dashboard configuration.
+pub(super) const DEFAULT_CONFIG_TOML: &str = r#"# AgentBench dashboard configuration.
 # Every value here is optional; deleting one restores its default.
 # Intervals accept ms, s, m, h, d — for example "500ms", "15m", "14d".
 

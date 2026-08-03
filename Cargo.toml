@@ -1,19 +1,34 @@
 [package]
 name = "agentbench"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
+# Required from the moment a second binary exists: without it `cargo run` cannot choose between
+# `agentbench` and `agentbench-tray` and fails, which breaks both the CI smoke check and anyone building
+# from source. The console build is the one a person means.
+default-run = "agentbench"
 description = "Cross-platform diagnostics for slow coding-agent environments"
 license = "MIT"
 repository = "https://github.com/jazzonaut/agentbench"
 homepage = "https://github.com/jazzonaut/agentbench"
 documentation = "https://docs.rs/agentbench"
 readme = "README.md"
-# 1.88 is where `let` chains stabilised for edition 2024, and this crate uses them. ratatui 0.30
-# separately requires 1.86 — it is the first release built against crossterm 0.29, and so the first
-# that does not link a second copy of crossterm alongside this project's — but the language feature is
-# the binding constraint. Verified by the `msrv` CI job, which reads this value; do not raise it
-# without a reason recorded here.
-rust-version = "1.88"
+# Raised from 1.88 because `libsqlite3-sys` 0.38.1 uses `cfg_select!` in its build script, and that
+# macro stabilised in 1.95. Edition 2024's MSRV-aware resolver did not prevent this: it can only avoid
+# a crate that declares a `rust-version`, and that one declares none, so the requirement is announced by
+# nothing but a compile failure in the build script — before any code in this crate is looked at. Every
+# toolchain from 1.88 up was tried; 1.94 and below fail, 1.95 passes.
+#
+# Pinning the dependency back instead would have kept the number low and the promise false. A lockfile
+# binds this repository, not the people who build the crate: `cargo install agentbench` resolves afresh,
+# takes 0.38.1, and needs 1.95 whatever this file claims.
+#
+# The earlier constraints still hold and are the floor if that dependency ever changes: `let` chains
+# stabilised for edition 2024 in 1.88 and this crate uses them, and ratatui 0.30 requires 1.86 — it is
+# the first release built against crossterm 0.29, and so the first that does not link a second copy of
+# crossterm alongside this project's.
+#
+# Verified by the `msrv` CI job, which reads this value; do not raise it without a reason recorded here.
+rust-version = "1.95"
 keywords = ["benchmark", "diagnostics", "llm", "claude", "performance"]
 categories = ["command-line-utilities", "development-tools", "hardware-support"]
 include = [
@@ -48,6 +63,21 @@ sysinfo = "0.38.4"
 tempfile = "3.20"
 toml = "1.1.4"
 uuid = { version = "1.17", features = ["v4", "serde"] }
+# Widgets and layout for the three interactive screens. `default-features = false` drops `all-widgets`,
+# whose only content beyond the base set is the calendar — and that pulls `time`, a dependency this crate
+# would compile solely to not use. `crossterm` resolves to 0.29, the version already above, so one copy is
+# linked rather than two; `cargo tree -i crossterm` is the check if that ever changes.
+ratatui = { version = "0.30", default-features = false, features = [
+    "std",
+    "crossterm",
+    "layout-cache",
+    "underline-color",
+] }
+# Format-preserving TOML for writing settings back from the control centre. `toml` above cannot do this:
+# it parses to owned values and re-serialising discards every comment in `DEFAULT_CONFIG_TOML`, which is
+# the file's documentation. Not shared with `toml` 1.x, which moved to `toml_parser`/`toml_writer`, so this
+# is one genuinely new crate rather than a promotion of an existing one.
+toml_edit = "0.25"
 
 # Thread priority and advisory file locking for the daemon. Both are already in the dependency tree
 # transitively, so promoting them to direct dependencies adds no new crates.
@@ -57,11 +87,27 @@ libc = "0.2"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    # Not for drawing: `WNDCLASSW` carries an `HBRUSH` for its background, so registering the tray's hidden
+    # window class needs the GDI types even though that window is never shown and never painted.
+    "Win32_Graphics_Gdi",
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
     "Win32_System_Power",
+    # Reading and writing the user's `PATH` under `HKCU\Environment`. Done through the registry rather
+    # than `setx`, which truncates the value at 1024 characters, or .NET's `SetEnvironmentVariable`, which
+    # cannot be relied on to preserve `REG_EXPAND_SZ` — both of those corrupt a `PATH` that contains
+    # `%USERPROFILE%`, silently and irreversibly.
+    "Win32_System_Registry",
     "Win32_System_Threading",
+    # `GetModuleHandleW`, to register the tray icon's hidden window class.
+    "Win32_System_LibraryLoader",
+    # `ShellExecuteW`: opening the dashboard in the user's browser, and re-launching this executable with
+    # the `runas` verb, which is the only place in the design a UAC prompt appears.
+    "Win32_UI_Shell",
+    # `SendMessageTimeoutW` to broadcast `WM_SETTINGCHANGE`, so a new shell sees an edited `PATH` without
+    # the user logging out. Also the tray icon's window and menu.
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 [dev-dependencies]

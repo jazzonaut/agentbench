@@ -2,6 +2,7 @@ pub mod bench;
 pub mod compare;
 pub mod diagnosis;
 pub mod experiment;
+pub mod install;
 pub mod integrations;
 pub mod live_llm;
 pub mod metrics;
@@ -9,7 +10,9 @@ pub mod model;
 pub mod process_tree;
 pub mod profile;
 pub mod report;
+pub mod status_report;
 pub mod system;
+pub mod tray;
 pub mod ui;
 pub mod watch;
 

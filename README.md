@@ -8,7 +8,11 @@ AgentBench is a local, cross-platform diagnostic CLI for answering a deceptively
 
 `agentbench dashboard` answers the companion question — **is this machine slower today than it was last week, and what changed?** It collects passive system samples, a scheduled micro-workload, and real timings from your own Claude Code transcripts into a local database, then serves a loopback web dashboard with day-over-day verdicts. Your existing transcripts are imported on first run, so it starts with months of history rather than waiting to accrue it.
 
-It does not upload telemetry or change antivirus, proxy, power, or OS settings. The collector makes exactly one outbound request, a timed HTTPS round trip carrying no prompt and no credentials, and that request has its own switch.
+Run `agentbench` with no arguments for the control centre: one screen showing whether collection is working
+and letting you change any of it without remembering a flag — start at login, run in the tray, install and
+add to `PATH`, sampling and probe cadence, retention, and the dashboard's port.
+
+It does not upload telemetry or change antivirus, proxy, power, or OS settings. The collector makes exactly one outbound request, a timed HTTPS round trip carrying no prompt and no credentials, and that request has its own switch. Startup, `PATH` and the install directory are only touched when you ask for them on that screen.
 
 ## Install
 
@@ -25,7 +29,7 @@ Release assets are provided for:
 
 ### Build from source
 
-Rust 1.88 or newer is required.
+Rust 1.95 or newer is required.
 
 ```text
 git clone https://github.com/jazzonaut/agentbench.git
@@ -281,8 +285,14 @@ Probes write into `probe-scratch/` inside the data directory, or inside `scratch
 It is emptied when the daemon starts and after every probe, so a daemon killed mid-workload does not
 leave a directory behind that would skew the next run.
 
-There is no service installer, and AgentBench changes no OS configuration on its own. To start the
-collector at login, register it with your platform's own scheduler.
+**On Windows, run `agentbench` with no arguments and turn on "Run at login"** — the control centre
+registers the task below for you, installs a copy of the executable somewhere `cargo clean` will not delete
+it, and can put that directory on your `PATH`. It never asks for administrator rights: the collector does
+not need them, and Windows will not show a consent prompt at logon anyway. Turning on "Start in tray" uses
+`agentbench-tray.exe` instead, which runs with no console window and a notification-area icon.
+
+AgentBench still changes no OS configuration unless asked. To register the task by hand instead, or on
+another platform, use your own scheduler.
 
 Windows, user-scoped and without administrator rights — substitute the real path to `agentbench.exe`:
 

@@ -144,8 +144,16 @@ struct Worker {
 
 impl Supervisor {
     pub fn new(sink: Sink) -> Self {
+        Self::with_shutdown(sink, Arc::new(AtomicBool::new(false)))
+    }
+
+    /// Take a shutdown flag the caller already holds.
+    ///
+    /// The tray build needs this: its Quit menu item has to be able to stop collection, and it cannot reach
+    /// a flag the supervisor created for itself.
+    pub fn with_shutdown(sink: Sink, shutdown: Arc<AtomicBool>) -> Self {
         Self {
-            shutdown: Arc::new(AtomicBool::new(false)),
+            shutdown,
             workers: Vec::new(),
             sink,
         }

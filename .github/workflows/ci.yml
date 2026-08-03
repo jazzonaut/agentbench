@@ -64,7 +64,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
+      # Clippy per platform, not only in `quality`. That job runs on Linux, so it never compiles a
+      # `#[cfg(windows)]` module — and the install, PATH, scheduled-task and tray code is almost entirely
+      # inside those. Without this step that code ships unlinted, which is how a `-D warnings` gate comes to
+      # mean "the parts of the crate that build on Linux are clean".
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - run: cargo test --locked --all-targets
       # `--all-targets` silently excludes doctests, and this codebase documents behaviour in doc comments
       # heavily enough that an example which no longer compiles is a real thing to catch.

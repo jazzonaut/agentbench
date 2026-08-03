@@ -4,6 +4,56 @@ All notable changes to AgentBench are documented here. The project follows [Sema
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-03
+
+### Added
+
+- **`agentbench` with no arguments opens a control centre.** One screen showing whether collection is
+  working and letting every setting that was previously a flag or a hand-edited TOML key be changed in
+  place: startup, install location, `PATH`, sampling and probe intervals, transcripts, retention, the
+  baseline window, and the dashboard's port. Changes apply as they are made rather than behind a save key,
+  and each one reports what it did — including when a value was clamped to the configuration's floor, and
+  to what. Settings are written with `toml_edit`, so the comments that document `watch.toml` survive being
+  edited.
+- **Collection can start at login on Windows.** A toggle registers an unelevated `ONLOGON` scheduled task,
+  which needs no administrator rights and therefore raises no consent prompt — Windows refuses to show one
+  at logon in any case. The default two-minute delay is deliberate: probes that fire during the login storm
+  are recorded as contended and drop out of the baseline, so a daemon that started immediately would
+  collect samples it could not later compare. The task is the only record of the setting; it is read back
+  rather than mirrored, so removing it in Task Scheduler is reflected honestly.
+- **A tray icon, in a new `agentbench-tray` executable.** The Windows subsystem is fixed at link time, so
+  this is a second binary rather than a flag: giving the main one no console would take out `top`, the
+  control centre and every line of report output. It runs the collector with no console window and a
+  notification-area icon whose menu opens the dashboard, opens the settings screen, or stops collecting —
+  the last through the same cooperative shutdown a Ctrl+C uses, so the database closes cleanly rather than
+  the process being torn down mid-write.
+- **An install action and a `PATH` toggle.** Installing copies the executable to
+  `%LOCALAPPDATA%\Programs\AgentBench`, and both `PATH` and the logon task point at that copy. Running from
+  a Cargo build directory disables both rows and says why: `cargo clean` deletes that path, after which
+  `agentbench` becomes "command not found" and the logon task starts nothing, neither with any error the
+  user would see. `PATH` is edited through `HKCU\Environment` with the value's registry type preserved, and
+  a `WM_SETTINGCHANGE` broadcast so a new terminal picks it up.
+- **A benchmark can be started with administrator rights from the control centre**, which is where the one
+  consent prompt in the design lives. The collector itself stays unelevated: it gathers identical data
+  either way, and elevating it would turn any fault in its loopback HTTP server into an
+  elevation-of-privilege one.
+
+### Changed — the terminal interface
+
+- **Every terminal screen is rebuilt on `ratatui`**, sharing one theme and one set of widgets. Colour now
+  has a job — status colours mean state and nothing else, series colours can never be mistaken for a
+  verdict, and text keeps text ink instead of whole lines being tinted. Panels adapt to the terminal's size
+  rather than assuming there are enough rows, and the live process view keeps a minute of history, so a
+  spike is still visible a moment after it happens.
+- **`bench` no longer prints its phase lines into a screen that is overwriting them.** Progress reached
+  stdout while the terminal UI held the alternate buffer, which is what the old note about timings being
+  "emitted after the dashboard closes" was apologising for. Phases now go to a sink: a gauge under the
+  terminal UI, and the same `[n/8] label` lines on stdout for a redirected or `--no-tui` run, byte for
+  byte as before.
+- The Windows release archive now contains `agentbench-tray.exe` alongside `agentbench.exe`.
+- `cargo clippy` runs on every platform in CI, not only Linux. The lint job's `-D warnings` had never seen
+  a `#[cfg(windows)]` module, which is where nearly all of this release's new code lives.
+
 ### Changed — measurement values move
 
 - **`memory.write_gib_s` now reports roughly an order of magnitude more, on both the probe and the
@@ -224,5 +274,6 @@ All notable changes to AgentBench are documented here. The project follows [Sema
 - Evidence-ranked diagnoses for system, network, security-scanner, and proxy bottlenecks.
 - Tag-driven Windows, Linux, macOS Intel, and macOS Apple Silicon GitHub releases.
 
+[0.5.0]: https://github.com/jazzonaut/agentbench/releases/tag/v0.5.0
 [0.4.0]: https://github.com/jazzonaut/agentbench/releases/tag/v0.4.0
 [0.3.0]: https://github.com/jazzonaut/agentbench/releases/tag/v0.3.0

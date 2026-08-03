@@ -1,0 +1,508 @@
+//! The screen `agentbench` opens with no arguments.
+//!
+//! It answers the two questions the command line makes awkward: is collection working, and how do I change
+//! something without remembering twelve flags. The status band comes from [`status_report`], the same code
+//! `dashboard --status` prints, so the screen and the command can never disagree about a verdict.
+//!
+//! [`status_report`]: crate::status_report
+
+mod apply;
+mod model;
+
+use crate::{
+    status_report,
+    ui::{
+        Screen, theme,
+        widgets::{Footer, Reading},
+    },
+    watch::{self, WatchConfig},
+};
+use anyhow::Result;
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use model::{Field, Kind, Section, State};
+use ratatui::{
+    Frame,
+    layout::{Constraint, Layout, Rect},
+    style::Style,
+    text::Line,
+    widgets::{Block, Paragraph, Wrap},
+};
+use std::time::{Duration, Instant};
+
+/// How often the status band is re-read.
+///
+/// Slow on purpose: it opens the database and probes the instance lock, and neither is worth doing four
+/// times a second to update a figure that changes once every sampling interval.
+const STATUS_REFRESH: Duration = Duration::from_secs(2);
+
+/// Redraw cadence.
+const TICK: Duration = Duration::from_millis(200);
+
+/// Column reserved for row labels.
+const LABEL_WIDTH: u16 = 30;
+
+const HINTS: &[(&str, &str)] = &[
+    ("↑↓", "move"),
+    ("space", "toggle"),
+    ("enter", "edit or run"),
+    ("q", "quit"),
+];
+
+const EDIT_HINTS: &[(&str, &str)] = &[("enter", "confirm"), ("esc", "cancel")];
+
+/// Open the control centre.
+pub fn run(data_dir: Option<std::path::PathBuf>) -> Result<()> {
+    // Loaded before the screen opens, so a configuration error is an ordinary message on stderr rather than
+    // something flashed inside an alternate buffer that is about to be torn down.
+    let config = WatchConfig::load(data_dir)?;
+    let mut app = App::new(config)?;
+    let mut screen = Screen::enter()?;
+    loop {
+        app.refresh_status_if_due();
+        screen.terminal().draw(|frame| app.draw(frame))?;
+        if event::poll(TICK)?
+            && let Event::Key(key) = event::read()?
+            && key.kind == KeyEventKind::Press
+            && app.handle(key.code, key.modifiers) == Flow::Quit
+        {
+            return Ok(());
+        }
+    }
+}
+
+/// Whether the loop continues.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Flow {
+    Continue,
+    Quit,
+}
+
+struct App {
+    state: State,
+    fields: Vec<Field>,
+    selected: usize,
+    /// Present while a value is being typed.
+    editing: Option<String>,
+    /// The last thing that happened, and whether it went wrong.
+    message: Option<Result<String, String>>,
+    status: Option<Result<status_report::Report, String>>,
+    status_read_at: Option<Instant>,
+}
+
+impl App {
+    fn new(config: WatchConfig) -> Result<Self> {
+        Ok(Self {
+            state: State::read(config),
+            fields: State::fields(),
+            selected: 0,
+            editing: None,
+            message: None,
+            status: None,
+            status_read_at: None,
+        })
+    }
+
+    fn field(&self) -> Field {
+        self.fields[self.selected.min(self.fields.len() - 1)]
+    }
+
+    /// Re-read the status band when it is stale, ignoring the outcome's shape.
+    fn refresh_status_if_due(&mut self) {
+        let due = self
+            .status_read_at
+            .is_none_or(|read_at| read_at.elapsed() >= STATUS_REFRESH);
+        if !due {
+            return;
+        }
+        self.status_read_at = Some(Instant::now());
+        // A missing database is the ordinary first-run case, not a failure worth a red message: the daemon
+        // creates it when it starts. Reported in the band as the reason there are no numbers.
+        self.status = Some(
+            watch::open_for_reading(&self.state.config)
+                .and_then(|reader| status_report::Report::build(&self.state.config, &reader))
+                .map_err(|error| format!("{error:#}")),
+        );
+    }
+
+    fn handle(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Flow {
+        if self.editing.is_some() {
+            return self.handle_edit(code);
+        }
+        match code {
+            KeyCode::Char('q') | KeyCode::Esc => return Flow::Quit,
+            KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => return Flow::Quit,
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.selected = (self.selected + 1) % self.fields.len();
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.selected = self
+                    .selected
+                    .checked_sub(1)
+                    .unwrap_or(self.fields.len() - 1);
+            }
+            KeyCode::Char(' ') => self.activate(false),
+            KeyCode::Enter => self.activate(true),
+            KeyCode::Char('r') => {
+                self.state = State::read(self.state.config.clone());
+                self.status_read_at = None;
+                self.message = Some(Ok("reloaded".into()));
+            }
+            _ => {}
+        }
+        Flow::Continue
+    }
+
+    /// Space toggles; Enter toggles, edits, or acts depending on the row.
+    fn activate(&mut self, enter: bool) {
+        let field = self.field();
+        let outcome = match field.kind() {
+            Kind::Toggle => apply::toggle(&mut self.state, field),
+            Kind::Value if enter => {
+                // Seeded with the current value so a small change is an edit rather than a retype.
+                self.editing = Some(self.state.value(field));
+                return;
+            }
+            Kind::Action if enter => apply::act(&mut self.state, field),
+            _ => return,
+        };
+        self.message = Some(outcome.map_err(|error| format!("{error:#}")));
+    }
+
+    fn handle_edit(&mut self, code: KeyCode) -> Flow {
+        let Some(buffer) = self.editing.as_mut() else {
+            return Flow::Continue;
+        };
+        match code {
+            KeyCode::Esc => {
+                self.editing = None;
+            }
+            KeyCode::Enter => {
+                let text = buffer.clone();
+                self.editing = None;
+                let field = self.field();
+                self.message = Some(
+                    apply::commit(&mut self.state, field, &text).map_err(|e| format!("{e:#}")),
+                );
+            }
+            KeyCode::Backspace => {
+                buffer.pop();
+            }
+            // Control characters would be invisible in the field and meaningless to every parser behind it.
+            KeyCode::Char(character) if !character.is_control() => buffer.push(character),
+            _ => {}
+        }
+        Flow::Continue
+    }
+
+    fn draw(&self, frame: &mut Frame) {
+        let [status, rows, help, footer] = Layout::vertical([
+            Constraint::Length(6),
+            Constraint::Min(0),
+            Constraint::Length(2),
+            Constraint::Length(1),
+        ])
+        .areas(frame.area());
+        self.draw_status(frame, status);
+        self.draw_rows(frame, rows);
+        self.draw_help(frame, help);
+        frame.render_widget(
+            if self.editing.is_some() {
+                Footer::new(EDIT_HINTS)
+            } else {
+                Footer::new(HINTS)
+            },
+            footer,
+        );
+    }
+
+    fn draw_status(&self, frame: &mut Frame, area: Rect) {
+        let running = self
+            .status
+            .as_ref()
+            .and_then(|status| status.as_ref().ok())
+            .is_some_and(|report| report.daemon_running);
+        let block = Block::bordered()
+            .border_style(theme::border())
+            .title_style(theme::heading())
+            .title(format!(
+                " AgentBench — {} ",
+                if running {
+                    "collecting"
+                } else {
+                    "not collecting"
+                }
+            ));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        if inner.height == 0 {
+            return;
+        }
+        let lines: Vec<Line> = match &self.status {
+            Some(Ok(report)) => report
+                .summary()
+                .into_iter()
+                // The data directory is on the status band's first line elsewhere; here the rows below are
+                // about changing things, so the band stays to what is happening.
+                .filter(|(label, _)| *label != "Data directory")
+                .take(inner.height as usize)
+                .map(|(label, value)| {
+                    Line::from(vec![
+                        ratatui::text::Span::styled(format!("{label:<16}"), theme::label()),
+                        ratatui::text::Span::styled(value, theme::value()),
+                    ])
+                })
+                .collect(),
+            Some(Err(error)) => vec![Line::styled(error.as_str(), theme::absent())],
+            None => vec![Line::styled("reading…", theme::absent())],
+        };
+        frame.render_widget(Paragraph::new(lines), inner);
+    }
+
+    fn draw_rows(&self, frame: &mut Frame, area: Rect) {
+        if area.height == 0 || area.width == 0 {
+            return;
+        }
+        // Section headings are interleaved with rows, so the visible window is computed over the combined
+        // list. Scrolled to keep the selected row on screen rather than paging, because the list is short
+        // enough that a moving window reads better than a jumping one.
+        let mut entries: Vec<Entry> = Vec::new();
+        let mut current: Option<Section> = None;
+        let mut selected_line = 0;
+        for (index, field) in self.fields.iter().enumerate() {
+            let section = field.section();
+            if current != Some(section) {
+                entries.push(Entry::Heading(section));
+                current = Some(section);
+            }
+            if index == self.selected {
+                selected_line = entries.len();
+            }
+            entries.push(Entry::Row(index, *field));
+        }
+        let height = area.height as usize;
+        let first = selected_line.saturating_sub(height.saturating_sub(1) / 2);
+        let first = first.min(entries.len().saturating_sub(height));
+        let visible = entries.iter().skip(first).take(height);
+        let strips = Layout::vertical(vec![Constraint::Length(1); height]).split(area);
+        for (strip, entry) in strips.iter().zip(visible) {
+            match entry {
+                Entry::Heading(section) => {
+                    frame.render_widget(Line::styled(section.title(), theme::heading()), *strip);
+                }
+                Entry::Row(index, field) => self.draw_row(frame, *strip, *index, *field),
+            }
+        }
+    }
+
+    fn draw_row(&self, frame: &mut Frame, area: Rect, index: usize, field: Field) {
+        let focused = index == self.selected;
+        let editing = focused && self.editing.is_some();
+        let value = match &self.editing {
+            Some(buffer) if focused => format!("{buffer}▏"),
+            _ => self.state.value(field),
+        };
+        let unavailable = self.state.unavailable(field).is_some();
+        let value_style = if editing {
+            theme::selected()
+        } else if unavailable {
+            theme::absent()
+        } else {
+            theme::value()
+        };
+        let mut reading = Reading::new(field.label(), &value)
+            .value_style(value_style)
+            .label_width(LABEL_WIDTH);
+        if focused && !editing {
+            reading = reading.value_style(if unavailable {
+                theme::absent()
+            } else {
+                theme::value()
+            });
+        }
+        // The focus marker is the row's own inset rather than a reversed line: reversing a whole row in a
+        // terminal whose theme this module does not know can make the value harder to read, not easier.
+        let [marker, body] =
+            Layout::horizontal([Constraint::Length(2), Constraint::Min(0)]).areas(area);
+        frame.render_widget(
+            Line::styled(
+                if focused { "▸" } else { " " },
+                if focused {
+                    Style::default()
+                } else {
+                    theme::hint()
+                },
+            ),
+            marker,
+        );
+        frame.render_widget(reading, body);
+    }
+
+    fn draw_help(&self, frame: &mut Frame, area: Rect) {
+        if area.height == 0 {
+            return;
+        }
+        let field = self.field();
+        // A failure outranks the help text: it is about something the user just did, and the help will
+        // still be there next time they land on the row.
+        let (text, style) = match &self.message {
+            Some(Err(error)) => (error.clone(), Style::default().fg(theme::critical())),
+            Some(Ok(message)) => (message.clone(), Style::default().fg(theme::good())),
+            None => match self.state.unavailable(field) {
+                Some(reason) => (reason, theme::absent()),
+                None => (field.help().to_string(), theme::hint()),
+            },
+        };
+        frame.render_widget(
+            Paragraph::new(Line::styled(text, style)).wrap(Wrap { trim: true }),
+            area,
+        );
+    }
+}
+
+/// A line in the settings list: either a heading or a row.
+enum Entry {
+    Heading(Section),
+    Row(usize, Field),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{Terminal, backend::TestBackend};
+    use tempfile::tempdir;
+
+    fn app() -> App {
+        let temp = tempdir().expect("a temporary data directory");
+        let config =
+            WatchConfig::load(Some(temp.path().to_path_buf())).expect("defaults should load");
+        // The directory is dropped here, which is deliberate: the screen must draw against a data directory
+        // that has no database, since that is what a first run looks like.
+        App::new(config).expect("the app should build")
+    }
+
+    fn draw_at(app: &App, width: u16, height: u16) {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
+        terminal.draw(|frame| app.draw(frame)).expect("draw");
+    }
+
+    #[test]
+    fn the_screen_draws_at_a_comfortable_size() {
+        draw_at(&app(), 100, 40);
+    }
+
+    /// Layout degradation, including sizes smaller than the status band alone.
+    #[test]
+    fn the_screen_draws_when_cramped() {
+        let app = app();
+        for (width, height) in [(80, 12), (40, 8), (20, 6), (10, 3), (1, 1)] {
+            draw_at(&app, width, height);
+        }
+    }
+
+    #[test]
+    fn the_screen_draws_while_a_value_is_being_edited() {
+        let mut app = app();
+        app.selected = State::fields()
+            .iter()
+            .position(|field| *field == Field::SampleInterval)
+            .expect("the sample interval row");
+        app.handle(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.editing.is_some(), "Enter should open the editor");
+        draw_at(&app, 100, 40);
+    }
+
+    #[test]
+    fn navigation_wraps_at_both_ends() {
+        let mut app = app();
+        let last = app.fields.len() - 1;
+        app.handle(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(
+            app.selected, last,
+            "up from the first row wraps to the last"
+        );
+        app.handle(KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.selected, 0, "down from the last row wraps to the first");
+    }
+
+    #[test]
+    fn q_and_ctrl_c_quit_but_a_bare_c_does_not() {
+        let mut app = app();
+        assert_eq!(
+            app.handle(KeyCode::Char('q'), KeyModifiers::NONE),
+            Flow::Quit
+        );
+        assert_eq!(
+            app.handle(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            Flow::Quit
+        );
+        assert_eq!(
+            app.handle(KeyCode::Char('c'), KeyModifiers::NONE),
+            Flow::Continue
+        );
+    }
+
+    /// While editing, `q` is a character and must not quit the screen.
+    #[test]
+    fn keys_are_captured_by_the_editor_while_it_is_open() {
+        let mut app = app();
+        app.selected = State::fields()
+            .iter()
+            .position(|field| *field == Field::ServerPort)
+            .expect("the port row");
+        app.handle(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(
+            app.handle(KeyCode::Char('q'), KeyModifiers::NONE),
+            Flow::Continue
+        );
+        assert_eq!(app.editing.as_deref(), Some("7878q"));
+        app.handle(KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(app.editing.as_deref(), Some("7878"));
+        app.handle(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.editing.is_none(), "Esc should close the editor");
+    }
+
+    /// An unreadable entry has to be reported rather than substituted.
+    #[test]
+    fn committing_an_unparseable_value_reports_an_error() {
+        let mut app = app();
+        app.selected = State::fields()
+            .iter()
+            .position(|field| *field == Field::ServerPort)
+            .expect("the port row");
+        app.handle(KeyCode::Enter, KeyModifiers::NONE);
+        app.editing = Some("not-a-port".into());
+        app.handle(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(
+            matches!(&app.message, Some(Err(error)) if error.contains("not a port number")),
+            "{:?}",
+            app.message
+        );
+    }
+
+    /// A label wider than its column is silently truncated by the row widget, so the screen would show
+    /// "Run a benchmark, elevat" and nobody would know why. Caught here rather than by looking at it,
+    /// because it only shows up for the longest label and only once someone adds one.
+    #[test]
+    fn every_label_fits_the_column_reserved_for_it() {
+        for field in State::fields() {
+            let width = u16::try_from(field.label().chars().count()).expect("a short label");
+            assert!(
+                width <= LABEL_WIDTH,
+                "{:?} is {width} columns wide but only {LABEL_WIDTH} are reserved",
+                field.label()
+            );
+        }
+    }
+
+    /// Space on an action row must do nothing rather than fall through to something else.
+    #[test]
+    fn space_does_not_trigger_an_action_row() {
+        let mut app = app();
+        app.selected = State::fields()
+            .iter()
+            .position(|field| *field == Field::OpenDashboard)
+            .expect("the open dashboard row");
+        app.handle(KeyCode::Char(' '), KeyModifiers::NONE);
+        assert!(app.message.is_none(), "{:?}", app.message);
+    }
+}

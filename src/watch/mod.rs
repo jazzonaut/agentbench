@@ -15,6 +15,7 @@ pub mod maintenance;
 pub mod marker;
 pub mod platform;
 pub mod serve;
+pub mod settings;
 pub mod store;
 pub mod supervisor;
 
@@ -31,12 +32,46 @@ use std::sync::{
 use store::{Level, Store};
 use supervisor::{InstanceLock, ShutdownClock, Supervisor};
 
-/// Run the daemon until interrupted.
+/// Where the daemon's startup narration goes.
+///
+/// A parameter rather than a `println!`, because the windowless build that shows a tray icon has no console
+/// to print to: those lines would go nowhere and the "Press Ctrl+C to stop" among them would be a lie, since
+/// there is no console to press it in.
+pub enum Narrator {
+    /// Printed to stdout, for a run started from a terminal.
+    Stdout,
+    /// Discarded. The tray build shows the same information in its tooltip and menu.
+    Silent,
+}
+
+impl Narrator {
+    fn say(&self, line: &str) {
+        match self {
+            Self::Stdout => println!("{line}"),
+            Self::Silent => {}
+        }
+    }
+}
+
+/// Run the daemon until interrupted, narrating to stdout and handling Ctrl+C.
+pub fn run(config: WatchConfig) -> Result<()> {
+    let shutdown = Arc::new(AtomicBool::new(false));
+    install_signal_handler(shutdown.clone());
+    run_with(config, &Narrator::Stdout, shutdown)
+}
+
+/// Run the daemon against a caller-owned shutdown flag.
+///
+/// The tray build uses this so its Quit item and a Ctrl+C share one stopping path, the same arrangement
+/// [`bench::run_with_cancel`] uses for `q` and Ctrl+C. Nothing here installs a signal handler: a caller that
+/// owns the flag owns how it gets set.
 ///
 /// Ordering matters. The instance lock and the socket are acquired *before* collection starts, so a
 /// second daemon or an occupied port fails immediately and visibly rather than after the process
 /// appears to have started successfully.
-pub fn run(config: WatchConfig) -> Result<()> {
+///
+/// [`bench::run_with_cancel`]: crate::bench::run_with_cancel
+pub fn run_with(config: WatchConfig, narrator: &Narrator, shutdown: Arc<AtomicBool>) -> Result<()> {
     config.ensure_loopback()?;
     let _lock = InstanceLock::acquire(&config.lock_path())?;
 
@@ -65,9 +100,7 @@ pub fn run(config: WatchConfig) -> Result<()> {
         );
     }
 
-    let mut supervisor = Supervisor::new(sink.clone());
-    let shutdown = supervisor.shutdown_flag();
-    install_signal_handler(shutdown.clone());
+    let mut supervisor = Supervisor::with_shutdown(sink.clone(), shutdown.clone());
 
     // The sampler is polite: background CPU and I/O priority.
     let sampler_config = config.collect.clone();
@@ -143,9 +176,12 @@ pub fn run(config: WatchConfig) -> Result<()> {
     );
 
     if let Some(server) = server {
-        println!("AgentBench dashboard: {}", server.url());
-        println!("Data directory:       {}", config.data_dir.display());
-        println!("Press Ctrl+C to stop.");
+        narrator.say(&format!("AgentBench dashboard: {}", server.url()));
+        narrator.say(&format!(
+            "Data directory:       {}",
+            config.data_dir.display()
+        ));
+        narrator.say("Press Ctrl+C to stop.");
         // Serving occupies this thread; collectors run behind it.
         server.serve(
             &store,
@@ -154,9 +190,12 @@ pub fn run(config: WatchConfig) -> Result<()> {
             serve::Settings::from(&config.analysis).watching(store.writer_health()),
         );
     } else {
-        println!("AgentBench dashboard: collecting only (server disabled)");
-        println!("Data directory:       {}", config.data_dir.display());
-        println!("Press Ctrl+C to stop.");
+        narrator.say("AgentBench dashboard: collecting only (server disabled)");
+        narrator.say(&format!(
+            "Data directory:       {}",
+            config.data_dir.display()
+        ));
+        narrator.say("Press Ctrl+C to stop.");
     }
 
     // Reached either because there was never a server or because the one there was gave up on its
