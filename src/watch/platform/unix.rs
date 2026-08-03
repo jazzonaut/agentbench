@@ -5,6 +5,9 @@ use anyhow::{Context, Result, bail};
 use std::{env, fs::File, os::unix::io::AsRawFd, path::PathBuf};
 
 /// Nice increment applied to background collector threads.
+///
+/// Linux only: it is the value for `PRIO_PROCESS`, which is per-thread there and nowhere else.
+#[cfg(target_os = "linux")]
 const BACKGROUND_NICE: libc::c_int = 10;
 
 /// Linux's power-supply class, where mains adapters advertise whether they are supplying power.
@@ -41,16 +44,53 @@ pub(super) fn try_lock_exclusive(file: &File) -> Result<bool> {
     }
 }
 
-/// Lower scheduling priority for the calling thread.
+/// Lower scheduling priority for the calling thread, or refuse to touch anything.
 ///
-/// On Linux `setpriority(PRIO_PROCESS, 0, …)` applies to the calling *thread*, which is the
-/// granularity wanted. Elsewhere it may affect the whole process; the fallback is still an
-/// improvement over competing at normal priority, and I/O priority is left untouched because no
-/// portable interface exists.
-/// Not reversible: `setpriority` will not lower a nice value again without privileges, which is why
-/// no counterpart exists.
+/// The granularity is the whole point, and it is not portable. On Linux `setpriority(PRIO_PROCESS, 0,
+/// …)` applies to the calling *thread*; on macOS and the BSDs the same call applies to the whole
+/// *process*. Treating that as a harmless degradation was a mistake worth spelling out: the daemon runs
+/// the sampler in the background and the prober at normal priority deliberately, and a process-wide
+/// nice applied by the sampler drags the prober down with it. The prober would then be measuring its
+/// own throttle — the exact failure [`probes`] documents as forbidden — and would do so invisibly,
+/// because the bias is constant and a day-over-day baseline absorbs it while contended-versus-clean
+/// interpretation quietly inflates.
+///
+/// So each platform gets the call that means what this function claims, and a platform with no such
+/// call reports [`Capability::Unsupported`] rather than throttling a thread it was not asked to touch.
+/// The sampler then competes at normal priority and says so in the log, which is the lesser harm.
+///
+/// Not reversible anywhere: `setpriority` will not lower a nice value again without privileges, which
+/// is why no counterpart exists.
+///
+/// [`probes`]: crate::watch::collect::probes
+#[cfg(target_os = "linux")]
 pub(super) fn set_current_thread_background() -> Capability {
-    set_nice(BACKGROUND_NICE)
+    set_nice(libc::PRIO_PROCESS, BACKGROUND_NICE, "setpriority")
+}
+
+/// macOS has the exact analogue: per-thread, and it throttles I/O as well as CPU.
+///
+/// `PRIO_DARWIN_THREAD` with `who = 0` is defined to affect the calling thread alone, and
+/// `PRIO_DARWIN_BG` puts it in the background band the OS uses for its own housekeeping — which is
+/// what `THREAD_MODE_BACKGROUND_BEGIN` does on Windows, and therefore what the daemon means by
+/// "background" everywhere.
+#[cfg(target_os = "macos")]
+pub(super) fn set_current_thread_background() -> Capability {
+    set_nice(
+        libc::PRIO_DARWIN_THREAD,
+        libc::PRIO_DARWIN_BG,
+        "setpriority(PRIO_DARWIN_THREAD)",
+    )
+}
+
+/// Every other Unix declines, because the only call available would reach the prober.
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+pub(super) fn set_current_thread_background() -> Capability {
+    Capability::Unsupported(
+        "setpriority is process-wide on this platform, and lowering it would throttle the probe \
+         thread as well"
+            .into(),
+    )
 }
 
 /// Whether the machine is on battery, from sysfs.
@@ -112,14 +152,16 @@ pub(super) fn on_battery() -> Option<bool> {
     None
 }
 
-fn set_nice(value: libc::c_int) -> Capability {
-    // SAFETY: setpriority with PRIO_PROCESS and who=0 targets the caller and takes no pointers.
-    let result = unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, value) };
+/// Apply one `setpriority` call to the caller, naming it for the refusal message.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn set_nice(which: libc::c_int, value: libc::c_int, called: &str) -> Capability {
+    // SAFETY: setpriority with who=0 targets the caller and takes no pointers.
+    let result = unsafe { libc::setpriority(which, 0, value) };
     if result == 0 {
         Capability::Applied
     } else {
         Capability::Unsupported(format!(
-            "setpriority({value}) was refused: {}",
+            "{called} with {value} was refused: {}",
             std::io::Error::last_os_error()
         ))
     }

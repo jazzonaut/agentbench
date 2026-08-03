@@ -174,3 +174,18 @@ pub const ALTER_V3: &str = r#"
 ALTER TABLE samples_1m ADD COLUMN process_count_avg INTEGER;
 ALTER TABLE samples_1m ADD COLUMN agent_rss_max INTEGER;
 "#;
+
+/// The index retention needs, and the only query pattern the primary key cannot serve.
+///
+/// `samples` is `WITHOUT ROWID` on `(machine_id, ts)`, which answers every read the dashboard makes —
+/// they all name a machine. Retention deliberately does not: it prunes the whole file rather than this
+/// daemon's own rows, so that a database carried over from an old machine is not kept for ever by a
+/// daemon that will never recognise it. That makes its three statements — `min(ts)` before the cutoff,
+/// the rollup aggregate, and the delete — filter on `ts` alone, which without this index is a full
+/// scan each. A first pass over a fortnight of backlog runs fourteen chunks of three of them.
+///
+/// One index on the highest-rate table is the cost. It is the right trade precisely because that table
+/// is pruned to a fortnight: the index never grows past a fortnight either.
+pub const ALTER_V4: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_samples_ts ON samples(ts);
+"#;

@@ -25,6 +25,10 @@ const MIGRATIONS: &[Migration] = &[
         version: 3,
         sql: super::schema::ALTER_V3,
     },
+    Migration {
+        version: 4,
+        sql: super::schema::ALTER_V4,
+    },
 ];
 
 /// Version this build expects after migrating.
@@ -191,6 +195,35 @@ mod tests {
             .unwrap();
         assert_eq!(turns, 1);
         assert_eq!(tokens, 400, "tokens must not be counted twice");
+    }
+
+    /// Retention filters on `ts` alone, and on an existing database there was nothing to serve it.
+    #[test]
+    fn a_v3_database_gains_the_index_retention_scans_on() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        for sql in [
+            crate::watch::store::schema::CREATE_V1,
+            crate::watch::store::schema::ALTER_V2,
+            crate::watch::store::schema::ALTER_V3,
+        ] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 3).unwrap();
+
+        migrate(&mut conn).unwrap();
+
+        // The plan, not merely the index's existence: an index the planner will not use is no fix.
+        let plan: String = conn
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT min(ts) FROM samples WHERE ts < 1",
+                [],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(
+            plan.contains("idx_samples_ts"),
+            "retention must not full-scan: {plan}"
+        );
     }
 
     #[test]

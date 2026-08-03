@@ -14,7 +14,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use sysinfo::{Pid, ProcessesToUpdate, System};
+use sysinfo::{Pid, System};
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -38,9 +38,22 @@ pub struct CommandCapture {
     pub stdout_chunks: Vec<TimedChunk>,
 }
 
+/// When a read from the child's stdout arrived, and whether it carried a streamed token.
+///
+/// The text itself is deliberately not kept. It used to be, uncapped and owned, for stdout *and*
+/// stderr, so a profiled command that printed gigabytes exhausted memory — while the only consumer
+/// wanted a single substring test per read. Keeping the answer instead of the evidence makes the
+/// structure four times smaller than a pointer to the string it replaced.
+///
+/// The test was never quite exact anyway: an 8 KiB read can split a UTF-8 sequence, and can split the
+/// marker itself across two chunks. Both are unchanged here — this is a timing signal for
+/// inter-token gaps, not a transcript, and the authoritative token count comes from the parsed
+/// `stream_event` rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimedChunk {
     pub elapsed_ms: u64,
-    pub text: String,
+    /// Whether this read contained a streaming delta marker.
+    pub is_delta: bool,
 }
 
 pub fn run_report(
@@ -158,7 +171,11 @@ pub fn profile_command_capture(spec: &CommandSpec) -> Result<CommandCapture> {
         if first_output_ms.is_none() {
             first_output_ms = first_rx.try_recv().ok();
         }
-        system.refresh_processes(ProcessesToUpdate::All, true);
+        // One walk of the process table per tick. This loop used to refresh the processes here and
+        // then call `system::sample`, which opened with a refresh of its own — so every 250 ms
+        // iteration enumerated every process on the machine twice, for the whole life of a profiled
+        // command, including the live-LLM cases that run for minutes.
+        system::refresh_for_sample(&mut system);
         let tree = process_tree::descendants(&system, Pid::from_u32(root_pid));
         max_processes = max_processes.max(tree.len());
         let usage = process_tree::usage(&system, &tree);
@@ -172,7 +189,7 @@ pub fn profile_command_capture(spec: &CommandSpec) -> Result<CommandCapture> {
         peak_rss = peak_rss.max(tree_rss);
         read_bytes = read_bytes.max(tree_read);
         written_bytes = written_bytes.max(tree_write);
-        let mut sample = system::sample(&mut system, started);
+        let mut sample = system::sample_from(&system, started);
         sample.cpu_percent = tree_cpu;
         samples.push(sample);
         if let Some(status) = child.try_wait()? {
@@ -250,6 +267,19 @@ pub fn profile_command_capture(spec: &CommandSpec) -> Result<CommandCapture> {
     })
 }
 
+/// The event type Claude's streaming JSON emits once per text delta.
+///
+/// Matched on the raw bytes as they are read, so no copy of the stream has to be kept to match it
+/// later. Lives here rather than in `live_llm` because this is the only place the bytes exist.
+const DELTA_MARKER: &[u8] = b"content_block_delta";
+
+/// Whether `haystack` contains `needle`.
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
 fn spawn_reader<R: Read + Send + 'static>(
     mut reader: R,
     started: Instant,
@@ -275,7 +305,7 @@ fn spawn_reader<R: Read + Send + 'static>(
                     if save {
                         chunks.push(TimedChunk {
                             elapsed_ms: started.elapsed().as_millis() as u64,
-                            text: String::from_utf8_lossy(&buffer[..n]).into_owned(),
+                            is_delta: contains(&buffer[..n], DELTA_MARKER),
                         });
                         for byte in &buffer[..n] {
                             if tail.len() == CAPTURE_LIMIT {

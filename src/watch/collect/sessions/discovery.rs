@@ -53,6 +53,15 @@ impl Scan {
 /// Find every transcript under `roots`.
 ///
 /// A root that does not exist is not an error: a machine may simply never have run Claude Code.
+///
+/// Every pass walks the whole tree, and that is not an oversight left for later. Skipping a directory
+/// whose own mtime has not moved is the obvious saving and it is wrong here: on Windows and on Linux
+/// alike, a directory's mtime moves when an entry is *added or removed*, not when a file inside it is
+/// appended to — and appending is exactly what a live session transcript does for hours at a time. A
+/// scan that skipped it would keep finding new sessions while silently ceasing to import the rows of
+/// the one being written, which is the stream this whole module exists for. What is done instead is to
+/// make the walk itself cheap: the metadata already attached to each directory entry is reused rather
+/// than re-fetched, and the poll interval has a floor worth the name.
 pub fn scan(roots: &[PathBuf]) -> Scan {
     let mut scan = Scan::default();
     for root in roots {
@@ -83,7 +92,7 @@ fn walk(dir: &Path, depth: usize, scan: &mut Scan) {
         if kind.is_dir() {
             walk(&path, depth + 1, scan);
         } else if is_transcript(&path)
-            && let Some(transcript) = describe(path)
+            && let Some(transcript) = describe(&entry, kind.is_file(), path)
         {
             scan.transcripts.push(transcript);
         }
@@ -100,8 +109,21 @@ fn is_transcript(path: &Path) -> bool {
 }
 
 /// Read the size and modification time a scan needs, or skip a file that cannot be stated.
-fn describe(path: PathBuf) -> Option<Transcript> {
-    let metadata = fs::metadata(&path).ok()?;
+///
+/// Prefers the metadata the directory entry is already carrying. On Windows a `read_dir` entry arrives
+/// with size and timestamps attached, so `DirEntry::metadata` costs nothing while `fs::metadata` opens
+/// the file — and this runs over every transcript on the machine, every poll, for ever. Windows is also
+/// the platform where that difference matters most, since it is where a filter driver sees each open.
+///
+/// A symlink is the exception: `DirEntry::metadata` does not follow one, and a symlinked transcript
+/// would come back as an empty file that never appears to change. Those get the full lookup, which is
+/// what this function always did.
+fn describe(entry: &fs::DirEntry, is_plain_file: bool, path: PathBuf) -> Option<Transcript> {
+    let metadata = if is_plain_file {
+        entry.metadata().ok()?
+    } else {
+        fs::metadata(&path).ok()?
+    };
     let mtime_ms = metadata
         .modified()
         .ok()

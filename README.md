@@ -377,14 +377,24 @@ Portable counters are always collected when supported by the OS. Native collecto
 `--elevated` never prompts for elevation and never changes the machine. Start AgentBench from an elevated terminal if deeper supported checks are desired.
 
 The background collector degrades rather than guesses. Its sampler and transcript threads drop to
-background CPU and I/O priority only where the OS supports it. Power source is read natively on Windows,
-Linux and macOS and recorded as *unknown* everywhere else — never as "on mains", because a laptop on
-battery runs measurably slower for a reason that is not degradation. On Unix that lowered priority is
+background CPU and I/O priority only where the OS supports it *per thread* — `THREAD_MODE_BACKGROUND_BEGIN`
+on Windows, `setpriority(PRIO_PROCESS, …)` on Linux, `setpriority(PRIO_DARWIN_THREAD, …)` on macOS. Any
+other Unix reports the capability as unavailable and runs those threads at normal priority instead, saying
+so in the daemon log: the only call available there is process-wide, and a process-wide throttle applied by
+the sampler would reach the probe thread, which must not be throttled. Power source is read natively on
+Windows, Linux and macOS and recorded as *unknown* everywhere else — never as "on mains", because a laptop
+on battery runs measurably slower for a reason that is not degradation. On Unix that lowered priority is
 never restored, by design: lowering a nice value needs no privileges and raising it back does, so the
 probe thread is *started* at normal priority rather than restored to it. A restore that silently failed
 would make every probe on that thread read slow and report a machine degrading while nothing had changed.
 
-Two limitations of the dashboard are known and unresolved. Neither affects a judged series:
+The dashboard is loopback-only, and answers only to its own address. A request whose `Host` header names
+anything other than `127.0.0.1`, `[::1]` or `localhost` on the bound port is refused with 421, because
+binding to loopback stops a network peer but not a browser: any page you visit can point a name it
+controls at 127.0.0.1 and would otherwise read every endpoint same-origin, including real project paths
+and branch names.
+
+One limitation of the dashboard is known and unresolved. It does not affect a judged series:
 
 - If you change `--probe-interval` partway through a history, a chart spanning the change renders the
   minority-cadence stretch as a blank frame instead of a line. The line-break threshold is the series'
@@ -392,11 +402,13 @@ Two limitations of the dashboard are known and unresolved. Neither affects a jud
   threshold depend on the requested range instead was tried, and it drew a confident straight line across
   a real ninety-second gap in collection — the worse of the two failures. The fix is per-neighbourhood
   gap detection.
-- `probe:memory.write_gib_s` reports around 0.07 GiB/s on hardware that should manage orders of magnitude
-  more. The workload is shared with `bench`, so either the probe's 64 MiB working set is too small to
-  measure bandwidth or the benchmark has been reporting the same figure all along. It is charted,
-  deliberately unjudged, and worth measuring before it is worth changing, since a fix moves published
-  report values.
+
+`probe:memory.write_gib_s` used to report around 0.07 GiB/s on hardware that should manage orders of
+magnitude more. Neither hypothesis recorded here was right: the working set was not the problem, and the
+figure was not what the workload had always reported. A per-byte cancellation check inside the write loop
+was blocking vectorisation, and 0.07 GiB/s is the order of magnitude of a *debug* build — which nothing
+warned about at the time. Both are fixed, and the metric now reports the machine. **Figures from before
+v0.5.0 are not comparable with figures after it.**
 
 ## Design decisions
 

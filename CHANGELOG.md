@@ -2,6 +2,69 @@
 
 All notable changes to AgentBench are documented here. The project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed — measurement values move
+
+- **`memory.write_gib_s` now reports roughly an order of magnitude more, on both the probe and the
+  benchmark.** The cancellation check sat inside the per-byte write loop, which blocked vectorisation,
+  so the figure was the branch rather than the machine: 2.4 GiB/s in the old shape against about 28 in
+  the new one on the same hardware, writing byte-for-byte identical output. **Values recorded before
+  this release are not comparable with values after it.** This also resolves the README's open item —
+  the 0.07 GiB/s figure it recorded was a debug build, and neither hypothesis it offered was right.
+- A debug build now warns on stderr before it measures anything. Nothing previously stopped
+  `cargo run -- bench` writing figures forty times low into the dashboard's history beside a release
+  build's.
+
+### Fixed
+
+- A single refused row no longer ends all collection. The writer logged nothing and exited on any
+  insert failure, after which every collector's `send` silently returned `false`, the page kept serving,
+  and the only report was at process exit. Refused records are now counted, dropped and explained in the
+  operational log; only a transaction that cannot be opened or committed stops the thread, and when it
+  does it says so in the log and in `/api/status`.
+- A collector that panics is caught, logged with its message, and restarted on the same backoff as one
+  that returns early. Previously the thread died and nothing said so until shutdown, potentially days
+  later, while the dashboard looked healthy.
+- `dashboard --status` and its verdicts no longer open the database read-write. Both went through
+  `Store::open`, which runs migrations — so running a newer binary's `--status` while an older daemon
+  was collecting upgraded the schema underneath it. They now open a read-only connection, report an
+  out-of-range schema instead of changing it, and share one connection instead of building two.
+- On macOS, background priority is applied per thread with `PRIO_DARWIN_THREAD`. `PRIO_PROCESS` is
+  process-wide there, so the sampler was dragging the probe thread down with it and the probe was
+  measuring its own throttle. Other Unixes now report the capability as unavailable rather than do the
+  same.
+- The dashboard refuses requests whose `Host` is not its own loopback address, closing DNS rebinding —
+  a page on any origin could otherwise read every endpoint, including real project paths and branch
+  names. `X-Frame-Options` and a content security policy are sent alongside the existing `nosniff`.
+- `system::power_source` returned nothing on most Linux laptops: a `?` inside the directory loop
+  returned from the whole function as soon as a battery was visited before a mains supply, and
+  directory order is arbitrary. It now derives from the single reading in `watch::platform`.
+- Retention no longer full-scans `samples` three times per chunk. Its statements filter on `ts` alone,
+  which the `(machine_id, ts)` primary key cannot serve; migration v4 adds the index.
+- Transcript import positions are deleted when the transcript is gone. `import_watermark` had no delete
+  path at all, and every row in it is loaded into memory at startup.
+
+### Changed
+
+- The dashboard polls `/api/status` and `/api/verdicts` once a minute rather than every five seconds.
+  Between them they cost more than the collectors they report on — six `count(*)` aggregates and a
+  re-derived trailing window — so an open page was biasing the series it was drawing. Live tiles are
+  unchanged at five seconds.
+- `profile` walks the process table once per tick rather than twice, and asks for only the fields it
+  reads.
+- `profile` no longer retains every chunk of a child's output in memory. It kept an owned `String` per
+  8 KiB read, uncapped, for stdout and stderr, where the one consumer wanted a single substring test.
+- Transcript discovery reuses the metadata a directory entry already carries, which on Windows removes
+  a file open per transcript per pass, and the poll interval floor is 10 seconds rather than 1.
+- A verdict computed from a thin partial day says how thin it is: "today rests on N measurements against
+  a baseline of about M a day".
+- `--llm-route auto` documents that it runs both routes and pays for every scenario twice, and a run
+  that reported no cost is now named in the warnings rather than silently omitted from the cap's
+  arithmetic.
+- Directories under the sessions roots that cannot be listed are reported once, and again when the
+  count changes, instead of being counted and never mentioned.
+
 ## [0.4.0] - 2026-08-03
 
 ### Added

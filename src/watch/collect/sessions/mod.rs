@@ -16,9 +16,13 @@ pub mod row;
 use crate::watch::{
     clock::Clock,
     config::SessionsConfig,
-    store::{Level, Reader, Record, Sink, queries},
+    store::{ForgetWatermarks, Level, Reader, Record, Sink, queries},
 };
-use std::{collections::HashMap, path::PathBuf, time::Instant};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    time::Instant,
+};
 
 /// Import failures reported per pass.
 ///
@@ -43,11 +47,15 @@ struct Pass {
     tools: usize,
     rows_error: i64,
     bytes_read: i64,
+    /// Transcripts whose recorded position was dropped because the file is gone.
+    forgotten: usize,
+    /// Directories the scan could not list, as a standing count rather than an event.
+    unreadable: usize,
 }
 
 impl Pass {
     fn is_empty(&self) -> bool {
-        self.files_read == 0 && self.files_failed == 0
+        self.files_read == 0 && self.files_failed == 0 && self.forgotten == 0
     }
 }
 
@@ -73,6 +81,10 @@ pub fn run(config: &SessionsConfig, clock: &dyn Clock, sink: &Sink, reader: &Rea
     // both the work and the reason it took no time.
     let backfilling = positions.is_empty();
     let mut first = true;
+    // A permission-denied subtree is a standing condition, not an event: it is worth saying once, and
+    // worth saying again only when the number changes. Repeating it every thirty seconds would bury
+    // the log it is written to.
+    let mut reported_unreadable = 0;
     loop {
         let started = Instant::now();
         let pass = import_once(config, clock, sink, &mut positions);
@@ -86,6 +98,18 @@ pub fn run(config: &SessionsConfig, clock: &dyn Clock, sink: &Sink, reader: &Rea
             };
             report(sink, &pass, what, started);
         }
+        if pass.unreadable != reported_unreadable && pass.unreadable > 0 {
+            sink.log(
+                Level::Warn,
+                "sessions",
+                format!(
+                    "{} director(ies) under the sessions roots could not be listed; any transcripts \
+                     inside them are missing from the history",
+                    pass.unreadable
+                ),
+            );
+        }
+        reported_unreadable = pass.unreadable;
         first = false;
         if !clock.sleep(config.poll_interval) {
             return;
@@ -111,7 +135,11 @@ fn import_once(
             ),
         );
     }
-    let mut pass = Pass::default();
+    let mut pass = Pass {
+        unreadable: scan.unreadable,
+        ..Pass::default()
+    };
+    pass.forgotten = forget_departed(&scan, sink, positions);
     for transcript in &scan.transcripts {
         // A long backfill must not hold up Ctrl+C, so the answer is checked between files rather
         // than only between passes.
@@ -161,6 +189,51 @@ fn import_once(
     pass
 }
 
+/// Drop the recorded position of transcripts that have left the disk, in memory and in the database.
+///
+/// Two guards, and both are load-bearing, because a watermark deleted by mistake means the transcript
+/// is re-imported from byte zero:
+///
+/// 1. A truncated scan has not looked everywhere, so what it did not find proves nothing.
+/// 2. Absent from the scan is not the same as absent from the disk. A file whose directory became
+///    unreadable, or one the walk declined to `stat`, is still there — so its own existence is asked
+///    about directly rather than inferred from the scan.
+///
+/// Re-import would in fact be idempotent, since every session row is keyed on something stable. It
+/// would also read every byte of the file again and re-derive every measurement in it, which on a
+/// machine with a year of transcripts is the difference between a free stream and a visible one.
+fn forget_departed(
+    scan: &discovery::Scan,
+    sink: &Sink,
+    positions: &mut HashMap<PathBuf, Position>,
+) -> usize {
+    if scan.truncated {
+        return 0;
+    }
+    let present: HashSet<&PathBuf> = scan
+        .transcripts
+        .iter()
+        .map(|transcript| &transcript.path)
+        .collect();
+    let gone: Vec<PathBuf> = positions
+        .keys()
+        .filter(|path| !present.contains(*path) && !path.exists())
+        .cloned()
+        .collect();
+    if gone.is_empty() {
+        return 0;
+    }
+    let paths = gone
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
+    for path in &gone {
+        positions.remove(path);
+    }
+    sink.send(ForgetWatermarks { paths });
+    gone.len()
+}
+
 /// Say what one pass did. The caller decides whether it is worth saying.
 fn report(sink: &Sink, pass: &Pass, what: &str, started: Instant) {
     let seconds = started.elapsed().as_secs_f64();
@@ -173,6 +246,16 @@ fn report(sink: &Sink, pass: &Pass, what: &str, started: Instant) {
             pass.turns, pass.tools, pass.files_read
         ),
     );
+    if pass.forgotten > 0 {
+        sink.log(
+            Level::Info,
+            "sessions",
+            format!(
+                "forgot the recorded position of {} transcript(s) that are no longer on disk",
+                pass.forgotten
+            ),
+        );
+    }
     if pass.rows_error > 0 {
         sink.log(
             Level::Warn,
@@ -369,6 +452,33 @@ mod tests {
             "one new turn, and no duplicate of the first"
         );
         assert_eq!(second.tools, 2);
+    }
+
+    /// The table that used to have no delete path at all.
+    ///
+    /// The rows a departed transcript contributed stay: they are measurements of work that really
+    /// happened. Only the bookmark goes, because there is nothing left to bookmark.
+    #[test]
+    fn the_recorded_position_of_a_deleted_transcript_is_forgotten() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("watch.db");
+        let root = temp.path().join("projects");
+        write(&root, "one.jsonl", &transcript("1"));
+        write(&root, "two.jsonl", &transcript("2"));
+        assert_eq!(import_into(&db, &root, 1).watermarks, 2);
+
+        std::fs::remove_file(root.join("D--Work").join("two.jsonl")).unwrap();
+        let after = import_into(&db, &root, 1);
+        assert_eq!(after.watermarks, 1, "only the transcript still on disk");
+        assert_eq!(after.turns, 2, "its measurements are history, not a cache");
+        assert!(
+            after
+                .events
+                .iter()
+                .any(|message| message.contains("no longer on disk")),
+            "the pruning explains itself: {:?}",
+            after.events
+        );
     }
 
     #[test]

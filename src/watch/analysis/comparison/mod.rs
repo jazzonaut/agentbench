@@ -8,7 +8,7 @@ pub mod evidence;
 pub mod subjects;
 
 use super::{
-    baseline::{self, Baseline},
+    baseline::{self, Baseline, DayValue},
     day,
     verdict::{self, Verdict},
 };
@@ -97,7 +97,7 @@ fn judge(evidence: Evidence, label: &'static str, window_days: usize) -> Compari
         today_observations: today_value.map_or(0, |value| value.observations),
         note: note(
             verdict,
-            today_value.is_some(),
+            today_value.as_ref(),
             baseline.as_ref(),
             power.as_ref(),
             window_days,
@@ -109,16 +109,24 @@ fn judge(evidence: Evidence, label: &'static str, window_days: usize) -> Compari
     }
 }
 
+/// A day whose evidence is this much thinner than the baseline's daily average is worth remarking on.
+///
+/// Half, because the claim is only that "today rests on far less than a usual day" — not a threshold
+/// anything is filtered by, and not a number worth tuning. What it catches is the structural asymmetry
+/// in the comparison: today is a *partial* day judged against whole ones, so at 45 minutes past
+/// midnight three probes can carry a verdict against days built from up to 96.
+const THIN_DAY_FRACTION: f64 = 0.5;
+
 /// The sentence that goes beside a verdict, or in place of one.
 fn note(
     verdict: Verdict,
-    has_today: bool,
+    today: Option<&DayValue>,
     baseline: Option<&Baseline>,
     power: Option<&PowerMix>,
     window_days: usize,
 ) -> Option<String> {
     if verdict == Verdict::Insufficient {
-        return Some(match (has_today, baseline) {
+        return Some(match (today.is_some(), baseline) {
             (false, _) => format!(
                 "today has fewer than {MIN_OBSERVATIONS_PER_DAY} comparable measurements so far"
             ),
@@ -136,6 +144,22 @@ fn note(
             PowerMix::describe(mix.today_on_battery, mix.today_runs),
             PowerMix::describe(mix.baseline_on_battery, mix.baseline_runs),
         ));
+    }
+    // The verdict stands; what it rests on is disclosed rather than used to suppress it. Today is the
+    // day *so far*, and early in the morning that is a handful of measurements judged against days made
+    // of dozens — so a morning that happened to include a compile can read `worse` until enough probes
+    // accumulate to dilute it. The band floor absorbs much of this, but not all of it, and a reader
+    // deciding whether to investigate is entitled to the count.
+    if let (Some(today), Some(baseline)) = (today, baseline)
+        && baseline.days > 0
+    {
+        let per_day = baseline.observations as f64 / baseline.days as f64;
+        if (today.observations as f64) < per_day * THIN_DAY_FRACTION {
+            return Some(format!(
+                "today rests on {} measurement(s) against a baseline of about {per_day:.0} a day",
+                today.observations
+            ));
+        }
     }
     if baseline.is_some_and(|baseline| baseline.width_is_floor) {
         return Some(
@@ -164,6 +188,15 @@ mod tests {
         Baseline::from_days(&days).expect("enough days")
     }
 
+    /// Today's figure, from `observations` measurements.
+    fn today(observations: usize) -> DayValue {
+        DayValue {
+            day_start_ms: 0,
+            value: 12.0,
+            observations,
+        }
+    }
+
     fn mix(today_battery: usize, today: usize, base_battery: usize, base: usize) -> PowerMix {
         PowerMix {
             today_on_battery: today_battery,
@@ -175,10 +208,11 @@ mod tests {
 
     #[test]
     fn an_insufficient_verdict_explains_which_side_was_missing() {
-        let no_today = note(Verdict::Insufficient, false, None, None, 7).expect("a reason");
+        let no_today = note(Verdict::Insufficient, None, None, None, 7).expect("a reason");
         assert!(no_today.contains("today"), "{no_today}");
 
-        let no_history = note(Verdict::Insufficient, true, None, None, 7).expect("a reason");
+        let no_history =
+            note(Verdict::Insufficient, Some(&today(8)), None, None, 7).expect("a reason");
         assert!(no_history.contains("last 7 days"), "{no_history}");
     }
 
@@ -186,16 +220,57 @@ mod tests {
     fn a_power_disagreement_qualifies_a_verdict_that_was_reached() {
         let baseline = band(&[12.0; 4]);
         let unplugged = mix(5, 6, 0, 32);
-        let text = note(Verdict::Worse, true, Some(&baseline), Some(&unplugged), 7)
-            .expect("a qualification");
+        let text = note(
+            Verdict::Worse,
+            Some(&today(8)),
+            Some(&baseline),
+            Some(&unplugged),
+            7,
+        )
+        .expect("a qualification");
         assert!(text.contains("battery"), "{text}");
         assert!(text.contains("power"), "{text}");
 
         // Consistent power, floored band: the other thing worth disclosing.
         let consistent = mix(0, 6, 0, 32);
-        let floored = note(Verdict::Worse, true, Some(&baseline), Some(&consistent), 7)
-            .expect("a qualification");
+        let floored = note(
+            Verdict::Worse,
+            Some(&today(8)),
+            Some(&baseline),
+            Some(&consistent),
+            7,
+        )
+        .expect("a qualification");
         assert!(floored.contains("minimum width"), "{floored}");
+    }
+
+    /// The structural asymmetry: a day in progress judged against days that finished.
+    #[test]
+    fn a_thin_partial_day_says_how_thin_it_is() {
+        // Five days of eight measurements each, against a morning that has managed three.
+        let baseline = band(&[4000.0, 3000.0, 5000.0, 4500.0, 3500.0]);
+        let text = note(
+            Verdict::Worse,
+            Some(&today(3)),
+            Some(&baseline),
+            Some(&mix(0, 3, 0, 40)),
+            7,
+        )
+        .expect("a qualification");
+        assert!(text.contains('3'), "the count itself: {text}");
+        assert!(text.contains("about 8 a day"), "{text}");
+
+        // A day that has accumulated a normal amount of evidence is not remarked on.
+        assert_eq!(
+            note(
+                Verdict::Worse,
+                Some(&today(7)),
+                Some(&baseline),
+                Some(&mix(0, 7, 0, 40)),
+                7
+            ),
+            None
+        );
     }
 
     /// A verdict with nothing to qualify it says nothing, rather than padding.
@@ -206,7 +281,7 @@ mod tests {
         assert_eq!(
             note(
                 Verdict::Normal,
-                true,
+                Some(&today(8)),
                 Some(&baseline),
                 Some(&mix(0, 6, 0, 32)),
                 7

@@ -11,10 +11,10 @@ pub mod schema;
 pub mod writer;
 
 pub use records::{
-    Covariates, Event, Level, Maintenance, MetricSource, ProbeMetric, ProbeRun, Record, RunMarker,
-    Sample, ToolCall, ToolVersion, Turn, Watermark,
+    Covariates, Event, ForgetWatermarks, Level, Maintenance, MetricSource, ProbeMetric, ProbeRun,
+    Record, RunMarker, Sample, ToolCall, ToolVersion, Turn, Watermark,
 };
-pub use writer::Sink;
+pub use writer::{Sink, WriterHealth};
 
 use crate::model::Inventory;
 use anyhow::{Context, Result};
@@ -45,6 +45,7 @@ pub struct Store {
     path: PathBuf,
     machine_id: String,
     sink: Sink,
+    health: WriterHealth,
     handle: Option<thread::JoinHandle<Result<()>>>,
 }
 
@@ -59,15 +60,18 @@ impl Store {
 
         let (sender, receiver) = mpsc::sync_channel(CHANNEL_CAPACITY);
         let writer_machine = machine_id.clone();
+        let health = WriterHealth::running();
+        let writer_health = health.clone();
         let handle = thread::Builder::new()
             .name("watch-writer".into())
-            .spawn(move || writer::run(conn, &writer_machine, receiver))
+            .spawn(move || writer::run(conn, &writer_machine, receiver, writer_health))
             .context("spawn writer thread")?;
 
         Ok(Self {
             path: path.to_path_buf(),
             machine_id,
             sink: Sink::new(sender),
+            health,
             handle: Some(handle),
         })
     }
@@ -75,6 +79,14 @@ impl Store {
     /// A handle collectors use to submit records.
     pub fn sink(&self) -> Sink {
         self.sink.clone()
+    }
+
+    /// Whether the writer thread is still draining records.
+    ///
+    /// Handed to the server so a status request can report a dead writer as a fault rather than as a
+    /// series that happens to have stopped moving.
+    pub fn writer_health(&self) -> WriterHealth {
+        self.health.clone()
     }
 
     /// Stable identifier for this machine within the database.

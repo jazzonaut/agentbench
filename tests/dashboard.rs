@@ -239,11 +239,11 @@ fn free_port() -> u16 {
 }
 
 /// Minimal HTTP/1.0 GET, so the test suite needs no HTTP client dependency.
-fn fetch(url: &str) -> Result<String, String> {
-    let rest = url
-        .strip_prefix("http://")
-        .ok_or("only http:// is supported")?;
-    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+///
+/// `host` is a parameter rather than derived from `authority` because the gap between the two is the
+/// whole of the DNS-rebinding case: the connection lands on loopback either way, and only the header
+/// says who the client thought it was calling.
+fn raw_get(authority: &str, path: &str, host: &str) -> Result<(u16, String, String), String> {
     let mut stream = TcpStream::connect(authority).map_err(|error| error.to_string())?;
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
@@ -251,7 +251,7 @@ fn fetch(url: &str) -> Result<String, String> {
     use std::io::Write;
     write!(
         stream,
-        "GET /{path} HTTP/1.0\r\nHost: {authority}\r\nConnection: close\r\n\r\n"
+        "GET /{path} HTTP/1.0\r\nHost: {host}\r\nConnection: close\r\n\r\n"
     )
     .map_err(|error| error.to_string())?;
     let mut raw = Vec::new();
@@ -262,15 +262,52 @@ fn fetch(url: &str) -> Result<String, String> {
     let (head, body) = text
         .split_once("\r\n\r\n")
         .ok_or_else(|| format!("malformed response: {text:?}"))?;
-    let status = head
+    let status: u16 = head
         .lines()
         .next()
         .and_then(|line| line.split_whitespace().nth(1))
-        .unwrap_or("000");
-    if status != "200" {
+        .and_then(|code| code.parse().ok())
+        .unwrap_or(0);
+    Ok((status, head.to_string(), body.to_string()))
+}
+
+fn fetch(url: &str) -> Result<String, String> {
+    let rest = url
+        .strip_prefix("http://")
+        .ok_or("only http:// is supported")?;
+    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let (status, _, body) = raw_get(authority, path, authority)?;
+    if status != 200 {
         return Err(format!("status {status}: {body}"));
     }
-    Ok(body.to_string())
+    Ok(body)
+}
+
+/// Binding to loopback stops a network peer; it does not stop a browser.
+///
+/// A page on any origin can point a name it controls at 127.0.0.1 and then read every endpoint here
+/// same-origin, which would expose real project paths and branch names. The request is indistinguishable
+/// from a legitimate one at the socket, so this asserts on the only thing that differs: the `Host`.
+#[test]
+fn a_request_carrying_someone_elses_host_is_refused() {
+    let daemon = Daemon::start(&[]);
+    daemon.wait_until_listening();
+    let authority = format!("127.0.0.1:{}", daemon.port);
+
+    let (status, head, _) = raw_get(&authority, "api/status", &authority).expect("own host");
+    assert_eq!(status, 200, "{head}");
+    let head = head.to_ascii_lowercase();
+    assert!(head.contains("x-frame-options: deny"), "{head}");
+    assert!(head.contains("frame-ancestors 'none'"), "{head}");
+
+    for host in [
+        "rebind.attacker.example".to_string(),
+        format!("rebind.attacker.example:{}", daemon.port),
+        format!("127.0.0.1.nip.io:{}", daemon.port),
+    ] {
+        let (status, head, _) = raw_get(&authority, "api/status", &host).expect("connect");
+        assert_eq!(status, 421, "Host: {host} -> {head}");
+    }
 }
 
 #[test]
@@ -741,10 +778,18 @@ fn retention_summarises_old_samples_and_the_series_survives_it() {
         "{series}"
     );
 
-    // The default window reaches back past the boundary, so it is the mixed case: summarised minutes at the
-    // old end, untouched samples at the new one, in one ordered series with nothing repeated across the join.
-    let spanning: serde_json::Value =
-        serde_json::from_str(&daemon.get("/api/series?metric=cpu_percent")).expect("valid json");
+    // A range reaching back past the boundary is the mixed case: summarised minutes at the old end,
+    // untouched samples at the new one, in one ordered series with nothing repeated across the join.
+    //
+    // Asked for explicitly rather than left to the default window. The default is two days and the
+    // seeded stretch is two days old, so whether its summarised minutes fall inside it depends on how
+    // long the daemon took to start — which made this assertion fail about one run in three.
+    let spanning: serde_json::Value = serde_json::from_str(&daemon.get(&format!(
+        "/api/series?metric=cpu_percent&from={}&to={}",
+        old - 60_000,
+        agentbench::watch::store::now_ms()
+    )))
+    .expect("valid json");
     assert_eq!(spanning["resolution"], "mixed", "{spanning}");
     let stamps: Vec<i64> = spanning["points"]
         .as_array()
@@ -855,30 +900,40 @@ fn collection_works_with_the_server_disabled() {
         .spawn()
         .expect("spawn collector");
 
-    // Wait for the database file to appear and grow, rather than for a port.
+    let status = || {
+        Command::cargo_bin("agentbench")
+            .expect("built binary")
+            .arg("dashboard")
+            .arg("--status")
+            .arg("--data-dir")
+            .arg(data_dir.path())
+            .output()
+            .expect("run status")
+    };
+
+    // Wait for the collector to have written a schema, not merely for the file to appear. Opening a
+    // connection creates the file before the first migration commits, and a status read is
+    // deliberately not allowed to migrate it into existence — that is how a newer binary asked for a
+    // status line used to upgrade the schema underneath an older daemon still collecting on it.
     let deadline = Instant::now() + TIMEOUT;
     let database = data_dir.path().join("watch.db");
-    let mut created = false;
+    let mut collecting = false;
     while Instant::now() < deadline {
-        if database.exists() {
-            created = true;
+        if database.exists() && status().status.success() {
+            collecting = true;
             break;
         }
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(100));
     }
     let _ = child.kill();
     let _ = child.wait();
-    assert!(created, "the database should be created without a server");
+    assert!(
+        collecting,
+        "the database should be created and readable without a server"
+    );
 
-    // No port was opened, and the data is still readable afterwards.
-    let output = Command::cargo_bin("agentbench")
-        .expect("built binary")
-        .arg("dashboard")
-        .arg("--status")
-        .arg("--data-dir")
-        .arg(data_dir.path())
-        .output()
-        .expect("run status");
+    // No port was opened, and the data is still readable after the collector is gone.
+    let output = status();
     assert!(
         output.status.success(),
         "status after --no-serve failed: {}",

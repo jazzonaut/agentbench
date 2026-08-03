@@ -1,16 +1,19 @@
 //! The HTTP surface. The only module aware of `tiny_http`.
 //!
-//! Blocking and thread-per-request, matching the rest of the codebase: no async runtime is introduced
-//! for what is a handful of local JSON endpoints and a few embedded files.
+//! Blocking and single-threaded: the accept loop handles each request inline, and no async runtime is
+//! introduced for what is a handful of local JSON endpoints and a few embedded files served to one
+//! viewer. The cost of that choice is that a slow query delays the next request, which is why the page
+//! keeps the expensive endpoints off its fastest poll.
 
 pub mod assets;
 pub mod handlers;
+pub mod origin;
 pub mod response;
 pub mod router;
 
 use crate::watch::{
     config::{AnalysisConfig, ServerConfig},
-    store::{Level, Sink, Store},
+    store::{Level, Sink, Store, WriterHealth},
 };
 use anyhow::{Context, Result};
 use response::{Req, Resp};
@@ -31,16 +34,23 @@ const SHUTDOWN_POLL: Duration = Duration::from_millis(250);
 /// Passed in rather than read from a global, and kept to what is genuinely needed: a handler that could
 /// reach the whole configuration would eventually reach for the data directory or the bind address, and the
 /// read-only guarantee on this layer is worth more than the convenience.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Settings {
     /// Trailing window the verdicts compare today against, in whole local days.
     pub baseline_window_days: u32,
+    /// Liveness of the writer, when the caller is the daemon that owns it.
+    ///
+    /// The one runtime fact a handler cannot read out of the database: a writer that has stopped leaves
+    /// the file exactly as it was, so the page would otherwise draw a flat line and call it a quiet
+    /// machine.
+    pub writer: Option<WriterHealth>,
 }
 
 impl From<&AnalysisConfig> for Settings {
     fn from(config: &AnalysisConfig) -> Self {
         Self {
             baseline_window_days: config.baseline_window_days,
+            writer: None,
         }
     }
 }
@@ -50,7 +60,16 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             baseline_window_days: 7,
+            writer: None,
         }
+    }
+}
+
+impl Settings {
+    /// Report this writer's liveness alongside the rest of the status payload.
+    pub fn watching(mut self, writer: WriterHealth) -> Self {
+        self.writer = Some(writer);
+        self
     }
 }
 
@@ -94,6 +113,7 @@ impl Server {
     /// Each request gets a fresh read-only connection. At the volume a single local viewer generates,
     /// opening one per request is cheaper than the machinery of a pool.
     pub fn serve(self, store: &Store, sink: &Sink, shutdown: Arc<AtomicBool>, settings: Settings) {
+        let port = self.address.port();
         while !shutdown.load(Ordering::Relaxed) {
             let request = match self.inner.recv_timeout(SHUTDOWN_POLL) {
                 Ok(Some(request)) => request,
@@ -107,9 +127,18 @@ impl Server {
                     return;
                 }
             };
-            let response = match store.reader() {
-                Ok(reader) => router::route(&Req::parse(request.url()), &reader, settings),
-                Err(error) => Resp::error(503, &format!("database unavailable: {error}")),
+            // Checked before the database is even opened: a rebound request is not a request for this
+            // server, and answering it at all is the whole of the vulnerability.
+            let response = if origin::is_own_host(host_header(&request), port) {
+                match store.reader() {
+                    Ok(reader) => router::route(&Req::parse(request.url()), &reader, &settings),
+                    Err(error) => Resp::error(503, &format!("database unavailable: {error}")),
+                }
+            } else {
+                Resp::error(
+                    421,
+                    "this dashboard answers only to its own loopback address",
+                )
             };
             if let Err(error) = respond(request, &response) {
                 sink.log(Level::Warn, "serve", format!("failed to respond: {error}"));
@@ -118,12 +147,31 @@ impl Server {
     }
 }
 
+/// The request's `Host`, if it sent one.
+fn host_header(request: &tiny_http::Request) -> Option<&str> {
+    request
+        .headers()
+        .iter()
+        .find(|header| header.field.equiv("Host"))
+        .map(|header| header.value.as_str())
+}
+
 /// Write a [`Resp`] to a `tiny_http` request.
 fn respond(request: tiny_http::Request, response: &Resp) -> std::io::Result<()> {
     let mut headers = vec![
         header("Content-Type", response.content_type),
         // The dashboard is local-only and embeds no third-party origins.
         header("X-Content-Type-Options", "nosniff"),
+        // Nothing here is meant to be loaded inside someone else's page, and nothing here loads from
+        // anywhere else. Both framing headers, because the older one is what a browser without CSP
+        // support honours. `'unsafe-inline'` for styles alone: the page carries one inline stylesheet
+        // and no inline script, so scripts keep the strict rule.
+        header("X-Frame-Options", "DENY"),
+        header(
+            "Content-Security-Policy",
+            "default-src 'self'; style-src 'self' 'unsafe-inline'; \
+             frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
+        ),
     ];
     headers.push(header(
         "Cache-Control",

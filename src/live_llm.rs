@@ -112,6 +112,11 @@ pub fn run_suite(
     let live_started = Instant::now();
     let mut scenario_index = 0_usize;
     let mut total_cost = 0.0_f64;
+    // Runs that spent money the cap never saw. A timeout or a kill produces no `result` event and so
+    // no `total_cost_usd`, which means the running total understates what has been spent and the cap is
+    // being enforced against an incomplete figure. Bounded in practice — two failures disable a route —
+    // but a money guarantee that is quietly approximate has to say so.
+    let mut unaccounted_runs = 0_usize;
 
     while overall_started.elapsed() < options.minimum_total_duration
         && overall_started.elapsed() < options.maximum_total_duration
@@ -158,8 +163,9 @@ pub fn run_suite(
                 &expected,
                 timeout,
             )?;
-            if let Some(cost) = run.total_cost_usd {
-                total_cost += cost;
+            match run.total_cost_usd {
+                Some(cost) => total_cost += cost,
+                None => unaccounted_runs += 1,
             }
             if !run.success {
                 *route_failures.entry(route.into()).or_default() += 1;
@@ -191,6 +197,22 @@ pub fn run_suite(
                 "{route} live route was disabled after repeated failures"
             ));
         }
+    }
+    if unaccounted_runs > 0 {
+        warnings.push(format!(
+            "{unaccounted_runs} live run(s) reported no cost — a timed-out or killed run still spends \
+             money — so the ${:.2} cap was enforced on incomplete accounting and the true spend is \
+             above the ${total_cost:.3} recorded",
+            options.max_cost_usd
+        ));
+    }
+    if routes.len() > 1 {
+        warnings.push(format!(
+            "every scenario was run on {} routes ({}), so the API spend is that many times a \
+             single-route run",
+            routes.len(),
+            routes.join(" and ")
+        ));
     }
     let mut metrics = summarize(&runs);
     metrics.push(catalog::LLM_TOTAL_COST_USD.scalar(total_cost));
@@ -310,7 +332,7 @@ fn parse_run(
         .count();
     let chunk_times: Vec<f64> = chunks
         .iter()
-        .filter(|chunk| chunk.text.contains("content_block_delta"))
+        .filter(|chunk| chunk.is_delta)
         .map(|chunk| chunk.elapsed_ms as f64)
         .collect();
     let gaps: Vec<f64> = chunk_times
@@ -477,7 +499,7 @@ mod tests {
         };
         let chunks = vec![TimedChunk {
             elapsed_ms: 1_100,
-            text: "content_block_delta".into(),
+            is_delta: true,
         }];
         let run = parse_run(
             "direct",

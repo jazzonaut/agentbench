@@ -5,10 +5,14 @@ import {
 } from './format.js';
 import { createChart } from './chart.js';
 
-/** Live tiles refresh on this cadence; the server samples independently of it. */
+/** Live tiles refresh on this cadence; the server samples independently of it.
+ *
+ *  Only /api/live rides this poll. It reads one row per stream, which is what makes it affordable
+ *  five times a minute; the aggregate endpoints are on {@link HISTORY_POLL_MS} for the opposite reason.
+ */
 const LIVE_POLL_MS = 5000;
 
-/** History reloads far less often than the tiles: it changes slowly and costs more to fetch. */
+/** History, health, and verdicts reload here: they change slowly and each costs a scan to compute. */
 const HISTORY_POLL_MS = 60000;
 
 const RANGES = [
@@ -249,13 +253,18 @@ function renderStatus(status) {
   const dot = document.createElement('span');
   dot.className = `dot ${fresh ? 'ok' : 'stale'}`;
   collecting.append(dot);
+  // A stopped writer is the one stall a timestamp cannot describe: the rows are recent and nothing
+  // more will ever be added, so it is named rather than left to read as a quiet machine.
+  const stopped = status.writer_running === false;
   collecting.append(
     document.createTextNode(
-      status.sample_age_ms === null
-        ? 'no samples recorded'
-        : fresh
-          ? `collecting · last sample ${duration(status.sample_age_ms)} ago`
-          : `stalled · last sample ${duration(status.sample_age_ms)} ago`,
+      stopped
+        ? 'writer stopped · nothing is being recorded'
+        : status.sample_age_ms === null
+          ? 'no samples recorded'
+          : fresh
+            ? `collecting · last sample ${duration(status.sample_age_ms)} ago`
+            : `stalled · last sample ${duration(status.sample_age_ms)} ago`,
     ),
   );
 
@@ -320,22 +329,40 @@ function renderRanges() {
   }
 }
 
+/** Reported by /api/status, which is polled far less often than the tiles that display it. */
+let uplotVersion = null;
+
 async function loadLive() {
   try {
-    // Verdicts are polled with the tiles rather than with the history: they are about today, and today
-    // changes while you are looking at it.
-    const [live, status, verdicts] = await Promise.all([
-      api('/api/live'),
-      api('/api/status'),
-      api('/api/verdicts'),
-    ]);
+    const live = await api('/api/live');
     renderTiles(live);
     renderToday(live.today, live.day_start_ts);
-    renderVerdicts(verdicts);
-    renderStatus(status);
-    dom.subtitle.textContent = `machine ${live.machine_id.slice(0, 12)} · uPlot ${status.uplot_version}`;
+    const machine = `machine ${live.machine_id.slice(0, 12)}`;
+    dom.subtitle.textContent = uplotVersion ? `${machine} · uPlot ${uplotVersion}` : machine;
   } catch (error) {
     dom.subtitle.textContent = `cannot reach the daemon: ${error.message}`;
+  }
+}
+
+/** Daemon health and today's verdicts, on the slow cadence.
+ *
+ *  Both used to ride along with the live tiles every five seconds, and between them they cost the
+ *  machine more than the collectors they report on: /api/status runs six count(*) aggregates over the
+ *  fact tables, and /api/verdicts re-derives a whole trailing window, one aggregation per day in it.
+ *  The server handles requests one at a time on the main thread at normal priority, so an open
+ *  dashboard was biasing the very series it was drawing.
+ *
+ *  Neither payload changes on a five-second timescale. A verdict moves when a probe lands, four times
+ *  an hour; the health counts move by a handful of rows. A minute is still far finer than either.
+ */
+async function loadHealth() {
+  try {
+    const [status, verdicts] = await Promise.all([api('/api/status'), api('/api/verdicts')]);
+    uplotVersion = status.uplot_version;
+    renderVerdicts(verdicts);
+    renderStatus(status);
+  } catch (error) {
+    dom.statusLine.textContent = `cannot reach the daemon: ${error.message}`;
   }
 }
 
@@ -393,6 +420,8 @@ renderRanges();
 // read as the filter having done nothing.
 dom.uncontended.addEventListener('change', () => void loadHistory());
 void loadLive();
+void loadHealth();
 void loadHistory();
 setInterval(loadLive, LIVE_POLL_MS);
+setInterval(loadHealth, HISTORY_POLL_MS);
 setInterval(loadHistory, HISTORY_POLL_MS);

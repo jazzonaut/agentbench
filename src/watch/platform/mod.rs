@@ -79,6 +79,13 @@ pub fn try_lock_exclusive(file: &File) -> Result<bool> {
 /// Applied only to threads whose timing does not matter. Deliberately never applied to the probe
 /// thread: a throttled probe measures the throttle, not the machine.
 ///
+/// **The calling thread, or nothing.** Windows uses `THREAD_MODE_BACKGROUND_BEGIN`, Linux
+/// `setpriority(PRIO_PROCESS, …)` and macOS `setpriority(PRIO_DARWIN_THREAD, …)`, all of which are
+/// per-thread; a platform offering only a process-wide call reports [`Capability::Unsupported`]
+/// instead. A process-wide throttle applied by the sampler would reach the prober, and a prober that
+/// has been throttled reports the machine as slower than it is — silently, and only in the comparison
+/// between contended and uncontended runs, which is the hardest place to notice it.
+///
 /// **One-way on Unix.** Lowering priority needs no privileges; raising it back does. An unprivileged
 /// process cannot undo this, so there is deliberately no counterpart function: a measured thread has
 /// to be started at normal priority rather than restored to it. A restore that silently failed would
@@ -95,10 +102,10 @@ pub fn set_current_thread_background() -> Capability {
 /// difference between mains and battery is a third of the CPU's clock and would otherwise be
 /// indistinguishable from a machine that had genuinely degraded.
 ///
-/// Deliberately not shared with [`crate::system`]'s power-source detection. That one answers a
-/// different question — *which* source, in prose, once per report — and is free to spend a child
-/// process on it. This one is asked every fifteen minutes immediately before a measurement, so on
-/// Windows and Linux it is a syscall and a sysfs read respectively.
+/// This is the single reading of the fact. [`crate::system`]'s report field names *which* source in
+/// prose, but it names it from this answer rather than from a second implementation: there used to be
+/// two, and the other one returned `None` on most Linux laptops because it treated a battery
+/// directory it happened to visit first as the end of the search.
 pub fn on_battery() -> Option<bool> {
     imp::on_battery()
 }

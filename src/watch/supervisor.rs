@@ -12,7 +12,9 @@ use crate::watch::{
 };
 use anyhow::{Context, Result, bail};
 use std::{
+    any::Any,
     fs::File,
+    panic::AssertUnwindSafe,
     path::Path,
     sync::{
         Arc,
@@ -24,6 +26,20 @@ use std::{
 
 /// Delay before a died-unexpectedly worker is restarted.
 const RESTART_BACKOFF: Duration = Duration::from_secs(5);
+
+/// The message carried by a panic, for the two payload types `panic!` actually produces.
+///
+/// Anything else is reported as unreadable rather than guessed at: the point of the line is to name
+/// the fault, and a payload nobody can print is itself worth saying out loud.
+fn describe(payload: &(dyn Any + Send)) -> &str {
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        message
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message
+    } else {
+        "a payload of an unprintable type"
+    }
+}
 
 /// Held for the lifetime of the daemon to prove only one instance is collecting.
 ///
@@ -132,10 +148,18 @@ impl Supervisor {
         self.shutdown.load(Ordering::Relaxed)
     }
 
-    /// Spawn a worker that runs `body` and is restarted if it returns early.
+    /// Spawn a worker that runs `body` and is restarted if it stops for any reason.
     ///
     /// `background` requests reduced CPU and I/O priority for the worker. Pass `false` for anything
     /// whose timing is being measured.
+    ///
+    /// A panic is caught here rather than allowed to unwind the thread. An earlier version let it
+    /// unwind and relied on the join in [`shutdown`] to report it, which meant an index panic somewhere
+    /// inside process enumeration took one stream out for the life of the process and said so only at
+    /// exit — potentially days later, with the dashboard looking healthy throughout. A panicking worker
+    /// and a returning one are the same fault from the outside, so they take the same path.
+    ///
+    /// [`shutdown`]: Supervisor::shutdown
     pub fn spawn<F>(&mut self, name: &'static str, background: bool, body: F) -> Result<()>
     where
         F: Fn() + Send + Clone + 'static,
@@ -156,17 +180,26 @@ impl Supervisor {
                     }
                 }
                 while !shutdown.load(Ordering::Relaxed) {
-                    body.clone()();
+                    // `AssertUnwindSafe` is honest here: the body owns everything it touches, and what
+                    // it shares — the sink and the shutdown flag — carries no invariant a half-finished
+                    // iteration could break.
+                    let body = body.clone();
+                    let outcome = std::panic::catch_unwind(AssertUnwindSafe(body));
                     if shutdown.load(Ordering::Relaxed) {
                         break;
                     }
-                    // Reaching here means the worker returned without being asked to. A panic would
-                    // have unwound instead, which the join in `shutdown` reports separately.
+                    // Reaching here means the worker stopped without being asked to.
+                    let (level, what) = match &outcome {
+                        Ok(()) => (Level::Warn, "stopped unexpectedly".to_string()),
+                        Err(payload) => {
+                            (Level::Error, format!("panicked: {}", describe(&**payload)))
+                        }
+                    };
                     sink.log(
-                        Level::Warn,
+                        level,
                         name,
                         format!(
-                            "worker stopped unexpectedly; restarting in {}s",
+                            "worker {what}; restarting in {}s",
                             RESTART_BACKOFF.as_secs()
                         ),
                     );
@@ -182,6 +215,12 @@ impl Supervisor {
     }
 
     /// Stop every worker and report any that panicked.
+    ///
+    /// A backstop rather than the main path, since [`spawn`] catches a panic in the worker body and
+    /// restarts it. What reaches here is a panic outside that body — in the priority prologue, or in
+    /// the sink — which is not something a restart would survive either.
+    ///
+    /// [`spawn`]: Supervisor::spawn
     pub fn shutdown(mut self) -> Result<()> {
         self.request_shutdown();
         let mut panicked = Vec::new();
@@ -289,5 +328,39 @@ mod tests {
                 if event.source == "flaky" && event.message.contains("stopped unexpectedly"))
         });
         assert!(warned, "an early return must be logged");
+    }
+
+    /// The failure that used to be invisible until the process exited.
+    ///
+    /// The default panic hook still prints a backtrace to stderr while this runs, which is noise in the
+    /// test output and the right behaviour in a daemon.
+    #[test]
+    fn a_worker_that_panics_is_reported_and_the_thread_survives() {
+        let (sink, receiver) = sink();
+        let mut supervisor = Supervisor::new(sink);
+        let runs = Arc::new(AtomicUsize::new(0));
+        let counter = runs.clone();
+        supervisor
+            .spawn("panicky", false, move || {
+                counter.fetch_add(1, Ordering::Relaxed);
+                panic!("process enumeration went wrong");
+            })
+            .unwrap();
+        for _ in 0..500 {
+            if runs.load(Ordering::Relaxed) >= 1 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        supervisor
+            .shutdown()
+            .expect("a caught panic must not surface as a panicked thread");
+        let reported = receiver.try_iter().any(|record| {
+            matches!(record, crate::watch::store::Record::Event(event)
+                if event.source == "panicky"
+                    && event.level == Level::Error
+                    && event.message.contains("process enumeration went wrong"))
+        });
+        assert!(reported, "a panic must be logged with its own message");
     }
 }

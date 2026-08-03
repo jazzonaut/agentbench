@@ -138,7 +138,7 @@ pub fn run(config: WatchConfig) -> Result<()> {
                 &store,
                 &sink,
                 shutdown.clone(),
-                serve::Settings::from(&config.analysis),
+                serve::Settings::from(&config.analysis).watching(store.writer_health()),
             );
         }
         None => {
@@ -160,22 +160,33 @@ pub fn run(config: WatchConfig) -> Result<()> {
 }
 
 /// Read the current status without starting anything.
-pub fn status(config: &WatchConfig, event_limit: usize) -> Result<Status> {
-    let reader = open_for_reading(config)?;
-    serve::handlers::status::build(&reader, event_limit)
+pub fn status(reader: &store::Reader, event_limit: usize) -> Result<Status> {
+    serve::handlers::status::build(reader, event_limit, None)
 }
 
 /// Compare today against its trailing baseline without starting anything.
 ///
 /// Reads the same database `--status` does, through the same analysis the dashboard's tiles use, so the
 /// command line and the page can never reach different verdicts from the same rows.
-pub fn verdicts(config: &WatchConfig) -> Result<analysis::Comparisons> {
-    let reader = open_for_reading(config)?;
-    analysis::today_against_baseline(&reader, config.analysis.baseline_window_days)
+pub fn verdicts(reader: &store::Reader, window_days: u32) -> Result<analysis::Comparisons> {
+    analysis::today_against_baseline(reader, window_days)
 }
 
 /// Open the configured database read-only, explaining the common case of it not existing yet.
-fn open_for_reading(config: &WatchConfig) -> Result<store::Reader> {
+///
+/// [`Reader::open`] rather than [`Store::open`]. Opening the store to obtain a connection that cannot
+/// write would set pragmas, **run migrations**, insert a `machines` row and spawn a writer thread — and
+/// the migration is not a wasted step but a dangerous one. Install a newer binary, run
+/// `dashboard --status` while an older daemon is still collecting, and the schema is upgraded beneath
+/// it; its prepared statements then run against a shape it does not know. That is exactly what
+/// [`marker`] spends its doc comment avoiding, and the read path has no more right to do it.
+///
+/// A reader needs a path and a machine id, and [`system::machine_id`] is the cheap extract of the
+/// second: the same hashed hostname [`system::inventory`] would have produced, without enumerating
+/// every disk or spawning a child process to name the power source.
+///
+/// [`Reader::open`]: store::Reader::open
+pub fn open_for_reading(config: &WatchConfig) -> Result<store::Reader> {
     let path = config.database_path();
     if !path.exists() {
         anyhow::bail!(
@@ -183,9 +194,31 @@ fn open_for_reading(config: &WatchConfig) -> Result<store::Reader> {
             path.display()
         );
     }
-    let inventory = system::inventory(false);
-    let store = Store::open(&path, &inventory)?;
-    store.reader()
+    let reader = store::Reader::open(&path, system::machine_id())?;
+    // Not migrating means the two ends of the version range have to be reported rather than fixed,
+    // which is the same bargain `marker` makes. Both are ordinary rather than alarming: the first is a
+    // status read racing a daemon that has only just created the file, and the second is an older
+    // binary left on the PATH.
+    let version: u32 = reader
+        .conn()
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .context("read the database schema version")?;
+    if version == 0 {
+        anyhow::bail!(
+            "the watch database at {} has no schema yet; it is created when the daemon starts, so \
+             try again in a moment",
+            path.display()
+        );
+    }
+    if version > store::migrations::target_version() {
+        anyhow::bail!(
+            "the watch database at {} was written by a newer AgentBench (schema v{version}, this \
+             build understands v{}); upgrade to read it",
+            path.display(),
+            store::migrations::target_version()
+        );
+    }
+    Ok(reader)
 }
 
 /// Whether another daemon currently holds the instance lock.

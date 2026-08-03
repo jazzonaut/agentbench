@@ -61,16 +61,23 @@ pub struct EventRow {
 }
 
 /// Aggregate counts and freshness.
+///
+/// Every count here is a scan of an index, so this is not a cheap query and is not meant to be asked
+/// often — the dashboard polls it on the minute cadence, not the five-second one.
 pub fn health(conn: &Connection, machine_id: &str) -> Result<Health> {
     let count = |sql: &str| -> Result<i64> {
         conn.query_row(sql, [machine_id], |row| row.get(0))
             .with_context(|| format!("count via {sql}"))
     };
-    let (first, last): (Option<i64>, Option<i64>) = conn.query_row(
-        "SELECT min(ts), max(ts) FROM samples WHERE machine_id = ?1",
-        [machine_id],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
+    // Two statements rather than one. SQLite's min/max optimisation — seek one end of the index and
+    // stop — applies only to a query with a single aggregate in it, so `SELECT min(ts), max(ts)` reads
+    // every row for this machine while these two read one each.
+    let extreme = |sql: &str| -> Result<Option<i64>> {
+        conn.query_row(sql, [machine_id], |row| row.get(0))
+            .with_context(|| format!("read via {sql}"))
+    };
+    let first = extreme("SELECT min(ts) FROM samples WHERE machine_id = ?1")?;
+    let last = extreme("SELECT max(ts) FROM samples WHERE machine_id = ?1")?;
     Ok(Health {
         samples: count("SELECT count(*) FROM samples WHERE machine_id = ?1")?,
         probe_runs: count("SELECT count(*) FROM probe_runs WHERE machine_id = ?1")?,

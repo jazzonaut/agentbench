@@ -34,8 +34,12 @@ pub const IDLE_INTERVAL_RATIO: u32 = 6;
 
 /// Floor on the transcript poll interval.
 ///
-/// A pass stats every transcript, so polling in a tight loop would turn a free stream into a busy one.
-const SHORTEST_POLL: Duration = Duration::from_secs(1);
+/// A pass walks every directory under every root and reads the metadata of every transcript it finds,
+/// whether or not anything has changed. On a heavy Claude Code user's machine — sessions plus their
+/// subagents plus nested workflows — that is thousands of directory entries per pass, which at the
+/// one-second floor this used to permit is exactly the filesystem churn the tool exists to attribute to
+/// antivirus and filter drivers. Ten seconds is still far finer than anything on the page moves.
+const SHORTEST_POLL: Duration = Duration::from_secs(10);
 
 /// Floor on the probe interval.
 ///

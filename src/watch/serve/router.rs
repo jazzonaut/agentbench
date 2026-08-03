@@ -13,14 +13,14 @@ use crate::watch::{
 };
 
 /// Route a request to its handler.
-pub fn route(req: &Req, reader: &Reader, settings: Settings) -> Resp {
+pub fn route(req: &Req, reader: &Reader, settings: &Settings) -> Resp {
     if let Some(asset) = assets::get(&req.path) {
         return asset;
     }
     match req.path.as_str() {
         "/api/live" => live::handle(req, reader),
         "/api/series" => series::handle(req, reader),
-        "/api/status" => status::handle(req, reader),
+        "/api/status" => status::handle(req, reader, settings.writer.as_ref()),
         "/api/verdicts" => verdicts::handle(req, reader, settings.baseline_window_days),
         "/api/annotations" => annotations::handle(req, reader),
         _ => Resp::not_found(),
@@ -66,7 +66,7 @@ mod tests {
 
         fn get(&self, target: &str) -> Resp {
             let reader = self.store.reader().unwrap();
-            route(&Req::parse(target), &reader, Settings::default())
+            route(&Req::parse(target), &reader, &Settings::default())
         }
 
         fn json(&self, target: &str) -> Value {
@@ -196,7 +196,7 @@ mod tests {
                 now
             )),
             &reader,
-            Settings::default(),
+            &Settings::default(),
         );
         assert_eq!(resp.status, 200, "{}", body(&resp));
         let payload: Value = serde_json::from_slice(&resp.body).unwrap();
@@ -248,7 +248,7 @@ mod tests {
         let store = Store::open(&temp.path().join("watch.db"), &inventory).unwrap();
         let reader = store.reader().unwrap();
         let json = |target: &str| -> Value {
-            let resp = route(&Req::parse(target), &reader, Settings::default());
+            let resp = route(&Req::parse(target), &reader, &Settings::default());
             assert_eq!(resp.status, 200, "{target}: {}", body(&resp));
             serde_json::from_slice(&resp.body).unwrap()
         };
@@ -299,7 +299,7 @@ mod tests {
         let store = Store::open(&temp.path().join("watch.db"), &inventory).unwrap();
         let reader = store.reader().unwrap();
 
-        let resp = route(&Req::parse("/api/status"), &reader, Settings::default());
+        let resp = route(&Req::parse("/api/status"), &reader, &Settings::default());
         let status: Value = serde_json::from_slice(&resp.body).unwrap();
         assert_eq!(status["health"]["run_markers"], 1, "{status}");
     }
@@ -328,14 +328,56 @@ mod tests {
         let store = Store::open(&temp.path().join("watch.db"), &inventory).unwrap();
         let reader = store.reader().unwrap();
 
-        let resp = route(&Req::parse("/api/status"), &reader, Settings::default());
+        let resp = route(&Req::parse("/api/status"), &reader, &Settings::default());
         let status: Value = serde_json::from_slice(&resp.body).unwrap();
         assert_eq!(status["health"]["samples"], 1);
         assert_eq!(status["collecting"], true);
 
-        let resp = route(&Req::parse("/api/live"), &reader, Settings::default());
+        let resp = route(&Req::parse("/api/live"), &reader, &Settings::default());
         let live: Value = serde_json::from_slice(&resp.body).unwrap();
         assert_eq!(live["sample"]["process_count"], 300);
+    }
+
+    /// A fresh sample and a dead writer is a stalled daemon, not a working one.
+    ///
+    /// This is the shape of the fault the status payload used to be unable to describe: the rows are
+    /// recent, so age alone says "collecting", while nothing more will ever be written.
+    #[test]
+    fn a_stopped_writer_is_reported_and_is_not_read_as_collecting() {
+        let fixture = Fixture::new();
+        fixture.store.sink().send(crate::watch::store::Sample {
+            ts: crate::watch::store::now_ms(),
+            cpu_percent: 21.5,
+            used_memory: 1 << 30,
+            total_memory: 8 << 30,
+            used_swap: 0,
+            process_count: 300,
+            scanner_cpu: None,
+            agent_cpu: None,
+            agent_rss: None,
+            agent_processes: None,
+        });
+        let health = fixture.store.writer_health();
+        let inventory = Inventory {
+            hostname_hash: "hash-router".into(),
+            ..Default::default()
+        };
+        let temp = fixture.close();
+        assert!(!health.is_running(), "the writer has been shut down");
+
+        let store = Store::open(&temp.path().join("watch.db"), &inventory).unwrap();
+        let reader = store.reader().unwrap();
+        let settings = Settings::default().watching(health);
+        let resp = route(&Req::parse("/api/status"), &reader, &settings);
+        let status: Value = serde_json::from_slice(&resp.body).unwrap();
+        assert_eq!(status["writer_running"], false, "{status}");
+        assert_eq!(status["collecting"], false, "{status}");
+
+        // Without a writer to ask about, the field says so rather than claiming health.
+        let resp = route(&Req::parse("/api/status"), &reader, &Settings::default());
+        let status: Value = serde_json::from_slice(&resp.body).unwrap();
+        assert!(status["writer_running"].is_null(), "{status}");
+        assert_eq!(status["collecting"], true, "{status}");
     }
 
     #[test]

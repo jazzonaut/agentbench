@@ -4,7 +4,7 @@
 //! written, so a table's conflict policy is stated once.
 
 use crate::watch::store::records::{
-    Event, ProbeRun, RunMarker, Sample, ToolCall, ToolVersion, Turn, Watermark,
+    Event, ForgetWatermarks, ProbeRun, RunMarker, Sample, ToolCall, ToolVersion, Turn, Watermark,
 };
 use anyhow::{Context, Result};
 use rusqlite::{Transaction, params};
@@ -223,6 +223,21 @@ pub fn watermark(tx: &Transaction<'_>, mark: &Watermark, now: i64) -> Result<()>
         now,
     ])
     .context("update import watermark")?;
+    Ok(())
+}
+
+/// Drop the recorded position of transcripts that are no longer on disk.
+///
+/// The only statement in the codebase that deletes from this table. Deleting a watermark for a file
+/// that still exists would silently re-import it from byte zero, so the decision about *which* paths
+/// belongs entirely to the caller that just looked at the filesystem; this only carries it out.
+pub fn forget_watermarks(tx: &Transaction<'_>, forget: &ForgetWatermarks) -> Result<()> {
+    let mut statement = tx.prepare_cached("DELETE FROM import_watermark WHERE path = ?1")?;
+    for path in &forget.paths {
+        statement
+            .execute([path])
+            .with_context(|| format!("forget the import watermark for {path}"))?;
+    }
     Ok(())
 }
 

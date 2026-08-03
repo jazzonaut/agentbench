@@ -259,6 +259,21 @@ pub struct Watermark {
     pub rows_error: i64,
 }
 
+/// Transcripts whose recorded position is no longer worth keeping.
+///
+/// `import_watermark` had no delete path at all, and every row in it is loaded into memory at every
+/// startup. Claude Code writes one transcript per project per invocation and subagents write their
+/// own, so on a long-lived machine the table grows without bound into tens of thousands of rows
+/// describing files that were removed months ago.
+///
+/// Sent as a batch rather than one record per path: a housekeeping pass finds them together, and one
+/// row of the queue should not be spent on each.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ForgetWatermarks {
+    /// Paths recorded here that are no longer on disk.
+    pub paths: Vec<String>,
+}
+
 /// Anything the writer can persist.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Record {
@@ -270,6 +285,7 @@ pub enum Record {
     ToolCall(ToolCall),
     ToolVersion(ToolVersion),
     Watermark(Watermark),
+    ForgetWatermarks(ForgetWatermarks),
     Maintenance(Maintenance),
 }
 
@@ -334,6 +350,12 @@ impl From<ToolVersion> for Record {
 impl From<Watermark> for Record {
     fn from(value: Watermark) -> Self {
         Self::Watermark(value)
+    }
+}
+
+impl From<ForgetWatermarks> for Record {
+    fn from(value: ForgetWatermarks) -> Self {
+        Self::ForgetWatermarks(value)
     }
 }
 

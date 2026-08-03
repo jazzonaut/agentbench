@@ -31,7 +31,13 @@ enum Command {
         /// Skip paid/live Claude tests. Standard still runs for at least 3 minutes.
         #[arg(long)]
         no_live_llm: bool,
-        #[arg(long, value_enum, default_value = "auto")]
+        /// Which live-Claude routes to exercise.
+        ///
+        /// `auto` runs BOTH direct and Headroom whenever a Headroom proxy is listening, so every
+        /// scenario is paid for twice; it falls back to direct alone when none is. Pass `direct` to
+        /// halve the spend, or `both` to require the proxy rather than depend on whether it happens to
+        /// be up.
+        #[arg(long, value_enum, default_value = "auto", verbatim_doc_comment)]
         llm_route: LlmRouteArg,
         #[arg(long, default_value = "sonnet")]
         llm_model: String,
@@ -149,8 +155,31 @@ enum LlmRouteArg {
     Both,
 }
 
+/// Say so when this binary cannot produce a number worth keeping.
+///
+/// A debug build reports memory write bandwidth around forty times low, and everything else in
+/// proportion. Those figures do not stay in the terminal: `bench` writes them into the dashboard's
+/// history as `source = bench` rows, and a debug-built daemon writes its probe series alongside a
+/// release build's, where nothing downstream can tell them apart. So this is a line on stderr at
+/// startup rather than a footnote in the README.
+fn warn_if_measuring_with_a_debug_build() {
+    if cfg!(debug_assertions) {
+        eprintln!(
+            "warning: this is a debug build. Its measurements are far slower than the machine and \
+             must not be compared with, or stored beside, release-build history. Use --release."
+        );
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if matches!(
+        cli.command,
+        Command::Bench { .. } | Command::Profile { .. } | Command::Experiment { .. }
+    ) || matches!(cli.command, Command::Dashboard { status: false, .. })
+    {
+        warn_if_measuring_with_a_debug_build();
+    }
     match cli.command {
         Command::Bench {
             preset,
@@ -418,8 +447,12 @@ fn run_dashboard(args: DashboardArgs) -> Result<()> {
 }
 
 /// Human-readable rendering of the same payload `/api/status` returns.
+///
+/// One reader for both halves. Opening a second would re-derive the same machine id and re-open the
+/// same file to answer a question the first one could already have answered.
 fn print_status(config: &watch::WatchConfig) -> Result<()> {
-    let status = watch::status(config, 10)?;
+    let reader = watch::open_for_reading(config)?;
+    let status = watch::status(&reader, 10)?;
     let age = status
         .sample_age_ms
         .map(|ms| format!("{:.0}s ago", ms as f64 / 1000.0))
@@ -453,7 +486,7 @@ fn print_status(config: &watch::WatchConfig) -> Result<()> {
     println!("Transcripts:    {} imported", status.health.imported_files);
     println!("Import errors:  {}", status.health.import_errors);
     println!("Schema version: {}", status.health.schema_version);
-    print_verdicts(config);
+    print_verdicts(&reader, config.analysis.baseline_window_days);
     if !status.events.is_empty() {
         println!("\nRecent events:");
         for event in &status.events {
@@ -468,8 +501,8 @@ fn print_status(config: &watch::WatchConfig) -> Result<()> {
 /// Failures are printed rather than propagated. A verdict is the most derived thing in the tool and the
 /// least essential to `--status`, whose actual job is to answer "is collection working?" — so a query that
 /// cannot be answered says so on one line and leaves the counts above it intact.
-fn print_verdicts(config: &watch::WatchConfig) {
-    let comparisons = match watch::verdicts(config) {
+fn print_verdicts(reader: &watch::store::Reader, window_days: u32) {
+    let comparisons = match watch::verdicts(reader, window_days) {
         Ok(comparisons) => comparisons,
         Err(error) => {
             println!("\nToday vs baseline: unavailable ({error:#})");

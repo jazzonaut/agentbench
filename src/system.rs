@@ -1,7 +1,7 @@
 use crate::model::{DiskInfo, Inventory, SystemSample};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, env, fs, path::Path, process::Command, time::Instant};
-use sysinfo::{Disks, System};
+use sysinfo::{Disks, ProcessesToUpdate, System};
 
 pub fn hash_private(value: impl AsRef<[u8]>) -> String {
     let digest = Sha256::digest(value.as_ref());
@@ -74,8 +74,21 @@ pub fn inventory(elevated_requested: bool) -> Inventory {
     result
 }
 
-pub fn sample(system: &mut System, started: Instant) -> SystemSample {
-    system.refresh_all();
+/// Refresh exactly what [`sample_from`] and a process-tree walk read, and nothing else.
+///
+/// Separate from the reading so a caller that already walks the process table for its own reasons can
+/// do it once. The enumeration is the expensive part — on Windows it is the most expensive thing this
+/// tool does per unit time — so it is worth both not repeating it and not asking for more than is
+/// wanted: `refresh_all` would additionally fetch each process's command line, environment and owner,
+/// none of which anything here reads.
+pub fn refresh_for_sample(system: &mut System) {
+    system.refresh_memory();
+    system.refresh_cpu_usage();
+    system.refresh_processes(ProcessesToUpdate::All, true);
+}
+
+/// Read a sample from an already-refreshed `System`.
+pub fn sample_from(system: &System, started: Instant) -> SystemSample {
     let scanner_names = [
         "msmpeng",
         "windefend",
@@ -104,6 +117,12 @@ pub fn sample(system: &mut System, started: Instant) -> SystemSample {
         process_count: system.processes().len(),
         scanner_cpu_percent: (scanner_cpu > 0.0).then_some(scanner_cpu),
     }
+}
+
+/// Refresh and read in one step, for a caller with no other use for the `System`.
+pub fn sample(system: &mut System, started: Instant) -> SystemSample {
+    refresh_for_sample(system);
+    sample_from(system, started)
 }
 
 pub fn tool_version(program: &str, args: &[&str]) -> Option<(String, u64)> {
@@ -202,34 +221,27 @@ fn power_source() -> Option<String> {
     }
 }
 
-#[cfg(target_os = "linux")]
+/// Which source is powering the machine, named for the report.
+///
+/// Delegated rather than reimplemented. There were two Unix readings of this one fact and they
+/// disagreed: this one walked `/sys/class/power_supply` looking for any `online` file, and since a
+/// battery has no such file and `read_dir` order is arbitrary, visiting `BAT0` first returned `None`
+/// for the whole function — the answer was decided by directory ordering. The watch-side reading
+/// filters on `type == "Mains"`, keeps looking, and distinguishes "cannot tell" from "on mains", so it
+/// is the one that survives.
+///
+/// The cost argument that kept them apart no longer holds either way round: the surviving
+/// implementation is a few small reads on Linux and one short-lived `pmset` on macOS, which is what
+/// this path was already spending.
+#[cfg(unix)]
 fn power_source() -> Option<String> {
-    let base = Path::new("/sys/class/power_supply");
-    let entries = fs::read_dir(base).ok()?;
-    for entry in entries.flatten() {
-        let online = entry.path().join("online");
-        if fs::read_to_string(online).ok()?.trim() == "1" {
-            return Some("ac".into());
-        }
-    }
-    Some("battery_or_unknown".into())
+    Some(match crate::watch::platform::on_battery()? {
+        true => "battery".into(),
+        false => "ac".into(),
+    })
 }
 
-#[cfg(target_os = "macos")]
-fn power_source() -> Option<String> {
-    let output = Command::new("pmset").args(["-g", "batt"]).output().ok()?;
-    let text = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
-    Some(
-        if text.contains("ac power") {
-            "ac"
-        } else {
-            "battery"
-        }
-        .into(),
-    )
-}
-
-#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(windows, unix)))]
 fn power_source() -> Option<String> {
     None
 }
