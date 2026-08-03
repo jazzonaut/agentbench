@@ -64,11 +64,27 @@ pub fn loopback(bytes: usize) -> Result<Vec<Metric>> {
 /// End-to-end HTTPS request latency to the public Anthropic endpoint.
 ///
 /// Skipped entirely under `--offline`. This sends no prompt and no credentials; it is a timing probe.
+///
+/// The first request through a fresh client pays DNS resolution, the TCP handshake and the TLS
+/// handshake; every request after it reuses the pooled connection. Mixing the two in one distribution
+/// made a summary statistic out of two different measurements, and because the sample counts here are
+/// small it was the *reported* one: at any preset size the p95 of this series was the cold request by
+/// construction (see [`crate::model::percentile_of_sorted`]). So when more than one sample is asked
+/// for, the connection is established first and that request is not recorded.
+///
+/// A single sample is left alone deliberately, and the background prober asks for exactly one. Warming
+/// up would double the outbound requests the daemon makes - the one thing about it that leaves the
+/// machine, and something the user is promised a count of. One cold request every fifteen minutes is
+/// consistent with the one before it, which is all a day-over-day comparison needs.
 pub fn https(samples: usize, cancel: &Arc<AtomicBool>) -> Result<Vec<Metric>> {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(10))
         .user_agent(concat!("AgentBench/", env!("CARGO_PKG_VERSION")))
         .build()?;
+    if samples > 1 {
+        check_cancel(cancel)?;
+        black_box(client.get(HTTPS_PROBE_URL).send()?.status());
+    }
     let mut latencies = Vec::new();
     for _ in 0..samples {
         check_cancel(cancel)?;

@@ -147,6 +147,13 @@ impl Metric {
 /// p50 on a dashboard chart, a p50 in a printed report and a p50 behind a day-over-day verdict have to
 /// be the same number — a reader comparing two of them has no way to discover that they were not.
 ///
+/// **A p95 of eleven values or fewer is the maximum.** `round((n - 1) * 0.95)` reaches the last index
+/// for every `n` up to 11 and only then starts to land inside the sample, so a caller asking for a tail
+/// from a handful of measurements gets the single worst one, wearing a name that suggests a
+/// distribution. That is not a rounding quirk to fix - with eleven samples there is no tail to
+/// estimate - so callers with small sample counts either take more samples or report the maximum and
+/// call it that. `network::https` is the workload this bit.
+///
 /// The caller sorts, so a function that already holds sorted data does not sort it twice.
 pub fn percentile_of_sorted(sorted: &[f64], p: f64) -> Option<f64> {
     if sorted.is_empty() {

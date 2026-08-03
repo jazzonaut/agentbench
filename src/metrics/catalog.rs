@@ -81,7 +81,12 @@ spec! {
     lower_is_better: false,
     phase: "memory",
     informational: false,
-    description: "Speed while sampling the benchmark memory buffer; affected by cache hierarchy and memory bandwidth.",
+    // The rate at which the machine can *reach* the buffer, not move it: one byte in every 64 is
+    // touched, and the divisor is the whole buffer. That is a defensible cache-line-granular reading -
+    // every line is fetched exactly once - but it is not the same quantity as `memory.write_gib_s`
+    // beside it, and on a machine whose last-level cache holds the buffer it is cache bandwidth
+    // rather than memory bandwidth. Charted next to the write figure, never divided by it.
+    description: "Rate at which the benchmark memory buffer can be reached, sampling one byte per cache line; not comparable with the write figure, and reports cache rather than memory bandwidth on a machine whose last-level cache holds the buffer.",
 }
 
 // --------------------------------------------------------------------- filesystem
@@ -96,6 +101,8 @@ spec! {
     description: "Large-file write throughput on the selected target volume, including the final flush.",
 }
 
+// Emitted by a benchmark only. The prober drops it, because at its working set the read is served
+// entirely from the page cache; see `watch::collect::probes::workloads::sequential_write`.
 spec! {
     FS_SEQUENTIAL_READ_MIB_S,
     name: "filesystem.sequential_read_mib_s",
@@ -103,7 +110,13 @@ spec! {
     lower_is_better: false,
     phase: "filesystem",
     informational: false,
-    description: "Large-file read throughput on the selected target volume; OS filesystem cache may contribute.",
+    // "May contribute" was too kind by a wide margin, and measurement says so: on a 16-core Windows
+    // machine this reports 4,820 MiB/s at the quick preset's 64 MiB and 9,447 MiB/s at the standard
+    // preset's 512 MiB, against 2,172 and 1,463 MiB/s written to the same file moments earlier. A
+    // figure six times the write speed of the device is not the device. Reading a file just written,
+    // at any size a preset asks for, measures the cached read path on any machine with the RAM to
+    // hold it - which is every machine, since presets size this to a fraction of a gigabyte.
+    description: "Re-read throughput of the large file just written; served from the OS page cache at every preset size, so this measures the cached read path rather than the device.",
 }
 
 spec! {
@@ -116,14 +129,21 @@ spec! {
     description: "Combined create, metadata-stat, rename, and delete operations per second across many small files.",
 }
 
+// Informational for the same reason as `cpu.multi_elapsed_ms`, and it is worth being explicit about
+// why a duration sitting beside a rate is not a second finding: this is the *same measurement*.
+// `small_file_ops_s` is `4 × count / seconds` and this is `seconds × 1000`, so with the count fixed by
+// the preset each is a reciprocal of the other and a slow volume moves both. Treating them as two
+// comparable metrics counted one observation twice - in the comparison table, and in any reading of how
+// many metrics moved. It also is not comparable between sources at all, since the count differs by two
+// orders of magnitude between a probe and a benchmark while the rate is normalised.
 spec! {
     FS_SMALL_FILE_TOTAL_MS,
     name: "filesystem.small_file_total_ms",
     unit: "ms",
     lower_is_better: true,
     phase: "filesystem",
-    informational: false,
-    description: "Total wall time for the complete small-file create/stat/rename/delete workload.",
+    informational: true,
+    description: "Total wall time of the small-file create/stat/rename/delete workload; scales with the file count the preset chose, so it reports how long the phase took rather than how fast the volume is.",
 }
 
 spec! {
@@ -199,7 +219,12 @@ spec! {
     lower_is_better: true,
     phase: "network",
     informational: false,
-    description: "End-to-end HTTPS request latency to the public Anthropic endpoint, including network and TLS effects.",
+    // The two sources measure subtly different things and both are consistent with themselves, which
+    // is what a trend needs: a benchmark establishes the connection first and reports requests over
+    // it, while a probe makes exactly one request and so always includes DNS and the TLS handshake.
+    // Comparing a probe value against a benchmark value would be comparing those two; the `source`
+    // column is what keeps them apart.
+    description: "End-to-end HTTPS request latency to the public Anthropic endpoint. A benchmark reports requests over an established connection; a single-sample probe includes DNS and TLS setup.",
 }
 
 // ----------------------------------------------------------------------- live llm

@@ -74,38 +74,46 @@ pub fn inventory(elevated_requested: bool) -> Inventory {
     result
 }
 
-/// Refresh exactly what [`sample_from`] and a process-tree walk read, and nothing else.
+/// Refresh the whole-machine counters, which are cheap.
 ///
-/// Separate from the reading so a caller that already walks the process table for its own reasons can
-/// do it once. The enumeration is the expensive part — on Windows it is the most expensive thing this
-/// tool does per unit time — so it is worth both not repeating it and not asking for more than is
-/// wanted: `refresh_all` would additionally fetch each process's command line, environment and owner,
-/// none of which anything here reads.
-pub fn refresh_for_sample(system: &mut System) {
+/// Split from [`refresh_processes_for_sample`] because the two have very different costs and a
+/// sampler wants them on different cadences: memory and CPU are a couple of reads, and the process
+/// walk is measured in milliseconds.
+pub fn refresh_machine(system: &mut System) {
     system.refresh_memory();
     system.refresh_cpu_usage();
+}
+
+/// Re-enumerate the process table, which is the expensive half of a sample.
+///
+/// On Windows this is the most expensive thing this tool does per unit time: measured at 9.9 ms mean
+/// and 13.8 ms worst case over 365 processes, which is why the sampler runs it on a slower cadence
+/// than the reading itself. `refresh_all` would additionally fetch each process's command line,
+/// environment and owner, none of which anything here reads.
+pub fn refresh_processes_for_sample(system: &mut System) {
     system.refresh_processes(ProcessesToUpdate::All, true);
 }
 
+/// Refresh exactly what [`sample_from`] and a process-tree walk read, and nothing else.
+pub fn refresh_for_sample(system: &mut System) {
+    refresh_machine(system);
+    refresh_processes_for_sample(system);
+}
+
 /// Read a sample from an already-refreshed `System`.
+///
+/// `scanner_cpu_percent` is on the per-core scale documented at
+/// [`process_tree::TreeUsage::cpu_percent`], unlike `cpu_percent` beside it, and reads `0.0` until the
+/// process table has been refreshed three times.
 pub fn sample_from(system: &System, started: Instant) -> SystemSample {
-    let scanner_names = [
-        "msmpeng",
-        "windefend",
-        "sophos",
-        "crowdstrike",
-        "sentinelone",
-        "clamd",
-        "eset",
-        "avast",
-        "avg",
-    ];
     let scanner_cpu: f32 = system
         .processes()
         .values()
         .filter(|p| {
             let name = p.name().to_string_lossy().to_ascii_lowercase();
-            scanner_names.iter().any(|scanner| name.contains(scanner))
+            crate::watch::config::SCANNER_NAME_FRAGMENTS
+                .iter()
+                .any(|scanner| name.contains(scanner))
         })
         .map(|p| p.cpu_usage())
         .sum();

@@ -27,8 +27,15 @@ use std::{
 /// invisible: one core for a fifth of a second, four times an hour.
 const CPU_DURATION: Duration = Duration::from_millis(200);
 
-/// Memory buffer. Small enough to stay off the swap path on a loaded machine, large enough to exceed
-/// any last-level cache and so measure memory rather than cache.
+/// Memory buffer. Small enough to stay off the swap path on a loaded machine, and larger than the
+/// last-level cache of a typical machine so that the reading is memory rather than cache.
+///
+/// "Typical" is doing real work in that sentence and the claim it replaced - that 64 MiB exceeds *any*
+/// last-level cache - is false: a desktop part with stacked cache has 96 MB of L3 and server parts have
+/// more. On such a machine both memory figures describe the cache hierarchy under a name that says
+/// memory. Sizing from the detected cache would be better and `sysinfo` does not expose it; raising the
+/// constant would make every machine's numbers incomparable with the ones already collected, to fix a
+/// reading on the machines least likely to be short of memory bandwidth. So it is stated instead.
 const MEMORY_BYTES: usize = 64 << 20;
 
 /// Sequential write volume. 8 MiB × 96 runs is the ~768 MiB/day the design budgeted for.

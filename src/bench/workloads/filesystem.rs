@@ -36,11 +36,18 @@ pub fn sequential_io(dir: &Path, bytes: u64, cancel: &Arc<AtomicBool>) -> Result
     let data = dir.join("sequential.bin");
     let block = vec![0xA5_u8; 1 << 20];
 
+    // The written total is counted rather than assumed. `bytes` is divided into whole blocks, so a
+    // caller passing something that is not a multiple of the block size writes less than it asked for,
+    // and dividing the requested figure by the elapsed time would report throughput the volume never
+    // delivered. Every caller today passes a multiple of 1 MiB, which is exactly the kind of thing that
+    // stops being true silently.
     let started = Instant::now();
     let mut file = File::create(&data)?;
+    let mut written = 0_u64;
     for _ in 0..(bytes / block.len() as u64) {
         check_cancel(cancel)?;
         file.write_all(&block)?;
+        written += block.len() as u64;
     }
     file.sync_all()?;
     let write_seconds = started.elapsed().as_secs_f64();
@@ -63,7 +70,7 @@ pub fn sequential_io(dir: &Path, bytes: u64, cancel: &Arc<AtomicBool>) -> Result
     fs::remove_file(&data)?;
 
     Ok(vec![
-        catalog::FS_SEQUENTIAL_WRITE_MIB_S.scalar(bytes as f64 / write_seconds / 1_048_576.0),
+        catalog::FS_SEQUENTIAL_WRITE_MIB_S.scalar(written as f64 / write_seconds / 1_048_576.0),
         catalog::FS_SEQUENTIAL_READ_MIB_S.scalar(read_bytes as f64 / read_seconds / 1_048_576.0),
     ])
 }

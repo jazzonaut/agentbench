@@ -10,6 +10,22 @@ use sysinfo::{Pid, System};
 /// Aggregated resource use across a set of processes.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct TreeUsage {
+    /// Summed CPU use **as a percentage of one core**, so the range is 0 to 100 × cores.
+    ///
+    /// This is `sysinfo`'s own scale for a process ("might be bigger than 100 if run on a multi-core
+    /// machine"), and it is emphatically not the scale of [`System::global_cpu_usage`], which is 0 to
+    /// 100 for the whole machine. The two get compared against each other by anything that reads a
+    /// sample, so the difference is stated here rather than at each reader: measured on a 16-core
+    /// Windows machine, four busy threads report 401 here and 55 there.
+    ///
+    /// A second hazard belongs with the first, because it looks like a value: `sysinfo` needs a
+    /// process refreshed **three** times before this is a measurement. The first refresh arms the
+    /// interval, the second saves the counters the delta is taken from, and only the third can
+    /// subtract them - the documented "twice" is one short on Windows. Refreshes one and two report
+    /// exactly `0.0`, which is indistinguishable from an idle process. Every caller that reads this
+    /// therefore warms up first: `bench::sampler` discards two readings before it records one,
+    /// `watch::collect::sampler::Sampler::prime` costs the daemon its first sample, and the prober takes
+    /// one extra priming reading before the first probe of a session.
     pub cpu_percent: f32,
     pub rss_bytes: u64,
     pub read_bytes: u64,

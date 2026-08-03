@@ -5,6 +5,18 @@ use crate::{
     },
 };
 
+/// Scanner CPU above which a slow filesystem result is worth attributing to it, **per core**.
+///
+/// `SystemSample::scanner_cpu_percent` is a sum of per-process readings, so it runs to 100 × cores and
+/// 10.0 means a tenth of one core - see [`crate::process_tree::TreeUsage::cpu_percent`]. This was 2.0
+/// and was read at the call site as "a couple of percent of total CPU"; on a 16-core machine it is one
+/// eightieth of the machine, which a scanner sitting idle clears, so the higher-confidence branch was
+/// effectively unconditional wherever a scanner was installed at all. The same mistake was found and
+/// fixed on the dashboard's side of the tool, where the constant is
+/// `watch::collect::probes::covariates::BUSY_SCANNER_CORE_PERCENT`; this is the same threshold for the
+/// same reading, kept at the same value deliberately.
+const SCANNER_BUSY_CORE_PERCENT: f32 = 10.0;
+
 pub fn analyze(
     metrics: &[Metric],
     samples: &[SystemSample],
@@ -24,11 +36,12 @@ pub fn analyze(
             .iter()
             .filter_map(|s| s.scanner_cpu_percent)
             .fold(0.0_f32, f32::max);
-        let (confidence, mut evidence) = if scanner > 2.0 {
+        let (confidence, mut evidence) = if scanner > SCANNER_BUSY_CORE_PERCENT {
             (
                 0.85,
                 vec![format!(
-                    "A security-scanner process reached {scanner:.1}% CPU during the run"
+                    "A security-scanner process reached {scanner:.0}% of one core during the run \
+                     (the threshold is {SCANNER_BUSY_CORE_PERCENT:.0}%)"
                 )],
             )
         } else {
@@ -72,15 +85,27 @@ pub fn analyze(
             ],
         ));
     }
+    // Judged on the median rather than the p95. Every preset takes eight samples or fewer, and at that
+    // size a p95 is the single worst request and nothing else (see `model::percentile_of_sorted`), so
+    // the rule fired on one outlier while claiming to describe a tail. The worst request is still worth
+    // showing, as evidence, under its own name.
     if let Some(m) = metric(catalog::NETWORK_HTTPS_LATENCY_MS.name)
-        .filter(|m| m.p95.unwrap_or(m.value) > 1_000.0)
+        .filter(|m| m.p50.unwrap_or(m.value) > 1_000.0)
     {
+        let mut evidence = vec![format!(
+            "Median HTTPS latency was {:.0} ms over {} request(s); the threshold is 1,000 ms",
+            m.p50.unwrap_or(m.value),
+            m.samples
+        )];
+        if let Some(worst) = m.max {
+            evidence.push(format!("The slowest request took {worst:.0} ms"));
+        }
         findings.push(finding(
             "network",
             Severity::Warning,
             0.65,
-            "High or inconsistent HTTPS latency",
-            vec![format!("HTTPS p95 was {:.0} ms", m.p95.unwrap_or(m.value))],
+            "High HTTPS latency",
+            evidence,
             vec!["The public endpoint and current internet conditions contribute to this result"],
             vec![
                 "Compare DNS/TLS timing on both machines at the same time",
@@ -333,6 +358,44 @@ mod tests {
                 .limitations
                 .iter()
                 .any(|v| v.contains("does not prove"))
+        );
+    }
+
+    /// The scale trap: an idle scanner must not raise the confidence of a filesystem finding.
+    ///
+    /// Both numbers here are percentages of *one core*. At the previous threshold of 2.0 the second
+    /// case reported 0.85 confidence and named a scanner in its evidence, on the strength of a process
+    /// using a thirtieth of one core - which on a 16-core machine is two thousandths of the machine.
+    #[test]
+    fn an_installed_but_idle_scanner_does_not_raise_confidence() {
+        let finding_for = |scanner: f32| {
+            let metrics = vec![catalog::FS_SMALL_FILE_OPS_S.scalar(400.0)];
+            let samples = vec![SystemSample {
+                scanner_cpu_percent: Some(scanner),
+                ..Default::default()
+            }];
+            analyze(&metrics, &samples, &[])
+                .into_iter()
+                .find(|f| f.category == "security_or_disk")
+                .expect("a slow small-file result is always a finding")
+        };
+
+        let idle = finding_for(3.0);
+        assert_eq!(idle.confidence, 0.65, "{:?}", idle.evidence);
+        assert!(
+            idle.evidence.iter().all(|line| !line.contains("scanner")),
+            "an idle scanner must not be named as evidence: {:?}",
+            idle.evidence
+        );
+
+        let busy = finding_for(60.0);
+        assert_eq!(busy.confidence, 0.85);
+        assert!(
+            busy.evidence
+                .iter()
+                .any(|line| line.contains("of one core")),
+            "the evidence must state the scale it is on: {:?}",
+            busy.evidence
         );
     }
 

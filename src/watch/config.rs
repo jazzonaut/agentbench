@@ -464,21 +464,28 @@ impl FileConfig {
 }
 
 /// Scanner name fragments matched case-insensitively against process names.
+///
+/// Public and `const` because the benchmark's own sampler needs the same list: two lists of scanner
+/// names would drift, and a scanner the daemon correlates against but a benchmark does not is a
+/// difference in *findings* between two paths that are supposed to agree.
+pub const SCANNER_NAME_FRAGMENTS: &[&str] = &[
+    "msmpeng",
+    "windefend",
+    "sophos",
+    "crowdstrike",
+    "sentinelone",
+    "clamd",
+    "eset",
+    "avast",
+    "avg",
+];
+
+/// [`SCANNER_NAME_FRAGMENTS`] as the owned form the configuration carries.
 fn default_scanner_names() -> Vec<String> {
-    [
-        "msmpeng",
-        "windefend",
-        "sophos",
-        "crowdstrike",
-        "sentinelone",
-        "clamd",
-        "eset",
-        "avast",
-        "avg",
-    ]
-    .iter()
-    .map(|name| (*name).to_string())
-    .collect()
+    SCANNER_NAME_FRAGMENTS
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect()
 }
 
 /// Expand a leading `~` using the platform home directory.

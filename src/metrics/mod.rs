@@ -126,6 +126,10 @@ mod tests {
         assert!(is_informational("llm.total_cost_usd"));
         assert!(is_informational("llm.phase_wall_seconds"));
         assert!(is_informational("cpu.multi_elapsed_ms"));
+        // A phase duration whose length is set by the preset's file count, and the reciprocal of
+        // `filesystem.small_file_ops_s`: comparing both would count one measurement twice.
+        assert!(is_informational("filesystem.small_file_total_ms"));
+        assert!(!is_informational("filesystem.small_file_ops_s"));
         assert!(!is_informational("llm.direct.latency.wall_ms"));
         assert!(!is_informational("cpu.single_mops_s"));
     }
