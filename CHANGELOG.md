@@ -21,6 +21,10 @@ All notable changes to AgentBench are documented here. The project follows [Sema
 
 ### Changed
 
+- **Breaking:** the minimum supported Rust version is now 1.86, raised from 1.85. Required by ratatui
+  0.30, which is the first ratatui release built against crossterm 0.29; earlier versions require
+  crossterm 0.28 and would link a second copy of crossterm alongside this project's, with two
+  independent owners of terminal raw mode.
 - **Breaking:** `agentbench dashboard` now starts the background collector and web dashboard. The live
   terminal view moved to `agentbench top`. Passing the old `--pid`, `--name`, or `--interval-ms` flags
   to `dashboard` still works for this release and prints a notice pointing at `top`; the shim is

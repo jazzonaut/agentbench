@@ -157,11 +157,24 @@ One API request emits several assistant rows sharing a `requestId`, each repeati
   averaged in. The sampler now takes and discards a throwaway reading, then waits at least
   `sysinfo::MINIMUM_CPU_UPDATE_INTERVAL` before recording.
 
+### ratatui and the MSRV
+
+**Decided: adopt ratatui 0.30, MSRV raised to 1.86.**
+
+ratatui 0.29 requires crossterm 0.28.1 against this project's 0.29, which would link two crossterm
+versions into one binary with two independent owners of terminal raw mode. ratatui 0.30 matches
+crossterm 0.29 but declares `rust-version = 1.86.0`, so adopting it requires the bump. The bump landed
+first, on its own, so that the version constraint is recorded independently of the rewrite.
+
+Keep the dependency narrow when adopting it: `default-features = false` with only the features
+actually needed, since the defaults pull `all-widgets`, `macros`, `layout-cache`, and — on non-Windows
+targets — the termion and termwiz backends, none of which this project uses.
+
+Note that CI has no MSRV verification job, so `rust-version` is documentation rather than something
+enforced. Raising it does not break any build that currently passes, and equally would not catch an
+accidental use of a newer language feature.
+
 ### Open questions carried into phase 2
 
-- **ratatui for the terminal views.** Desirable, but version-constrained: ratatui 0.29 requires
-  crossterm 0.28.1 against this project's 0.29, which would link two crossterm versions each managing
-  raw mode; ratatui 0.30 matches crossterm 0.29 but declares `rust-version = 1.86.0` against this
-  project's declared MSRV of 1.85. Adopting it therefore means an MSRV bump. Undecided.
-- **Whether `agentbench top` or the `bench` progress display benefits more** from a widget library.
-  The progress display is currently a static text list where gauges and sparklines would help most.
+- **Whether `agentbench top` or the `bench` progress display is rewritten first.** The progress display
+  is currently a static text list where gauges and a sparkline would help most; `top` already works.
