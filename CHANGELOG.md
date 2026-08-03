@@ -4,6 +4,76 @@ All notable changes to AgentBench are documented here. The project follows [Sema
 
 ## [Unreleased]
 
+### Added
+
+- **The control centre can start collection, compare reports, and erase what has been collected.** The
+  three things the screen previously sent you back to the command line for. Starting the daemon passes the
+  data directory explicitly, so a screen opened with `--data-dir` cannot start a daemon that collects
+  somewhere else. Comparing takes the two newest reports in the working directory, older as the baseline,
+  writes the comparison beside them and opens it — the guards that refuse to compare two different presets
+  are the same ones `agentbench compare` uses, because they moved into a shared function rather than being
+  reimplemented. Erasing asks for a second Enter within five seconds, refuses while a daemon holds the
+  database, and reports the size it is about to remove before it removes it.
+- **Two new charted session series, `tool_edit_ms` and `tool_search_ms`.** `Edit` and `Write` in the
+  first; `Grep` and `Glob` in the second. Both were previously pooled into `tool_read_ms` and are now
+  visible on their own. `tool_search_ms` is the closest thing the tool has to a directory-walk
+  measurement, which is what moves when a filter driver or a cloud-sync placeholder provider gets into
+  the path of an enumeration.
+
+### Changed
+
+- **`tool_read_ms` is the latency of `Read` alone**, where it used to pool `Read`, `Grep`, `Glob` and
+  `Edit`. It is the only session series that carries a verdict, and pooling put a composition confound
+  inside it: measured over 15,035 real tool calls, the four medians are 11, 72, 223 and 35 ms, and the
+  pooled daily median correlated with *the share of calls that happened to be reads* at r = −0.86. Three
+  quarters of the movement in the judged series was the model's choice of tool rather than the machine.
+  One day in the sample sat near the month's worst pooled figure while its `Read` median was the month's
+  best. **Values before this release are not comparable with values after it.**
+- **A slow small-file result no longer blames an idle security scanner.** The threshold was 2.0 against a
+  reading that is a percentage of *one core*, so on a sixteen-core machine it fired at one eightieth of
+  the machine — which anything installed clears. It is now 10.0, the same value the dashboard's own
+  contention tag uses for the same reading, and the evidence line states the scale it is on. The scale is
+  documented once, on `process_tree::TreeUsage::cpu_percent`, rather than at each reader.
+- **The benchmark's sampler warms up before it records, and walks the process table four times less
+  often.** Per-process CPU needs three refreshes before it is a measurement rather than a `0.0`, so the
+  first sample of every run previously reported no scanner activity whatever was happening — and because
+  the scanner evidence takes the maximum over a run, a missing real reading mattered while a phantom quiet
+  one did not. The whole-machine figure was inflated on that sample too: 9.0% against 4.4% once settled.
+  The walk itself costs about 10 ms of every 500 ms interval on Windows, spent observing during the two
+  measurements most sensitive to someone else using the machine, so it now runs every two seconds while
+  the cheap counters are still read every 500 ms.
+- **`network.https_latency_ms` establishes the connection before it starts timing**, when more than one
+  sample is asked for. The first request through a fresh client pays DNS, TCP and TLS; the rest reuse the
+  pooled connection, and at every preset's sample count the reported p95 *was* that first request, since
+  `round((n - 1) × 0.95)` reaches the last index for any n up to 11. The diagnostic threshold now reads
+  the median and reports the slowest request as evidence under its own name. A single-sample probe is
+  left alone: warming up would double the daemon's outbound requests, and one cold request every fifteen
+  minutes is consistent with the one before it.
+- **`cpu.single_mops_s` discards a 25 ms warm-up.** An idle processor takes tens of milliseconds to raise
+  its clock, and how long depends on the power plan and how idle it had been — a systematic bias, and a
+  larger one for the prober's 200 ms reading than for a benchmark's seconds, which is backwards.
+  **Values before this release are not comparable with values after it.**
+- **`filesystem.small_file_total_ms` is informational.** It is `seconds × 1000` where
+  `filesystem.small_file_ops_s` is `4 × count / seconds`: with the count fixed by the preset, each is the
+  reciprocal of the other, and treating them as two comparable metrics counted one measurement twice in
+  the comparison table.
+- **Two metric descriptions now say what the number is.** `filesystem.sequential_read_mib_s` reports the
+  cached read path, not the device: it measures 4,820 MiB/s at the quick preset's 64 MiB and 9,447 MiB/s
+  at the standard preset's 512 MiB, against 1,463 MiB/s written to the same file moments earlier. And
+  `memory.read_gib_s` is a rate at which memory can be *reached*, sampling one byte per cache line, so it
+  is not comparable with the write figure beside it.
+- **The first probe of a daemon session takes an extra priming reading.** Its covariates were previously
+  a scanner at exactly 0.0% and an agent reported inactive whatever either was doing, so a probe that
+  competed with a working agent could be recorded as comparable. Measured on one machine: the first probe
+  said no agent was active where the second and third, with the same thirty-seven-process agent tree in
+  front of them, said one was.
+
+### Fixed
+
+- `filesystem.sequential_write_mib_s` divides the bytes actually written by the elapsed time rather than
+  the bytes requested. Every caller today passes a multiple of the 1 MiB block size, so the two agreed;
+  the point is that they stop agreeing silently.
+
 ## [0.5.0] - 2026-08-03
 
 ### Added
