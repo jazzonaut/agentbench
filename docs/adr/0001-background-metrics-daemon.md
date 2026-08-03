@@ -75,13 +75,38 @@ Transcripts carry no duration or TTFT fields. The following are derived from row
 
 | Metric | Derivation | Confound |
 |---|---|---|
-| tool latency | `assistant(tool_use).timestamp` → matching `user.toolUseResult.timestamp`, linked by the result block's `tool_use_id` and falling back to `sourceToolAssistantUUID` | permission waits inflate it |
+| tool latency | `assistant(tool_use).timestamp` → matching `user.toolUseResult.timestamp`, linked by the result block's `tool_use_id` and falling back to `sourceToolAssistantUUID` | permission waits inflate it; parallel calls in one assistant row share a start; 1 ms timestamp resolution against an 11 ms median |
 | `first_response_ms` | user prompt row → first assistant row | contains the whole thinking block; a queued prompt waits before the request is sent |
 | tokens, cache ratio | `usage`, **deduped by `requestId`** | none once deduped |
 
 Read-only tool latency (`Read`, `Grep`, `Glob`, `Edit`) is the clean filesystem signal and is charted
 by default. `Bash` latency is stored but not charted by default: it is dominated by permission waits
 and legitimately long commands, so unfiltered it measures time away from the keyboard.
+
+**Superseded after 0.5.0: one tool per series, and only `Read` is judged.** Pooling those four was
+wrong and measurement says by how much. Over 15,035 real calls the medians are `Read` 11 ms, `Edit`
+35 ms, `Grep` 72 ms, `Glob` 223 ms — an order of magnitude apart, mixed in proportions the model
+chooses. Across 23 days with enough calls to have a daily median, the pooled figure correlated with the
+*share of calls that were reads* at r = −0.86, against −0.39 for the `Read`-only median: three quarters
+of the movement in the only judged session series was composition. The pooled figure ranged 18–34 ms
+across those days and 3 August sat at 30 ms, near the month's worst, on the day whose `Read` median was
+its best at 9.5 ms. `Read` is now judged; `tool_edit_ms` (`Edit`, `Write`) and `tool_search_ms` (`Grep`,
+`Glob`) are charted. Filtering by project was considered as a further control and rejected for now:
+`Read` medians across the eight busiest projects span 9–12 ms, so the repository matters far less to a
+read than the choice of tool does.
+
+Two confounds in tool latency were measured and deliberately left in place.
+
+- **Parallel calls share a start.** When one assistant row requests several tools, each result is
+  timestamped separately but all of them are timed from the row that asked, so siblings inflate each
+  other. Real effect, real size: batched `Read` calls have a median of 16 ms against 10 ms for
+  unbatched, +60%. They are 4% of reads, which moves a median by nothing measurable, and excluding them
+  would need a schema column and a full re-import to backfill. Recorded rather than fixed.
+- **The measurement sits close to its own resolution.** Transcript timestamps are milliseconds and the
+  `Read` median is 11 ms, so a single quantum is 9% of the value. The MAD across daily `Read` medians is
+  exactly 1.0 ms — one quantum — which means the band floor rather than the observed spread is what
+  governs that verdict. Charting a series whose noise floor is a rounding step is honest only if the
+  floor is disclosed, and it is.
 
 One API request emits several assistant rows sharing a `requestId`, each repeating the *cumulative*
 `usage`. Summing naively multiplies token counts. Dedupe by `requestId` before aggregating. Measured

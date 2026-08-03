@@ -64,6 +64,7 @@ pub fn run(config: &CollectConfig, data_dir: &Path, clock: &dyn Clock, sink: &Si
     let cancel = Arc::new(AtomicBool::new(false));
     let mut scratch: Option<Scratch> = None;
     let mut failures = 0_u64;
+    let mut warmed = false;
 
     while clock.sleep(config.probe_interval) {
         // Prepared here rather than before the loop, and kept once it succeeds. A removable volume or a
@@ -86,6 +87,24 @@ pub fn run(config: &CollectConfig, data_dir: &Path, clock: &dyn Clock, sink: &Si
         let Some(scratch) = scratch.as_ref() else {
             continue;
         };
+
+        // The first probe of a session needs one reading more than the others before its covariates
+        // are covariates. Per-process CPU is a delta and `sysinfo` needs three refreshes to produce
+        // one, not the two documented — see `process_tree::TreeUsage::cpu_percent` — so with a single
+        // priming refresh the first probe read a scanner at exactly 0.0% and an agent as inactive
+        // whatever either was doing, and was therefore tagged comparable when it may not have been.
+        // Measured on this machine: probe one reported `agent_active = false` where probes two and
+        // three, with the identical thirty-seven-process agent tree in front of them, reported true.
+        //
+        // Warming here rather than before the loop keeps the promise that nothing is measured until a
+        // full interval has passed; it costs one extra process walk per session.
+        if !warmed {
+            observer.prime(config);
+            if !clock.sleep(Observer::priming_wait()) {
+                return;
+            }
+            warmed = true;
+        }
 
         // Priming and process discovery sit outside the reading's window on purpose: the process-table
         // walk is the expensive part of observing a machine, and doing it inside would put it in the
@@ -210,10 +229,37 @@ mod tests {
         );
     }
 
+    /// The first probe of a session gets an extra priming reading; later ones do not need it.
+    ///
+    /// Asserted through the sleeps because the artefact itself - a covariate reading of exactly 0.0 -
+    /// is indistinguishable from a genuinely idle machine, which is what made it survive so long.
+    #[test]
+    fn the_first_probe_of_a_session_is_primed_twice_and_the_rest_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let interval = Duration::from_secs(900);
+        // Probe one: cadence, warm-up, priming. Probe two: cadence, priming. Then the refusal.
+        let clock = FakeClock::new(1_700_000_000_000, 5);
+        let (sender, receiver) = std::sync::mpsc::sync_channel(256);
+        let sink = Sink::new(sender);
+        run(&config(interval, false), temp.path(), &clock, &sink);
+        drop(sink);
+
+        let (runs, _) = drain(&receiver);
+        assert_eq!(runs.len(), 2, "two probes should have completed");
+        let sleeps = clock.sleeps();
+        let priming = Observer::priming_wait();
+        assert_eq!(
+            sleeps,
+            vec![interval, priming, priming, interval, priming, interval],
+            "the first probe waits twice before reading, the second once"
+        );
+    }
+
     #[test]
     fn a_probe_carries_covariates_and_probe_sourced_metrics() {
         let temp = tempfile::tempdir().unwrap();
-        let clock = FakeClock::new(1_700_000_000_000, 2);
+        // Cadence, then the session's one extra warm-up wait, then this probe's priming wait.
+        let clock = FakeClock::new(1_700_000_000_000, 3);
         let (sender, receiver) = std::sync::mpsc::sync_channel(256);
         let sink = Sink::new(sender);
         run(

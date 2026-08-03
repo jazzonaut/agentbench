@@ -3,8 +3,15 @@
 //! The exclusions are the interesting half of this list. `first_response_ms` mixes queue wait, thinking time
 //! and network latency, so a verdict on it would report the model's mood as a property of the machine.
 //! `tool_bash_ms` is dominated by how long commands legitimately took and by waits for a human to grant
-//! permission. Token counts and cache ratios describe what was asked of the agent, not what the machine did
-//! with it. Each of those is worth charting and none is worth a word like "worse".
+//! permission. `tool_search_ms` scales with the size of the tree being searched, so it moves when the agent
+//! changes project. `tool_edit_ms` is a filesystem cost, but an `Edit` also pays for matching the text it
+//! replaces, which is a property of the edit. Token counts and cache ratios describe what was asked of the
+//! agent, not what the machine did with it. Each of those is worth charting and none is worth a word like
+//! "worse".
+//!
+//! The judged session series is therefore one tool: `Read`. It used to be four pooled together, which put a
+//! composition confound inside the only session series anyone was told a verdict about - see
+//! [`SessionSeries::ToolReadMs`] for what that measured on real data.
 
 use crate::watch::store::queries::SessionSeries;
 
@@ -31,7 +38,7 @@ pub(super) const SUBJECTS: &[(Subject, &str)] = &[
     (Subject::Probe("cpu.single_mops_s"), "single-core CPU"),
     (
         Subject::Session(SessionSeries::ToolReadMs),
-        "agent file-tool latency",
+        "agent file-read latency",
     ),
 ];
 
@@ -70,6 +77,8 @@ mod tests {
         assert_eq!(judged, vec![SessionSeries::ToolReadMs]);
         for excluded in [
             SessionSeries::ToolBashMs,
+            SessionSeries::ToolEditMs,
+            SessionSeries::ToolSearchMs,
             SessionSeries::FirstResponseMs,
             SessionSeries::OutputTokens,
             SessionSeries::CacheHitRatio,

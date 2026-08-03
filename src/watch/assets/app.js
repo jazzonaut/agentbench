@@ -170,10 +170,10 @@ function renderToday(today, dayStart) {
   dom.today.append(
     tile(count(today.turns), `requests in ${count(today.sessions)} session(s)`),
     tile(count(today.tool_calls), `tool calls · ${projects}`),
-    // Absent is not zero: no file-tool calls yet means nothing was measured, not that it was instant.
+    // Absent is not zero: no reads yet means nothing was measured, not that it was instant.
     today.tool_read_p50_ms === null
-      ? tile('no calls yet', 'median file-tool latency', true)
-      : tile(latency(today.tool_read_p50_ms), 'median file-tool latency'),
+      ? tile('no reads yet', 'median Read latency', true)
+      : tile(latency(today.tool_read_p50_ms), 'median Read latency'),
     tile(count(today.output_tokens), 'output tokens'),
     today.cache_hit_ratio === null
       ? tile('—', 'prompt cache hits', true)

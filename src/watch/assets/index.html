@@ -224,8 +224,10 @@
     </div>
     <div class="card">
       <div class="card-head">
-        <span class="card-title">Agent file-tool latency</span>
-        <span class="card-note">median per bucket · Read, Grep, Glob, Edit</span>
+        <span class="card-title">Agent file-read latency</span>
+        <!-- One tool, not a family. `Read` medians around 11 ms where `Grep` is 72 and `Glob` is 223,
+             so a pooled series moved with whichever the model happened to call. -->
+        <span class="card-note">median per bucket · Read only</span>
       </div>
       <div id="chart-tools"></div>
       <p class="empty" data-empty-for="chart-tools" hidden>

@@ -34,8 +34,25 @@ enum Aggregation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionSeries {
-    /// Latency of the tools whose cost is the filesystem's: the clean signal.
+    /// Latency of `Read`, and of nothing else: the clean filesystem signal.
+    ///
+    /// One tool per series because these four differ by more than an order of magnitude and the mix
+    /// between them is decided by the model, not the machine. Measured over 15,035 real calls on one
+    /// developer's machine: `Read` 11 ms, `Edit` 35 ms, `Grep` 72 ms, `Glob` 223 ms. Pooling them gave a
+    /// daily median that correlated with the *share of calls that were reads* at r = −0.86 — three
+    /// quarters of the movement in the one judged session series was composition — while the same days'
+    /// `Read`-only medians correlated at −0.39. On 3 August the pooled figure sat near its worst for the
+    /// month, 30 ms, on a day whose `Read` median was the best of it at 9.5 ms.
     ToolReadMs,
+    /// Latency of `Edit` and `Write`. A filesystem cost too, but a write is what a scanner inspects and
+    /// an `Edit` also carries the cost of matching what it is replacing.
+    ToolEditMs,
+    /// Latency of `Grep` and `Glob`: the closest thing here to a directory-walk measurement.
+    ///
+    /// Charted rather than judged because it scales with the size of the tree searched, so it moves when
+    /// the agent changes project. That is also what makes it worth having: it is the series that would
+    /// show a filter driver or a cloud-sync placeholder provider making enumeration expensive.
+    ToolSearchMs,
     /// Latency of `Bash`. Available, but dominated by how long the command legitimately took and by
     /// waits for permission, so it is not a measure of the machine.
     ToolBashMs,
@@ -55,6 +72,8 @@ impl SessionSeries {
     pub fn parse(value: &str) -> Option<Self> {
         Some(match value {
             "tool_read_ms" => Self::ToolReadMs,
+            "tool_edit_ms" => Self::ToolEditMs,
+            "tool_search_ms" => Self::ToolSearchMs,
             "tool_bash_ms" => Self::ToolBashMs,
             "first_response_ms" => Self::FirstResponseMs,
             "output_tokens" => Self::OutputTokens,
@@ -66,6 +85,8 @@ impl SessionSeries {
     pub fn wire_name(self) -> &'static str {
         match self {
             Self::ToolReadMs => "tool_read_ms",
+            Self::ToolEditMs => "tool_edit_ms",
+            Self::ToolSearchMs => "tool_search_ms",
             Self::ToolBashMs => "tool_bash_ms",
             Self::FirstResponseMs => "first_response_ms",
             Self::OutputTokens => "output_tokens",
@@ -76,6 +97,8 @@ impl SessionSeries {
     /// Every series, for discovery by the dashboard.
     pub const ALL: &'static [Self] = &[
         Self::ToolReadMs,
+        Self::ToolEditMs,
+        Self::ToolSearchMs,
         Self::ToolBashMs,
         Self::FirstResponseMs,
         Self::OutputTokens,
@@ -84,7 +107,11 @@ impl SessionSeries {
 
     fn aggregation(self) -> Aggregation {
         match self {
-            Self::ToolReadMs | Self::ToolBashMs | Self::FirstResponseMs => Aggregation::Median,
+            Self::ToolReadMs
+            | Self::ToolEditMs
+            | Self::ToolSearchMs
+            | Self::ToolBashMs
+            | Self::FirstResponseMs => Aggregation::Median,
             Self::OutputTokens => Aggregation::Sum,
             Self::CacheHitRatio => Aggregation::Ratio,
         }
@@ -99,8 +126,19 @@ impl SessionSeries {
         match self {
             Self::ToolReadMs => {
                 "SELECT ts, duration_ms, 1 FROM session_tools
+                  WHERE machine_id = ?1 AND ts >= ?2 AND ts <= ?3 AND ok = 1 AND tool = 'Read'
+                  ORDER BY ts LIMIT ?4"
+            }
+            Self::ToolEditMs => {
+                "SELECT ts, duration_ms, 1 FROM session_tools
                   WHERE machine_id = ?1 AND ts >= ?2 AND ts <= ?3 AND ok = 1
-                    AND tool IN ('Read', 'Grep', 'Glob', 'Edit')
+                    AND tool IN ('Edit', 'Write')
+                  ORDER BY ts LIMIT ?4"
+            }
+            Self::ToolSearchMs => {
+                "SELECT ts, duration_ms, 1 FROM session_tools
+                  WHERE machine_id = ?1 AND ts >= ?2 AND ts <= ?3 AND ok = 1
+                    AND tool IN ('Grep', 'Glob')
                   ORDER BY ts LIMIT ?4"
             }
             Self::ToolBashMs => {
@@ -267,22 +305,41 @@ mod tests {
     #[test]
     fn latency_is_the_middle_of_a_bucket_not_its_mean() {
         let conn = fixture();
-        // The first minute holds four quick reads and one that took over a second. Its mean would be
-        // 254 ms and would report a filesystem problem that does not exist.
+        // The first minute holds two quick reads and one that took over a second. Its mean would be
+        // 406 ms and would report a filesystem problem that does not exist.
         assert_eq!(
             values(&conn, SessionSeries::ToolReadMs, MINUTE),
-            vec![12.0, 900.0],
+            vec![11.0],
             "the outlier must not move the median"
+        );
+    }
+
+    /// One tool per series, because a `Glob` and a `Read` are not the same measurement.
+    ///
+    /// The fixture's numbers are the shape of the real ones: reads in milliseconds, an edit a few times
+    /// slower, and a glob slower again by an order of magnitude. Pooling them, which is what this used
+    /// to do, produced a median of 40 ms that described none of the three.
+    #[test]
+    fn each_tool_family_is_its_own_series() {
+        let conn = fixture();
+        let hour = 60 * MINUTE;
+        assert_eq!(values(&conn, SessionSeries::ToolReadMs, hour), vec![11.0]);
+        assert_eq!(values(&conn, SessionSeries::ToolEditMs, hour), vec![40.0]);
+        // Grep at 12 ms and Glob at 900 ms; the p50 convention takes the upper middle of two.
+        assert_eq!(
+            values(&conn, SessionSeries::ToolSearchMs, hour),
+            vec![900.0]
         );
     }
 
     #[test]
     fn buckets_split_by_time_and_are_ordered_oldest_first() {
         let conn = fixture();
+        // The search series is the one spanning two minutes: a Grep in the first, a Glob in the second.
         let points = session_series(
             &conn,
             MACHINE,
-            SessionSeries::ToolReadMs,
+            SessionSeries::ToolSearchMs,
             0,
             i64::MAX,
             MINUTE,
@@ -291,17 +348,18 @@ mod tests {
         assert_eq!(points.len(), 2, "two minutes of calls, two buckets");
         assert!(points[0].ts < points[1].ts);
         assert_eq!(points[0].ts % MINUTE, 0, "buckets are aligned");
-        // The second minute holds a single slow read, which is its own median.
+        // The second minute holds a single slow glob, which is its own median.
         assert_eq!(points[1].value, 900.0);
     }
 
     #[test]
     fn a_wider_bucket_merges_what_a_narrow_one_separates() {
         let conn = fixture();
-        let wide = values(&conn, SessionSeries::ToolReadMs, 60 * MINUTE);
+        let narrow = values(&conn, SessionSeries::ToolSearchMs, MINUTE);
+        assert_eq!(narrow.len(), 2, "two minutes, two buckets");
+        let wide = values(&conn, SessionSeries::ToolSearchMs, 60 * MINUTE);
         assert_eq!(wide.len(), 1, "one hour, one bucket");
-        // Six reads of 8, 11, 12, 40, 900 and 1200 ms; the p50 convention takes the upper middle.
-        assert_eq!(wide[0], 40.0, "the median of all six reads");
+        assert_eq!(wide[0], 900.0, "the median of both searches");
     }
 
     #[test]
@@ -370,7 +428,7 @@ mod tests {
     #[test]
     fn buckets_report_the_number_of_rows_behind_each_value() {
         let conn = fixture();
-        let buckets = session_buckets(
+        let reads = session_buckets(
             &conn,
             MACHINE,
             SessionSeries::ToolReadMs,
@@ -379,14 +437,26 @@ mod tests {
             MINUTE,
         )
         .unwrap();
+        assert_eq!(reads.len(), 1, "every read is in the first minute");
+        assert_eq!(reads[0].observations, 3, "three reads behind that median");
+
+        let buckets = session_buckets(
+            &conn,
+            MACHINE,
+            SessionSeries::ToolSearchMs,
+            0,
+            i64::MAX,
+            MINUTE,
+        )
+        .unwrap();
         assert_eq!(buckets.len(), 2);
-        assert_eq!(buckets[0].observations, 5, "five reads in the first minute");
+        assert_eq!(buckets[0].observations, 1, "one grep in the first minute");
         assert_eq!(buckets[1].observations, 1);
         // The chart form must be the same numbers with the weights dropped, never a second computation.
         let points = session_series(
             &conn,
             MACHINE,
-            SessionSeries::ToolReadMs,
+            SessionSeries::ToolSearchMs,
             0,
             i64::MAX,
             MINUTE,

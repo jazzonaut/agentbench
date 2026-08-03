@@ -190,7 +190,9 @@ pub(crate) mod tests {
         assert_eq!(today.projects, 1);
         assert_eq!(today.output_tokens, 300);
         assert_eq!(today.cache_hit_ratio, Some(0.9));
-        assert_eq!(today.tool_read_p50_ms, Some(40.0));
+        // The median of the three `Read` calls (8, 11, 1200), and of nothing else: the fixture's `Grep`,
+        // `Glob` and `Edit` calls belong to their own series now.
+        assert_eq!(today.tool_read_p50_ms, Some(11.0));
         assert_eq!(today.last_activity_ts, Some(MINUTE + 1_000));
     }
 

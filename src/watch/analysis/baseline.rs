@@ -82,6 +82,16 @@ impl Baseline {
     ///
     /// `None` when too few days contributed, which the caller reports as insufficient data rather than
     /// papering over with a narrower window.
+    ///
+    /// **Days are unweighted.** A day built from three measurements counts exactly as much as one built
+    /// from nine hundred, even though [`DayValue::observations`] records the difference and the store's
+    /// bucket reducer keeps it precisely so the difference is available. That is a deliberate choice and
+    /// not an oversight: the unit of comparison is the day, a weighted median would let one busy
+    /// afternoon dominate the week it is judged against, and the thin days that would carry the least
+    /// weight are already excluded by `MIN_OBSERVATIONS_PER_DAY`. The cost is that a week of quiet days
+    /// produces a wider band than the same week's work would if it were weighted, so a real regression
+    /// on a quiet machine has to be larger before it is called one. The counts travel with the band for
+    /// exactly this reason: see [`Baseline::observations`].
     pub fn from_days(days: &[DayValue]) -> Option<Self> {
         let values: Vec<f64> = days
             .iter()
