@@ -10,6 +10,23 @@ use std::{collections::BTreeMap, fs, path::Path};
 const REGRESSION_THRESHOLD_PCT: f64 = 10.0;
 
 pub fn run(baseline_path: &Path, candidate_path: &Path, output: Option<&Path>) -> Result<()> {
+    let text = compare(baseline_path, candidate_path)?;
+    if let Some(path) = output {
+        fs::write(path, &text)?;
+        println!("Comparison: {}", path.display());
+    } else {
+        println!("{text}");
+    }
+    Ok(())
+}
+
+/// Read two reports, refuse the pairs that cannot be compared, and render the comparison.
+///
+/// Separated from [`run`] because the control centre needs the same answer without the printing: it
+/// owns an alternate terminal buffer, so anything written to stdout from there lands underneath the
+/// screen. Keeping the compatibility checks here rather than in the caller is the point of the split —
+/// a comparison of two different presets is meaningless however it was asked for.
+pub fn compare(baseline_path: &Path, candidate_path: &Path) -> Result<String> {
     let baseline = report::read_report(baseline_path)?;
     let candidate = report::read_report(candidate_path)?;
     if baseline.kind != candidate.kind {
@@ -70,14 +87,7 @@ pub fn run(baseline_path: &Path, candidate_path: &Path, output: Option<&Path>) -
             candidate_models
         );
     }
-    let text = comparison_markdown(&baseline, &candidate);
-    if let Some(path) = output {
-        fs::write(path, &text)?;
-        println!("Comparison: {}", path.display());
-    } else {
-        println!("{text}");
-    }
-    Ok(())
+    Ok(comparison_markdown(&baseline, &candidate))
 }
 
 /// First eight characters of a run id, or the whole thing when it is shorter.

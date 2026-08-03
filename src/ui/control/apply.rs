@@ -7,10 +7,11 @@
 
 use super::model::{Field, State};
 use crate::{
-    install,
-    watch::{config, settings::Draft},
+    compare, install,
+    watch::{self, config, settings::Draft},
 };
 use anyhow::{Context, Result, bail};
+use std::path::{Path, PathBuf};
 
 /// Preset a benchmark launched from here runs.
 const BENCHMARK_PRESET: &str = "standard";
@@ -182,8 +183,67 @@ pub fn act(state: &mut State, field: Field) -> Result<String> {
                 Ok("the benchmark is running in its own window".into())
             }
         }
+        // The data directory is passed explicitly. The screen may have been opened with `--data-dir`,
+        // and a daemon started from it that collected somewhere else would leave the status band above
+        // reporting "not collecting" while something was busily collecting into another database.
+        Field::StartCollecting => {
+            let program = std::env::current_exe().context("locate the running executable")?;
+            install::run_detached(
+                &program,
+                &format!("dashboard --data-dir {}", quoted(&state.config.data_dir)),
+            )?;
+            // Not set optimistically: the daemon takes a moment to take the lock, and a row that read
+            // "running" before it did would then flip back on the next refresh.
+            Ok("collection is starting in its own window".into())
+        }
+        Field::CompareReports => {
+            let [candidate, baseline, ..] = state.reports.as_slice() else {
+                bail!("two reports are needed and fewer than two were found");
+            };
+            let text = compare::compare(baseline, candidate)?;
+            let output = comparison_path(baseline, candidate);
+            std::fs::write(&output, text).with_context(|| format!("write {}", output.display()))?;
+            // Opened rather than printed: this screen owns an alternate terminal buffer, and anything
+            // written to stdout from here lands underneath it where nobody will see it.
+            install::open(&output.to_string_lossy())?;
+            Ok(format!("comparison written to {}", output.display()))
+        }
+        Field::EraseCollectedData => {
+            let removed = watch::reset_collected_data(&state.config)?;
+            state.database_bytes = None;
+            Ok(match removed.len() {
+                0 => "there was nothing collected to erase".into(),
+                count => format!(
+                    "erased {count} file(s) from {}; transcripts will be re-read when collection \
+                     next starts",
+                    state.config.data_dir.display()
+                ),
+            })
+        }
         _ => bail!("{} is not an action", field.label()),
     }
+}
+
+/// A path as a single command-line argument.
+///
+/// Quoted unconditionally rather than only when it contains a space: `install::run_detached` takes one
+/// argument string, so a data directory under `C:\Program Files` would otherwise arrive as two.
+fn quoted(path: &Path) -> String {
+    format!("\"{}\"", path.display())
+}
+
+/// Where a comparison of two reports is written.
+///
+/// Beside the reports, named after both, and with a `.md` extension so the result cannot be mistaken
+/// for a report and picked up as one on the next refresh.
+fn comparison_path(baseline: &Path, candidate: &Path) -> PathBuf {
+    let stem = |path: &Path| {
+        path.file_stem()
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "report".into())
+    };
+    let name = format!("{}-vs-{}.md", stem(baseline), stem(candidate));
+    candidate.with_file_name(name)
 }
 
 /// Save the collection settings and report what was actually written.

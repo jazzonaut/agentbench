@@ -1,8 +1,15 @@
 //! The screen `agentbench` opens with no arguments.
 //!
-//! It answers the two questions the command line makes awkward: is collection working, and how do I change
-//! something without remembering twelve flags. The status band comes from [`status_report`], the same code
-//! `dashboard --status` prints, so the screen and the command can never disagree about a verdict.
+//! It answers the questions the command line makes awkward: is collection working, how do I change
+//! something without remembering twelve flags, and how do I start, compare or reset without looking up a
+//! subcommand. The status band comes from [`status_report`], the same code `dashboard --status` prints, so
+//! the screen and the command can never disagree about a verdict.
+//!
+//! Every action row is a shortcut for something that can also be typed, and deliberately so: a screen that
+//! was the only way to reach a capability would put it out of reach of a script. The two exceptions are
+//! about installing the tool rather than using it - copying the executable somewhere durable, and putting
+//! that directory on `PATH` - which have nowhere sensible to live on a command line that has not been
+//! installed yet.
 //!
 //! [`status_report`]: crate::status_report
 
@@ -40,6 +47,12 @@ const TICK: Duration = Duration::from_millis(200);
 
 /// Column reserved for row labels.
 const LABEL_WIDTH: u16 = 30;
+
+/// How long a row that needs confirming stays armed.
+///
+/// Short enough that an Enter pressed a minute later belongs to whatever the user is doing now rather
+/// than to a question they have forgotten answering.
+const CONFIRM_WINDOW: Duration = Duration::from_secs(5);
 
 const HINTS: &[(&str, &str)] = &[
     ("↑↓", "move"),
@@ -87,6 +100,8 @@ struct App {
     message: Option<Result<String, String>>,
     status: Option<Result<status_report::Report, String>>,
     status_read_at: Option<Instant>,
+    /// A row awaiting a second Enter, and when it was armed.
+    armed: Option<(Field, Instant)>,
 }
 
 impl App {
@@ -99,6 +114,7 @@ impl App {
             message: None,
             status: None,
             status_read_at: None,
+            armed: None,
         })
     }
 
@@ -122,11 +138,26 @@ impl App {
                 .and_then(|reader| status_report::Report::build(&self.state.config, &reader))
                 .map_err(|error| format!("{error:#}")),
         );
+        // The rows that depend on whether anything is collecting read the same answer the band above
+        // them shows, rather than probing the lock a second time and possibly disagreeing with it. When
+        // the band could not be built at all - a first run with no database, most often - the lock is
+        // probed directly, because "start collecting" has to be right even then.
+        let running = match &self.status {
+            Some(Ok(report)) => report.daemon_running,
+            _ => watch::is_running(&self.state.config),
+        };
+        self.state.refresh_volatile(running);
     }
 
     fn handle(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Flow {
         if self.editing.is_some() {
             return self.handle_edit(code);
+        }
+        // Anything other than the confirming keystroke disarms. Moving off the row, or pressing a key
+        // that does something else, is not a decision to go ahead - and a row that stayed armed while
+        // the selection moved would act on whatever the user landed on next.
+        if code != KeyCode::Enter {
+            self.armed = None;
         }
         match code {
             KeyCode::Char('q') | KeyCode::Esc => return Flow::Quit,
@@ -162,10 +193,44 @@ impl App {
                 self.editing = Some(self.state.value(field));
                 return;
             }
-            Kind::Action if enter => apply::act(&mut self.state, field),
+            Kind::Action if enter => {
+                if let Some(prompt) = self.arm(field) {
+                    self.message = Some(Ok(prompt));
+                    return;
+                }
+                apply::act(&mut self.state, field)
+            }
             _ => return,
         };
+        self.armed = None;
         self.message = Some(outcome.map_err(|error| format!("{error:#}")));
+    }
+
+    /// Arm a row that needs confirming, or report that it is already armed.
+    ///
+    /// Returns the sentence to show while it waits, and `None` when the action should go ahead — either
+    /// because the row needs no confirmation or because this is the second Enter. The reason for asking
+    /// before acting rather than afterwards is that the row underneath the benchmark rows deletes
+    /// history, and the two are one keystroke apart.
+    fn arm(&mut self, field: Field) -> Option<String> {
+        if !field.needs_confirmation() {
+            return None;
+        }
+        // An unavailable row is refused by `apply` with a reason, which is more useful than a
+        // confirmation prompt for something that will not happen.
+        if self.state.unavailable(field).is_some() {
+            return None;
+        }
+        match self.armed {
+            Some((armed, at)) if armed == field && at.elapsed() < CONFIRM_WINDOW => None,
+            _ => {
+                self.armed = Some((field, Instant::now()));
+                Some(format!(
+                    "press enter again to {}",
+                    field.label().to_lowercase()
+                ))
+            }
+        }
     }
 
     fn handle_edit(&mut self, code: KeyCode) -> Flow {
@@ -490,6 +555,87 @@ mod tests {
                 width <= LABEL_WIDTH,
                 "{:?} is {width} columns wide but only {LABEL_WIDTH} are reserved",
                 field.label()
+            );
+        }
+    }
+
+    /// Select a row by field, failing loudly if it is no longer in the list.
+    fn select(app: &mut App, field: Field) {
+        app.selected = State::fields()
+            .iter()
+            .position(|candidate| *candidate == field)
+            .unwrap_or_else(|| panic!("{field:?} should be a row"));
+    }
+
+    /// The destructive row asks first, and one Enter alone does nothing.
+    #[test]
+    fn erasing_needs_a_second_enter() {
+        let mut app = app();
+        // A database to erase, so the row is not disabled for lack of one.
+        app.state.database_bytes = Some(4_096);
+        app.state.daemon_running = false;
+        select(&mut app, Field::EraseCollectedData);
+
+        app.handle(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.armed.is_some(), "the first Enter should arm the row");
+        assert!(
+            matches!(&app.message, Some(Ok(text)) if text.contains("press enter again")),
+            "{:?}",
+            app.message
+        );
+
+        app.handle(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.armed.is_none(), "acting disarms");
+        // The temporary data directory is already gone, so there is nothing to erase and the action
+        // says so. What matters here is that it ran at all.
+        assert!(app.message.is_some());
+    }
+
+    /// Moving away from an armed row must not leave it armed for whatever is selected next.
+    #[test]
+    fn navigating_away_disarms_the_row() {
+        let mut app = app();
+        app.state.database_bytes = Some(4_096);
+        app.state.daemon_running = false;
+        select(&mut app, Field::EraseCollectedData);
+        app.handle(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.armed.is_some());
+
+        app.handle(KeyCode::Up, KeyModifiers::NONE);
+        assert!(
+            app.armed.is_none(),
+            "the selection moved, so the answer lapses"
+        );
+    }
+
+    /// A stale confirmation is not a confirmation.
+    #[test]
+    fn an_expired_arming_asks_again_rather_than_acting() {
+        let mut app = app();
+        app.state.database_bytes = Some(4_096);
+        app.state.daemon_running = false;
+        select(&mut app, Field::EraseCollectedData);
+        app.armed = Some((
+            Field::EraseCollectedData,
+            Instant::now() - CONFIRM_WINDOW - Duration::from_secs(1),
+        ));
+
+        app.handle(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(
+            matches!(&app.message, Some(Ok(text)) if text.contains("press enter again")),
+            "an Enter outside the window should re-arm, not erase: {:?}",
+            app.message
+        );
+    }
+
+    /// Rows that only start something must not ask for confirmation.
+    #[test]
+    fn only_the_destructive_row_confirms() {
+        for field in State::fields() {
+            assert_eq!(
+                field.needs_confirmation(),
+                field == Field::EraseCollectedData,
+                "{field:?}"
             );
         }
     }

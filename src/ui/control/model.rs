@@ -58,9 +58,12 @@ pub enum Field {
     BaselineWindowDays,
     ServerEnabled,
     ServerPort,
+    StartCollecting,
     OpenDashboard,
     RunBenchmark,
     RunBenchmarkElevated,
+    CompareReports,
+    EraseCollectedData,
 }
 
 /// How a row responds to a keypress.
@@ -87,9 +90,12 @@ impl Field {
             Self::SessionsEnabled => Section::Sessions,
             Self::SamplesRawDays | Self::BaselineWindowDays => Section::History,
             Self::ServerEnabled | Self::ServerPort => Section::Server,
-            Self::OpenDashboard | Self::RunBenchmark | Self::RunBenchmarkElevated => {
-                Section::Actions
-            }
+            Self::StartCollecting
+            | Self::OpenDashboard
+            | Self::RunBenchmark
+            | Self::RunBenchmarkElevated
+            | Self::CompareReports
+            | Self::EraseCollectedData => Section::Actions,
         }
     }
 
@@ -110,10 +116,24 @@ impl Field {
             | Self::BaselineWindowDays
             | Self::ServerPort => Kind::Value,
             Self::InstallHere
+            | Self::StartCollecting
             | Self::OpenDashboard
             | Self::RunBenchmark
-            | Self::RunBenchmarkElevated => Kind::Action,
+            | Self::RunBenchmarkElevated
+            | Self::CompareReports
+            | Self::EraseCollectedData => Kind::Action,
         }
+    }
+
+    /// Whether Enter arms the row and a second Enter carries it out.
+    ///
+    /// Reserved for the one thing on this screen that cannot be undone. Every other row either changes
+    /// a setting that can be changed back or starts a process that can be closed; this one deletes
+    /// measurements that only exist here. A row next to "Run a benchmark" that erased months of history
+    /// on a single keypress would be a trap, and a modal dialog for one row would be a heavier answer
+    /// than the screen needs.
+    pub fn needs_confirmation(self) -> bool {
+        matches!(self, Self::EraseCollectedData)
     }
 
     pub fn label(self) -> &'static str {
@@ -133,9 +153,12 @@ impl Field {
             Self::BaselineWindowDays => "Baseline window",
             Self::ServerEnabled => "Serve the dashboard",
             Self::ServerPort => "Port",
+            Self::StartCollecting => "Start collecting",
             Self::OpenDashboard => "Open the dashboard",
             Self::RunBenchmark => "Run a benchmark",
             Self::RunBenchmarkElevated => "Run a benchmark, elevated",
+            Self::CompareReports => "Compare two reports",
+            Self::EraseCollectedData => "Erase collected data",
         }
     }
 
@@ -178,12 +201,24 @@ impl Field {
             Self::BaselineWindowDays => "Trailing days today is compared against.",
             Self::ServerEnabled => "Serve the web dashboard on loopback while collecting.",
             Self::ServerPort => "Loopback port for the dashboard.",
+            Self::StartCollecting => {
+                "Starts the daemon in its own window, against this data directory. Closing that \
+                 window stops collecting."
+            }
             Self::OpenDashboard => {
                 "Opens the dashboard in your browser. Requires the daemon running."
             }
             Self::RunBenchmark => "Runs the standard preset in a new window.",
             Self::RunBenchmarkElevated => {
                 "Prompts for administrator rights, which adds Defender diagnostics to the report."
+            }
+            Self::CompareReports => {
+                "Compares the two newest reports in this directory, the older as the baseline, and \
+                 opens the result."
+            }
+            Self::EraseCollectedData => {
+                "Deletes every sample, probe and derived session row. Transcripts are re-read from \
+                 disk, so session history returns; probe and sample history does not."
             }
         }
     }
@@ -206,6 +241,15 @@ pub struct State {
     pub login_delay: Duration,
     pub start_in_tray: bool,
     pub elevated: bool,
+    /// Whether a daemon holds the instance lock.
+    ///
+    /// Refreshed from the status band rather than probed again here, so the row that starts collection
+    /// and the heading that says whether anything is collecting cannot disagree.
+    pub daemon_running: bool,
+    /// Size of the database, or `None` when there is not one yet.
+    pub database_bytes: Option<u64>,
+    /// Benchmark reports in the working directory, newest first.
+    pub reports: Vec<PathBuf>,
 }
 
 impl State {
@@ -227,6 +271,11 @@ impl State {
             _ => (install::DEFAULT_DELAY, false),
         };
         Self {
+            daemon_running: crate::watch::is_running(&config),
+            database_bytes: std::fs::metadata(config.database_path())
+                .ok()
+                .map(|meta| meta.len()),
+            reports: reports_in_working_directory(),
             draft: Draft::from_config(&config),
             config,
             autostart,
@@ -268,6 +317,12 @@ impl State {
             Field::BaselineWindowDays => format!("{}d", self.draft.baseline_window_days),
             Field::ServerEnabled => on_off(self.draft.server_enabled),
             Field::ServerPort => self.draft.port.to_string(),
+            Field::StartCollecting => if self.daemon_running {
+                "running"
+            } else {
+                "not running"
+            }
+            .into(),
             Field::OpenDashboard => format!("http://127.0.0.1:{}/", self.draft.port),
             Field::RunBenchmark => "standard preset".into(),
             Field::RunBenchmarkElevated => {
@@ -277,6 +332,19 @@ impl State {
                     "prompts for consent".into()
                 }
             }
+            // Names the pair rather than counting the directory: the row acts on two specific files and
+            // a reader is entitled to know which two before pressing Enter.
+            Field::CompareReports => match self.reports.as_slice() {
+                [candidate, baseline, ..] => {
+                    format!("{} → {}", file_label(baseline), file_label(candidate))
+                }
+                [_] => "only one report here".into(),
+                [] => "no reports here".into(),
+            },
+            Field::EraseCollectedData => match self.database_bytes {
+                Some(bytes) => format!("{} collected", crate::ui::format::mib(bytes)),
+                None => "nothing collected yet".into(),
+            },
         }
     }
 
@@ -321,6 +389,26 @@ impl State {
             Field::RunBenchmarkElevated if self.elevated => Some(
                 "this process is already elevated, so plain \"Run a benchmark\" is enough".into(),
             ),
+            Field::StartCollecting if self.daemon_running => {
+                Some("collection is already running".into())
+            }
+            Field::CompareReports if self.reports.len() < 2 => Some(format!(
+                "two reports are needed and {} {} in {}",
+                self.reports.len(),
+                if self.reports.len() == 1 { "is" } else { "are" },
+                std::env::current_dir()
+                    .map(|dir| dir.display().to_string())
+                    .unwrap_or_else(|_| "this directory".into())
+            )),
+            // Refused here as well as by `watch::reset_collected_data`, so the row reads as disabled
+            // rather than failing on the second Enter. The check there is the one that matters: this one
+            // is a snapshot from the last status refresh.
+            Field::EraseCollectedData if self.daemon_running => {
+                Some("stop collection first: the daemon has the database open".into())
+            }
+            Field::EraseCollectedData if self.database_bytes.is_none() => {
+                Some("there is nothing collected to erase".into())
+            }
             _ => None,
         }
     }
@@ -343,9 +431,15 @@ impl State {
             Field::BaselineWindowDays,
             Field::ServerEnabled,
             Field::ServerPort,
+            // Starting collection comes first in the section because everything above it is a setting
+            // that only takes effect once something is collecting, and erasing comes last because it is
+            // the row nobody should reach by overshooting.
+            Field::StartCollecting,
             Field::OpenDashboard,
             Field::RunBenchmark,
             Field::RunBenchmarkElevated,
+            Field::CompareReports,
+            Field::EraseCollectedData,
         ]
     }
 
@@ -371,6 +465,21 @@ impl State {
         })
     }
 
+    /// Re-read the parts that change while the screen is open.
+    ///
+    /// Three facts about the world rather than about the configuration: whether anything is collecting,
+    /// how much has been collected, and which reports exist. All three are what an action row acts on,
+    /// so a screen left open while a benchmark finishes or a daemon starts has to notice.
+    ///
+    /// `running` is passed in rather than probed, so this and the status band cannot disagree.
+    pub fn refresh_volatile(&mut self, running: bool) {
+        self.daemon_running = running;
+        self.database_bytes = std::fs::metadata(self.config.database_path())
+            .ok()
+            .map(|meta| meta.len());
+        self.reports = reports_in_working_directory();
+    }
+
     /// Persist the collection settings and adopt whatever the writer normalised them to.
     pub fn save_draft(&mut self) -> Result<()> {
         let written = self.draft.save(&self.config.data_dir)?;
@@ -381,6 +490,48 @@ impl State {
 
 fn on_off(value: bool) -> String {
     if value { "on" } else { "off" }.to_string()
+}
+
+/// Prefix every report `report::write_report` names for itself.
+const REPORT_PREFIX: &str = "agentbench-";
+
+/// Benchmark reports in the working directory, newest first.
+///
+/// The working directory because that is where a benchmark writes when nobody passed `--output`, and
+/// the benchmark rows above launch exactly that. Matched by the name the writer chooses rather than by
+/// reading every `.json` file present: a directory of unrelated JSON would otherwise be parsed on every
+/// refresh to find out what it was.
+fn reports_in_working_directory() -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(".") else {
+        return Vec::new();
+    };
+    let mut found: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .flatten()
+        .filter(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            name.starts_with(REPORT_PREFIX) && name.ends_with(".json")
+        })
+        .filter_map(|entry| {
+            let modified = entry.metadata().ok()?.modified().ok()?;
+            Some((modified, entry.path()))
+        })
+        .collect();
+    // Newest first, and by name where two share a timestamp so the order is at least deterministic.
+    found.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| left.1.file_name().cmp(&right.1.file_name()))
+    });
+    found.into_iter().map(|(_, path)| path).collect()
+}
+
+/// A report's file name without the shared prefix or extension, for a row that has to fit a column.
+fn file_label(path: &std::path::Path) -> String {
+    path.file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .map(|stem| stem.trim_start_matches(REPORT_PREFIX).to_string())
+        .unwrap_or_else(|| path.display().to_string())
 }
 
 #[cfg(test)]

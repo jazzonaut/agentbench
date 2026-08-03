@@ -284,9 +284,129 @@ pub fn is_running(config: &WatchConfig) -> bool {
     InstanceLock::acquire(&config.lock_path()).is_err()
 }
 
+/// Erase every collected measurement, and report what was removed.
+///
+/// Done by deleting the database rather than by emptying its tables, for two reasons.
+///
+/// The first is that this is called from the control centre, which holds a read-only [`Reader`] on
+/// purpose: the whole `store`/`Reader` split exists so that nothing outside the writer thread can
+/// change history, and a screen that opened the database read-write to truncate it would be the one
+/// exception that makes the guarantee meaningless.
+///
+/// The second is what a reset should mean. Removing the file takes `import_watermark` with it, so the
+/// next daemon re-reads every transcript from the beginning and the session history — months of it,
+/// derived from files still sitting on disk — comes back. A reset that emptied the measurement tables
+/// but kept the watermarks would silently be irreversible for the one stream that did not have to be.
+/// Probe and sample history is genuinely gone either way; that is what erasing means.
+///
+/// Refuses while a daemon holds the instance lock. On Windows the delete would fail anyway, with an
+/// error about another process rather than an explanation.
+///
+/// [`Reader`]: store::Reader
+pub fn reset_collected_data(config: &WatchConfig) -> Result<Vec<std::path::PathBuf>> {
+    if is_running(config) {
+        anyhow::bail!(
+            "collection is running and has the database open; stop it first and try again"
+        );
+    }
+    let database = config.database_path();
+    let mut removed = Vec::new();
+    // The write-ahead log and the shared-memory index are part of the database, not incidental files:
+    // deleting only the first would leave a WAL that the next connection replays into a new database,
+    // which is the one outcome worse than either keeping or removing all three.
+    for path in [
+        database.clone(),
+        with_suffix(&database, "-wal"),
+        with_suffix(&database, "-shm"),
+    ] {
+        match std::fs::remove_file(&path) {
+            Ok(()) => removed.push(path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("remove {}", path.display()));
+            }
+        }
+    }
+    Ok(removed)
+}
+
+/// `watch.db` plus `-wal`, as SQLite names its companions.
+///
+/// Appended to the file name rather than assembled from the stem, so a data directory whose name
+/// contains a dot cannot end up with the suffix in the wrong place.
+fn with_suffix(database: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+    let mut name = database.file_name().unwrap_or_default().to_os_string();
+    name.push(suffix);
+    database.with_file_name(name)
+}
+
 /// Translate Ctrl+C into a cooperative shutdown request.
 fn install_signal_handler(shutdown: Arc<AtomicBool>) {
     // A failure here means an existing handler is installed; collection still works, it just cannot
     // be stopped as gracefully, so it is not worth failing startup over.
     let _ = ctrlc::set_handler(move || shutdown.store(true, Ordering::Relaxed));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn config(dir: &std::path::Path) -> WatchConfig {
+        WatchConfig::load(Some(dir.to_path_buf())).expect("defaults should load")
+    }
+
+    #[test]
+    fn a_reset_removes_the_database_and_its_companions() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = config(temp.path());
+        let database = config.database_path();
+        fs::write(&database, b"not really a database").unwrap();
+        fs::write(with_suffix(&database, "-wal"), b"log").unwrap();
+        fs::write(with_suffix(&database, "-shm"), b"index").unwrap();
+        // The configuration is not collected data and must survive.
+        let settings = temp.path().join("watch.toml");
+        assert!(settings.exists(), "load writes a default configuration");
+
+        let removed = reset_collected_data(&config).expect("nothing holds the database");
+        assert_eq!(removed.len(), 3, "{removed:?}");
+        assert!(!database.exists());
+        assert!(!with_suffix(&database, "-wal").exists());
+        assert!(!with_suffix(&database, "-shm").exists());
+        assert!(settings.exists(), "a reset must not erase the settings");
+    }
+
+    /// A first run has nothing to erase, which is a success and not an error.
+    #[test]
+    fn a_reset_with_no_database_yet_removes_nothing_and_succeeds() {
+        let temp = tempfile::tempdir().unwrap();
+        let removed = reset_collected_data(&config(temp.path())).expect("no database is fine");
+        assert!(removed.is_empty());
+    }
+
+    #[test]
+    fn a_reset_is_refused_while_a_daemon_holds_the_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = config(temp.path());
+        let database = config.database_path();
+        fs::write(&database, b"not really a database").unwrap();
+
+        let _lock = InstanceLock::acquire(&config.lock_path()).expect("the lock is free");
+        let error = reset_collected_data(&config).expect_err("a running daemon must block a reset");
+        assert!(
+            format!("{error:#}").contains("stop it first"),
+            "the message must say what to do: {error:#}"
+        );
+        assert!(database.exists(), "nothing may be removed after a refusal");
+    }
+
+    /// The suffix belongs on the file name, not on a stem split at the first dot.
+    #[test]
+    fn companions_are_named_after_the_whole_file() {
+        let path = std::path::Path::new("C:/data.dir/watch.db");
+        assert_eq!(
+            with_suffix(path, "-wal"),
+            std::path::Path::new("C:/data.dir/watch.db-wal")
+        );
+    }
 }
