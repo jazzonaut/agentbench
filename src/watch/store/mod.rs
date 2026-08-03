@@ -10,7 +10,10 @@ pub mod records;
 pub mod schema;
 pub mod writer;
 
-pub use records::{Event, Level, Record, Sample, ToolCall, ToolVersion, Turn, Watermark};
+pub use records::{
+    Covariates, Event, Level, MetricSource, ProbeMetric, ProbeRun, Record, RunMarker, Sample,
+    ToolCall, ToolVersion, Turn, Watermark,
+};
 pub use writer::Sink;
 
 use crate::model::Inventory;

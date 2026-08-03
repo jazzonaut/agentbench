@@ -31,6 +31,22 @@ export function latency(ms) {
   return `${(ms / 1000).toFixed(2)} s`;
 }
 
+/** A formatter for a metric whose unit the server supplied rather than the page hardcoding it.
+ *
+ *  Probe series are named after catalogue entries, and the catalogue owns each metric's unit. Deriving
+ *  the formatter from the response is what lets a second probe chart be one line of configuration
+ *  instead of a new formatter — and keeps the axis, the tooltip and the tile spelling a unit the same way.
+ */
+export function unitFormatter(unit) {
+  if (unit === 'ms') return latency;
+  return (value) => {
+    if (value === null || value === undefined) return '—';
+    // Large rates read better whole; small ones lose their meaning rounded.
+    const digits = Math.abs(value) >= 100 ? 0 : 1;
+    return `${value.toLocaleString(undefined, { maximumFractionDigits: digits })} ${unit}`;
+  };
+}
+
 /** A share of a whole, as a percentage. Takes 0…1, not 0…100. */
 export function ratio(value) {
   return value === null || value === undefined ? '—' : `${(value * 100).toFixed(0)}%`;

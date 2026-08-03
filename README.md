@@ -95,8 +95,10 @@ agentbench dashboard --status
 Useful flags: `--port`, `--data-dir`, `--no-serve` to collect without opening a socket, and
 `--sample-interval` / `--probe-interval` to raise resolution while investigating a regression.
 Lowering `--sample-interval` also lowers the idle cadence proportionally, so a faster setting is not
-silently defeated when the machine is quiet. `--no-sessions` stops it reading transcripts, and
-`--sessions-root DIR` points it at transcripts somewhere other than `~/.claude/projects`.
+silently defeated when the machine is quiet. `--no-probes` stops the controlled workload,
+`--no-probe-network` keeps it but drops its one outbound request, `--no-sessions` stops it reading
+transcripts, and `--sessions-root DIR` points it at transcripts somewhere other than
+`~/.claude/projects`.
 
 ### What it collects
 
@@ -105,10 +107,64 @@ silently defeated when the machine is quiet. `--no-sessions` stops it reading tr
   used and to discovered process ids rather than walking the whole process table, the sampler thread
   runs at background CPU and I/O priority where the OS supports it, and the cadence backs off when the
   machine is idle.
-- **Probes** *(from a later release)*: micro-scale reruns of the same workloads `bench` uses, at the
-  same metric names, so thresholds and comparisons carry over. Never any paid API call.
+- **Capability probes**: micro-scale reruns of the same workloads `bench` uses, under the same metric
+  names, so thresholds and comparisons carry over. Never any paid API call. See below for the cost.
 - **Real session metrics**: tool latency, response intervals, and token accounting derived from your
   own Claude Code transcripts, so the charts reflect measured usage rather than a proxy for it.
+- **Run markers**: whenever you run `bench`, `profile` or `experiment`, the start and end are recorded,
+  so the cliff a three-minute benchmark puts in the passive series is labelled rather than mistaken for
+  a machine getting slower. Silent and optional: nothing creates a database, so if you have never
+  started the dashboard, nothing happens.
+
+### What probing costs, and why it is not gated
+
+Passive samples explain what the machine was doing. They cannot distinguish *the disk got slower* from
+*the disk got busier* — for that you need an identical workload run on a schedule, which by definition
+consumes something. Every 15 minutes, one probe runs:
+
+| Workload | Scale | Metric it feeds |
+|---|---|---|
+| Single-thread CPU | one core for 200 ms | `cpu.single_mops_s` |
+| Memory | a 64 MiB buffer | `memory.write_gib_s`, `memory.read_gib_s` |
+| Sequential write | 8 MiB, flushed | `filesystem.sequential_write_mib_s` |
+| Small files | 200 files created, stat-ed, renamed, deleted | `filesystem.small_file_ops_s` |
+| SQLite | 2,000 rows inserted, 100 indexed lookups | `sqlite.insert_rows_s`, `sqlite.lookup_ms` |
+| Process launch | five child processes | `process.spawn_ms` |
+| Loopback TCP | 1 MiB | `network.loopback_connect_ms`, `network.loopback_mib_s` |
+| HTTPS | one round trip to `api.anthropic.com` | `network.https_latency_ms` |
+
+That is roughly a second and a half of work per run — about 0.17% of the machine — and around
+768 MiB of writes and 19,000 file creates a day. The small-file number is the one to watch: it is what
+moves when a security scanner or filesystem filter driver gets into the path.
+
+**Probes are not skipped when the machine is busy.** Waiting for an idle moment would collect nothing on
+exactly the days you care about. Instead every probe is stamped with what it was competing with — CPU,
+scanner CPU, whether an agent was working, whether you are on battery — read both immediately before
+and immediately after the measurement, so a probe clobbered halfway through is not filed as a clean
+one. The dashboard's **uncontended probes only** filter is where that tag gets used, and `--status`
+reports how many of your runs were clean, because a verdict computed from four points is worth
+knowing about.
+
+Probe values and `bench` values are stored side by side under different sources and are **never
+averaged together**. The same workload over 200 files and over 5,000 answers the same question at
+scales two orders of magnitude apart. The dashboard requests them as `probe:<metric>` and
+`bench:<metric>`; there is no unprefixed form, precisely so that a chart cannot silently pick one.
+
+The probe's outbound HTTPS request is the only part of the daemon that leaves your machine. It sends no
+prompt and no credentials, costs nothing, and only times the round trip — but 96 requests a day in a
+tool that otherwise uploads nothing gets its own switch: `--no-probe-network`, or `probe_network =
+false` under `[collect]` in `watch.toml`. `--no-probes` / `probes_enabled = false` turns the whole
+stream off and leaves passive and session collection running.
+
+Two things about probing are deliberately fixed rather than configurable. The **scale** of each
+workload is not a setting: the interval is a preference, but a working set is the unit the measurement
+is expressed in, and changing it would make March's numbers incomparable to April's with nothing in the
+data to say so. And the probe thread runs at **normal** priority, unlike the sampler — a throttled
+measurement measures the throttle.
+
+By default probes write inside the data directory. If the code you care about lives on a different
+volume, point `scratch_dir` under `[collect]` at that volume, or the probe measures the wrong disk and
+will do so silently.
 
 ### Session metrics, and what each one is worth
 
@@ -148,6 +204,10 @@ Transcripts are read, never copied. What is stored from them is timings, token c
 and the project path and branch a session ran in — no prompts, no code, no command output, and nothing
 from any tool's result. If you would rather it did not read them at all, `--no-sessions` or
 `enabled = false` under `[sessions]` in `watch.toml` turns the whole stream off.
+
+Probes write into `probe-scratch/` inside the data directory, or inside `scratch_dir` if you set one.
+It is emptied when the daemon starts and after every probe, so a daemon killed mid-workload does not
+leave a directory behind that would skew the next run.
 
 There is no service installer, and AgentBench changes no OS configuration on its own. To start the
 collector at login, register it with your platform's own scheduler.

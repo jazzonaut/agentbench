@@ -1,14 +1,16 @@
 //! `GET /api/series` — points for one series over a time range.
 //!
-//! Two kinds of series answer here. A passive one returns the samples themselves, because each is
-//! already a measurement of the whole machine. A derived one returns an aggregate per time bucket,
-//! because a single tool call is not a measurement of anything; the middle of an hour's calls is.
+//! Three kinds of series answer here, and the difference between them is what a single row means. A
+//! passive sample is already a measurement of the whole machine, so it is returned as it was recorded. A
+//! probe run is too — a controlled workload observed end to end — so it is also returned raw, optionally
+//! restricted to the runs that were not competing with anything. A derived session series is neither: one
+//! tool call is not a measurement of anything, so it is aggregated per time bucket.
 
 use crate::watch::{
     serve::response::{Req, Resp},
     store::{
         Reader,
-        queries::{self, SampleSeries, SessionSeries},
+        queries::{self, ProbeSeries, SampleSeries, SessionSeries},
     },
 };
 use serde::Serialize;
@@ -35,9 +37,13 @@ const TARGET_BUCKETS: i64 = 120;
 const MIN_BUCKET_MS: i64 = 60_000;
 
 /// Which series was asked for.
+///
+/// Probe names are tried last because they are the only prefixed family (`probe:` / `bench:`), so they
+/// cannot collide with a passive or session name however the other two grow.
 enum Requested {
     Sample(SampleSeries),
     Session(SessionSeries),
+    Probe(ProbeSeries),
 }
 
 impl Requested {
@@ -45,34 +51,46 @@ impl Requested {
         SampleSeries::parse(name)
             .map(Self::Sample)
             .or_else(|| SessionSeries::parse(name).map(Self::Session))
+            .or_else(|| ProbeSeries::parse(name).map(Self::Probe))
     }
 
-    fn wire_name(&self) -> &'static str {
+    fn wire_name(&self) -> String {
         match self {
-            Self::Sample(series) => series.wire_name(),
-            Self::Session(series) => series.wire_name(),
+            Self::Sample(series) => series.wire_name().to_string(),
+            Self::Session(series) => series.wire_name().to_string(),
+            Self::Probe(series) => series.wire_name(),
         }
     }
 }
 
 /// Every series name the dashboard may ask for.
-pub fn known_series() -> Vec<&'static str> {
+pub fn known_series() -> Vec<String> {
     SampleSeries::ALL
         .iter()
-        .map(|series| series.wire_name())
-        .chain(SessionSeries::ALL.iter().map(|series| series.wire_name()))
+        .map(|series| series.wire_name().to_string())
+        .chain(
+            SessionSeries::ALL
+                .iter()
+                .map(|series| series.wire_name().to_string()),
+        )
+        .chain(queries::probes::known_series())
         .collect()
 }
 
 #[derive(Debug, Serialize)]
-struct Series<'a> {
-    metric: &'a str,
+struct Series {
+    metric: String,
     from: i64,
     to: i64,
     /// Gap threshold in milliseconds, for the client to break the line on.
     gap_ms: i64,
     /// Width of one aggregation bucket, or absent for a raw series.
     bucket_ms: Option<i64>,
+    /// Unit and direction, for a probe series whose name is not one the page hardcodes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unit: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lower_is_better: Option<bool>,
     truncated: bool,
     points: Vec<queries::Point>,
 }
@@ -108,10 +126,44 @@ pub fn handle(req: &Req, reader: &Reader) -> Resp {
                     to,
                     gap_ms: gap_threshold_ms(&points),
                     bucket_ms: None,
+                    unit: None,
+                    lower_is_better: None,
                     truncated: points.len() >= limit,
                     points,
                 }),
                 Err(error) => Resp::error(500, &format!("series query failed: {error}")),
+            }
+        }
+        Requested::Probe(probe) => {
+            // Defaults to every run. Restricting to the uncontended subset is what makes two days
+            // comparable, but it is also what makes a busy week look like a week with no data, so the
+            // choice belongs to whoever is reading rather than to this endpoint.
+            let uncontended_only = req
+                .param("contended")
+                .is_some_and(|value| value == "exclude");
+            match queries::probe_series(
+                reader.conn(),
+                reader.machine_id(),
+                probe,
+                from,
+                to,
+                uncontended_only,
+            ) {
+                Ok(points) => Resp::json(&Series {
+                    metric: series.wire_name(),
+                    from,
+                    to,
+                    // Probes are far enough apart that a missed one is a real gap worth breaking the
+                    // line on, and the observed cadence is the only thing that knows the interval —
+                    // configuration can have changed several times across the range.
+                    gap_ms: gap_threshold_ms(&points),
+                    bucket_ms: None,
+                    unit: Some(probe.spec.unit),
+                    lower_is_better: Some(probe.spec.lower_is_better),
+                    truncated: false,
+                    points,
+                }),
+                Err(error) => Resp::error(500, &format!("probe series query failed: {error}")),
             }
         }
         Requested::Session(session) => {
@@ -134,6 +186,8 @@ pub fn handle(req: &Req, reader: &Reader) -> Resp {
                     // A bucket with no activity in it is a gap, not a zero: the agent was not working.
                     gap_ms: bucket.saturating_mul(GAP_FACTOR),
                     bucket_ms: Some(bucket),
+                    unit: None,
+                    lower_is_better: None,
                     truncated: false,
                     points,
                 }),
@@ -218,7 +272,7 @@ mod tests {
     }
 
     #[test]
-    fn both_families_of_series_are_recognised_and_advertised() {
+    fn every_family_of_series_is_recognised_and_advertised() {
         assert!(matches!(
             Requested::parse("cpu_percent"),
             Some(Requested::Sample(_))
@@ -227,11 +281,44 @@ mod tests {
             Requested::parse("tool_read_ms"),
             Some(Requested::Session(_))
         ));
+        assert!(matches!(
+            Requested::parse("probe:filesystem.small_file_ops_s"),
+            Some(Requested::Probe(_))
+        ));
+        assert!(matches!(
+            Requested::parse("bench:cpu.single_mops_s"),
+            Some(Requested::Probe(_))
+        ));
         assert!(Requested::parse("session_tools; DROP TABLE samples").is_none());
+        // A probe metric with no source prefix is not a series: it would have to pick one silently.
+        assert!(Requested::parse("filesystem.small_file_ops_s").is_none());
 
         let known = known_series();
-        assert!(known.contains(&"cpu_percent"));
-        assert!(known.contains(&"tool_read_ms"));
-        assert!(known.contains(&"first_response_ms"));
+        for expected in [
+            "cpu_percent",
+            "tool_read_ms",
+            "first_response_ms",
+            "probe:filesystem.small_file_ops_s",
+            "bench:filesystem.small_file_ops_s",
+        ] {
+            assert!(
+                known.contains(&expected.to_string()),
+                "{expected} should be advertised"
+            );
+        }
+    }
+
+    /// The wire name a request used is echoed back, so a client can tell which series it received.
+    #[test]
+    fn a_series_reports_the_name_it_was_asked_for() {
+        for name in [
+            "cpu_percent",
+            "tool_read_ms",
+            "probe:cpu.single_mops_s",
+            "bench:cpu.single_mops_s",
+        ] {
+            let requested = Requested::parse(name).expect(name);
+            assert_eq!(requested.wire_name(), name);
+        }
     }
 }

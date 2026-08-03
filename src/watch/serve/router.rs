@@ -81,7 +81,13 @@ mod tests {
     #[test]
     fn every_api_endpoint_answers_with_json() {
         let fixture = Fixture::new();
-        for target in ["/api/live", "/api/series?metric=cpu_percent", "/api/status"] {
+        for target in [
+            "/api/live",
+            "/api/series?metric=cpu_percent",
+            "/api/series?metric=probe:filesystem.small_file_ops_s",
+            "/api/series?metric=probe:filesystem.small_file_ops_s&contended=exclude",
+            "/api/status",
+        ] {
             let resp = fixture.get(target);
             assert_eq!(resp.status, 200, "{target} -> {}", body(&resp));
             assert!(
@@ -108,10 +114,108 @@ mod tests {
         assert!(live["sample"].is_null(), "{live}");
         assert!(live["machine_id"].as_str().is_some());
 
+        assert!(live["probe"].is_null(), "{live}");
+
         let status = fixture.json("/api/status");
         assert_eq!(status["health"]["samples"], 0);
+        assert_eq!(status["health"]["probe_runs"], 0);
+        assert_eq!(status["health"]["run_markers"], 0);
         assert_eq!(status["collecting"], false);
         assert!(status["sample_age_ms"].is_null());
+    }
+
+    /// A probe run travels through the real writer and comes back out of the real endpoints.
+    #[test]
+    fn a_probe_run_reaches_the_series_endpoint_and_the_live_tiles() {
+        let fixture = Fixture::new();
+        let now = crate::watch::store::now_ms();
+        let probe = |ts: i64, contended: bool, ops: f64| crate::watch::store::ProbeRun {
+            ts,
+            covariates: crate::watch::store::Covariates {
+                cpu_percent: Some(if contended { 90.0 } else { 4.0 }),
+                scanner_percent: Some(if contended { 30.0 } else { 0.1 }),
+                agent_active: false,
+                contended,
+                on_battery: Some(false),
+            },
+            metrics: vec![crate::watch::store::ProbeMetric {
+                name: "filesystem.small_file_ops_s".into(),
+                value: ops,
+                unit: "ops/s".into(),
+                lower_is_better: false,
+                source: crate::watch::store::MetricSource::Probe,
+            }],
+        };
+        assert!(
+            fixture
+                .store
+                .sink()
+                .send(probe(now - 2_000, false, 4_000.0))
+        );
+        assert!(fixture.store.sink().send(probe(now - 1_000, true, 800.0)));
+
+        let inventory = Inventory {
+            hostname_hash: "hash-router".into(),
+            ..Default::default()
+        };
+        let temp = fixture.close();
+        let store = Store::open(&temp.path().join("watch.db"), &inventory).unwrap();
+        let reader = store.reader().unwrap();
+        let json = |target: &str| -> Value {
+            let resp = route(&Req::parse(target), &reader);
+            assert_eq!(resp.status, 200, "{target}: {}", body(&resp));
+            serde_json::from_slice(&resp.body).unwrap()
+        };
+
+        let all = json("/api/series?metric=probe:filesystem.small_file_ops_s");
+        assert_eq!(all["points"].as_array().map(Vec::len), Some(2), "{all}");
+        assert_eq!(all["unit"], "ops/s", "the catalogue supplies the unit");
+        assert_eq!(all["lower_is_better"], false);
+
+        let clean = json("/api/series?metric=probe:filesystem.small_file_ops_s&contended=exclude");
+        let points = clean["points"].as_array().expect("points");
+        assert_eq!(points.len(), 1, "the contended run is excluded: {clean}");
+        assert_eq!(points[0]["value"].as_f64(), Some(4_000.0));
+
+        // The full-scale source is a different series and holds nothing.
+        let bench = json("/api/series?metric=bench:filesystem.small_file_ops_s");
+        assert!(bench["points"].as_array().expect("points").is_empty());
+
+        let live = json("/api/live");
+        assert_eq!(live["probe"]["contended"], true, "the newest run: {live}");
+        assert_eq!(live["probe"]["metrics"], 1);
+
+        let status = json("/api/status");
+        assert_eq!(status["health"]["probe_runs"], 2);
+        assert_eq!(status["health"]["probe_runs_clean"], 1);
+    }
+
+    /// A run marker goes in twice and stays one row, through the real writer.
+    #[test]
+    fn a_run_marker_is_recorded_once_and_counted() {
+        let fixture = Fixture::new();
+        let marker = |ended: Option<i64>| crate::watch::store::RunMarker {
+            run_id: "run-router".into(),
+            kind: "benchmark".into(),
+            preset: Some("quick".into()),
+            started: 1_700_000_000_000,
+            ended,
+            report_path: None,
+        };
+        assert!(fixture.store.sink().send(marker(None)));
+        assert!(fixture.store.sink().send(marker(Some(1_700_000_180_000))));
+
+        let inventory = Inventory {
+            hostname_hash: "hash-router".into(),
+            ..Default::default()
+        };
+        let temp = fixture.close();
+        let store = Store::open(&temp.path().join("watch.db"), &inventory).unwrap();
+        let reader = store.reader().unwrap();
+
+        let resp = route(&Req::parse("/api/status"), &reader);
+        let status: Value = serde_json::from_slice(&resp.body).unwrap();
+        assert_eq!(status["health"]["run_markers"], 1, "{status}");
     }
 
     #[test]

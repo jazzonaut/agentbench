@@ -156,6 +156,8 @@ mod tests {
             discovery_interval: Duration::from_secs(60),
             agent_process_names: vec!["\u{0}none\u{0}".into()],
             scanner_process_names: vec![],
+            probes_enabled: false,
+            probe_network: false,
             probe_interval: Duration::from_secs(900),
             scratch_dir: None,
         }

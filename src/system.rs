@@ -18,6 +18,16 @@ pub fn redact_text(value: &str) -> String {
     output
 }
 
+/// Stable, hashed identity of this machine.
+///
+/// Extracted so that a caller needing only the identity does not have to build a whole [`Inventory`],
+/// which enumerates every disk and spawns a child process to name the power source. [`inventory`] uses
+/// it too, so the two can never disagree about which machine a row belongs to — and they must not, since
+/// this value is the primary key of the dashboard's `machines` table.
+pub fn machine_id() -> String {
+    hash_private(System::host_name().unwrap_or_else(|| "unknown".into()))
+}
+
 pub fn inventory(elevated_requested: bool) -> Inventory {
     let mut system = System::new_all();
     system.refresh_all();
@@ -27,14 +37,13 @@ pub fn inventory(elevated_requested: bool) -> Inventory {
         .first()
         .map(|cpu| cpu.brand().trim().to_string())
         .unwrap_or_else(|| "unknown".into());
-    let hostname = System::host_name().unwrap_or_else(|| "unknown".into());
     let mut result = Inventory {
         os: System::name().unwrap_or_else(|| env::consts::OS.into()),
         os_version: System::long_os_version()
             .or_else(System::os_version)
             .unwrap_or_else(|| "unknown".into()),
         architecture: env::consts::ARCH.into(),
-        hostname_hash: hash_private(hostname),
+        hostname_hash: machine_id(),
         cpu,
         // An associated function since sysinfo 0.34: the physical count comes from the OS directly
         // and needs no refreshed `System`.

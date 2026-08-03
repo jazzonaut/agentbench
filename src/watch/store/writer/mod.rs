@@ -101,6 +101,8 @@ fn flush(conn: &mut Connection, machine_id: &str, batch: &mut Vec<Record>) -> Re
                 inserts::event(&tx, &event)?;
                 events_written = true;
             }
+            Record::ProbeRun(run) => inserts::probe_run(&tx, machine_id, &run)?,
+            Record::RunMarker(marker) => inserts::run_marker(&tx, machine_id, &marker)?,
             Record::Turn(turn) => inserts::turn(&tx, machine_id, &turn)?,
             Record::ToolCall(call) => inserts::tool_call(&tx, machine_id, &call)?,
             Record::ToolVersion(version) => inserts::tool_version(&tx, machine_id, &version)?,

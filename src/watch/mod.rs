@@ -9,6 +9,7 @@
 pub mod clock;
 pub mod collect;
 pub mod config;
+pub mod marker;
 pub mod platform;
 pub mod serve;
 pub mod store;
@@ -51,8 +52,7 @@ pub fn run(config: WatchConfig) -> Result<()> {
     let shutdown = supervisor.shutdown_flag();
     install_signal_handler(shutdown.clone());
 
-    // The sampler is polite: background CPU and I/O priority. Probes, in a later phase, will not be,
-    // because a throttled measurement measures the throttle.
+    // The sampler is polite: background CPU and I/O priority.
     let sampler_config = config.collect.clone();
     let sampler_sink = sink.clone();
     let sampler_shutdown = shutdown.clone();
@@ -60,6 +60,21 @@ pub fn run(config: WatchConfig) -> Result<()> {
         let clock = ShutdownClock::new(SystemClock, sampler_shutdown.clone());
         collect::sampler::run(&sampler_config, &clock, &sampler_sink);
     })?;
+
+    if config.collect.probes_enabled {
+        // `false`: the prober runs at normal priority, and that is load-bearing rather than an
+        // oversight. A throttled measurement measures the throttle, and on Unix the throttle cannot be
+        // lifted again without privileges — so a measured thread is *started* at normal priority and
+        // there is no restore function anywhere for anyone to reach for.
+        let prober_config = config.collect.clone();
+        let prober_sink = sink.clone();
+        let prober_shutdown = shutdown.clone();
+        let scratch_parent = config.data_dir.clone();
+        supervisor.spawn("prober", false, move || {
+            let clock = ShutdownClock::new(SystemClock, prober_shutdown.clone());
+            collect::probes::run(&prober_config, &scratch_parent, &clock, &prober_sink);
+        })?;
+    }
 
     if config.sessions.enabled {
         // Reading transcripts is free in the sense that matters: Claude Code has already written

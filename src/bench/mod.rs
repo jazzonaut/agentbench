@@ -45,6 +45,16 @@ const DEFAULT_LIVE_MINIMUM: Duration = Duration::from_secs(30);
 /// Headroom left before the preset duration limit when budgeting the live-LLM phase.
 const LIVE_PHASE_MARGIN: Duration = Duration::from_secs(10);
 
+/// Child processes launched by the process phase.
+///
+/// Not a preset knob: ten launches take well under a second on any machine, so scaling it per preset
+/// would change the numbers a preset reports without buying any more confidence in them. The workload
+/// takes it as a parameter for the background prober, which wants the same metric far more cheaply.
+const PROCESS_LAUNCHES: usize = 10;
+
+/// Bytes pushed through the loopback socket. Fixed for the same reason as [`PROCESS_LAUNCHES`].
+const LOOPBACK_BYTES: usize = 16 << 20;
+
 /// Run a benchmark, installing a Ctrl+C handler for cooperative cancellation.
 pub fn run(preset: Preset, target: &Path, options: BenchOptions) -> Result<Report> {
     let cancel = Arc::new(AtomicBool::new(false));
@@ -120,11 +130,11 @@ pub fn run_with_cancel(
     check_cancel(&cancel)?;
 
     phase(5, "Process launch benchmark");
-    metrics.extend(workloads::process::run()?);
+    metrics.extend(workloads::process::run(PROCESS_LAUNCHES)?);
     check_cancel(&cancel)?;
 
     phase(6, "Loopback/network benchmark");
-    metrics.extend(workloads::network::loopback()?);
+    metrics.extend(workloads::network::loopback(LOOPBACK_BYTES)?);
     check_cancel(&cancel)?;
 
     if !options.offline {

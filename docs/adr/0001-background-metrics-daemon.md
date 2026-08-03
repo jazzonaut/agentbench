@@ -157,8 +157,8 @@ machine look faster the more went wrong. On real data they are 3.3% of calls.
 | 0 | Prep refactor: split `bench.rs` into `bench/`, introduce `metrics/`. No behaviour change | **done** |
 | 1 | Spine: config, store with migrations, sampler, `events`, `--status`, one live tile and one chart | **done** |
 | 2 | Sessions: transcript parsing, derivation, watermarks, full backfill | **done** |
-| 3 | Probes: micro workloads, covariates, run markers | next |
-| 4 | Analysis: baseline, verdicts, annotations, rollup and retention | |
+| 3 | Probes: micro workloads, covariates, run markers | **done** |
+| 4 | Analysis: baseline, verdicts, annotations, rollup and retention | next |
 | 5 | Ship: README/CHANGELOG polish, autostart docs | mostly done in 1 |
 
 ### Deviations from the plan as executed
@@ -209,6 +209,85 @@ machine look faster the more went wrong. On real data they are 3.3% of calls.
   Left in, each daemon restart would have planted a phantom spike that phase 4's baselines would have
   averaged in. The sampler now takes and discards a throwaway reading, then waits at least
   `sysinfo::MINIMUM_CPU_UPDATE_INTERVAL` before recording.
+- **The probe drops the sequential *read*, and keeps only the write.** The design said "micro-scale
+  reuse of `bench` workloads" and budgeted 8 MiB of writes per probe. At 8 MiB the read pass comes
+  straight out of the OS page cache and reports memory bandwidth — thousands of MiB/s — under
+  `filesystem.sequential_read_mib_s`, a name that means disk throughput everywhere else in the tool.
+  Sizing past the cache instead would mean gigabytes of writes a day for one number. Shared metric
+  names are the point of reusing the workloads, so the honest move was to emit one fewer of them.
+- **Covariates are read once, before the workloads, and a two-reading version was built and reverted.**
+  The idea was sound on paper: read again afterwards, so that the closing CPU delta spans the measured
+  window and catches a machine clobbered half a second in. Run against a real daemon on an idle
+  sixteen-core machine, it tagged **17 of 24 runs contended**, because the delta it was computed from
+  contained the probe's own work. The same objection defeats every repair: excluding our own process tree
+  still leaves the scanner activity the probe's 200 file creates provoked, which is part of what the
+  probe measures rather than something it competed with. So the covariates are the opening reading and
+  nothing else. The cost is real and is documented in the type: something starting mid-probe is missed,
+  and the tag claims only "what this measurement began in".
+- **The contention thresholds are on two different scales, and getting that wrong was the second defect
+  this phase.** `global_cpu_usage()` is 0–100 across all cores; `process_tree::usage` sums
+  `Process::cpu_usage()`, which `sysinfo` reports as a percentage of *one* core, so a tree runs to
+  100 × cores. The first version used 40 for the machine, 2 for scanners and 1 for agents as though all
+  three were whole-machine figures. In practice 1% of one core is 0.06% of a sixteen-core machine, so
+  every idling `node` process — and the default `agent_process_names` matches all of them — counted as
+  contention. Real data showed the agent flag set on 6 of 8 runs on a machine doing nothing. The
+  thresholds are now named for their scale (`BUSY_MACHINE_PERCENT`, `BUSY_SCANNER_CORE_PERCENT`,
+  `AGENT_WORKING_CORE_PERCENT`) and set to 40, 10 and 20. The machine threshold still has to sit above
+  the probe's own footprint, since one core of eight already reads 12%.
+- **Both defects were found by running the daemon and reading `--status`, not by the tests.** Every unit
+  test passed throughout: they asserted the classification rule against invented numbers, and the rule was
+  fine. What was wrong was the numbers the rule was fed, which only a real machine produces. The lesson is
+  narrow and worth keeping: a threshold is not verified by a test that supplies its own inputs.
+- **Probe series are validated against the metric catalogue rather than a closed enum.** The passive and
+  session series each have a hand-written statement per series, so an enum is the natural guard. Probes
+  have one statement with the metric name as a bound parameter, and 18 catalogued metrics × 2 sources
+  would be 36 enum variants restating a list that already exists. The catalogue *is* the closed set. The
+  source prefix (`probe:` / `bench:`) is mandatory rather than defaulting to probes: a chart that
+  silently picked one scale is exactly the failure the `source` column exists to prevent.
+- **A probe records `p50` for a distribution, where a report records the mean.** `Metric::value` is the
+  mean, which is right in a report that prints p50, p95 and max beside it. `probe_metrics` has one
+  value column, and a single slow SQLite lookup out of a hundred must not become the fifteen-minute
+  reading. This follows `Metric::distribution`'s own percentile convention, so a p50 on a probe chart
+  and a p50 in a report mean the same thing.
+- **Run markers carry their own id, not the report's.** The design implied one identifier. The opening
+  write happens before any measurement, and the report's `run_id` does not exist until the run is over —
+  a primary key cannot be assigned retroactively. `report_path`, written at the closing end, is what
+  links a marker to the JSON it produced.
+- **Markers are written by `profile` and `experiment` too, not only `bench`.** Both load the machine for
+  minutes and put the same cliff in the passive series. Neither contributes metrics: a profile measures
+  somebody else's command and an experiment runs whatever its TOML said, so their numbers describe that
+  work rather than this machine's capability and have no business in a capability trend.
+- **A foreground run writes to the *default* data directory, never to a `--data-dir` the daemon was
+  started with.** A `bench` process has no way to discover where an unrelated process chose to keep its
+  database. It also never creates one, and never reports a failure to write: collecting is something a
+  user starts, and a message about a metrics database they may not know exists would be noise on the
+  output of a benchmark that succeeded.
+- **The marker writer refuses to migrate.** It may be an older binary than the one that created the
+  database, and upgrading a schema out from under a running daemon is how history that cannot be
+  regenerated gets corrupted. It checks `user_version`, writes in one short transaction under WAL and a
+  five-second busy timeout, and closes.
+- **A scratch directory that cannot be created is retried, not fatal.** The first implementation logged
+  the failure once and returned. That was actively worse than looping: the supervisor treats an early
+  return as a crash and restarts the worker after five seconds, so a permanently unwritable volume would
+  have logged the same failure seventeen thousand times a day and buried every other event. The prober
+  now prepares lazily inside its loop and keeps the handle once it succeeds, which also means a
+  reconnected removable volume resumes probing without a restart.
+- **Probe *scale* is deliberately not configurable, only the interval.** An interval is a preference. A
+  working set is the unit the measurement is expressed in, and letting it change would silently make
+  March's numbers incomparable to April's with nothing in the data to say so. The interval does get a
+  one-second floor, in the file and on the CLI flag alike, since back-to-back probing stops being
+  background collection.
+- **`platform::on_battery()` is a new capability and does not share code with `system::power_source`.**
+  They answer different questions under different budgets: the report's version names the source in prose
+  once per run and is free to spend a child process on it, whereas this one is asked immediately before a
+  measurement. Windows uses `GetSystemPowerStatus`, Linux reads sysfs, macOS spends a short `pmset`
+  because IOKit is the only alternative and it would mean a new dependency, and everything else reports
+  that it cannot tell. `None` is stored as SQL NULL and read back as unknown — never as "on mains",
+  because a laptop on battery runs a third slower for a reason that has nothing to do with degradation.
+- **`system::machine_id()` was extracted from `inventory`.** The marker writer needs the machine's
+  identity and nothing else, and building a whole `Inventory` for it enumerates every disk and spawns a
+  child process. The derivation now lives in one place, which it has to: that value is the primary key of
+  the `machines` table, and two spellings of it would silently split one machine's history in two.
 
 ### ratatui and the MSRV
 
@@ -237,7 +316,7 @@ test targets would only invite a failure the day a dev-dependency raises its own
 The general lesson is worth keeping: a version constraint that nothing executes is a guess with a
 number in it.
 
-### Open questions carried into phase 3
+### Open questions carried into phase 4
 
 - **Whether `agentbench top` or the `bench` progress display is rewritten first.** The progress display
   is currently a static text list where gauges and a sparkline would help most; `top` already works.
@@ -247,3 +326,23 @@ number in it.
 - **Whether subagent activity should be distinguishable from the session that spawned it.** Both are
   real work on this machine and both are imported, but a heavy workflow's tool calls currently blend
   into the parent project's numbers, and neither table records which is which.
+- **What a verdict does when the uncontended subset is too small.** Phase 3 collects the tag and phase 4
+  has to act on it. The accepted-costs section already says a verdict must report the sample count behind
+  each baseline and decline to compute a band from too few points, but "too few" is now a number someone
+  has to choose, and `--status` reports the clean count precisely so that choice can be made against real
+  data rather than guessed at.
+- **Whether run markers should suppress probes while a foreground run is in flight.** Today a probe that
+  lands during a `bench` run is collected and tagged contended by its own covariates, which is consistent
+  and costs nothing. The alternative — the marker telling the prober to skip — trades a correctly-tagged
+  data point for a hole, and would be the first piece of cross-process coordination in the design. Not
+  worth doing on suspicion; worth revisiting if the tags turn out not to catch it.
+- **Whether a probe should observe the machine *during* the measurement at all.** The opening reading
+  cannot see something that starts mid-probe, and the two-reading attempt above shows the naive fix is
+  worse than the gap. A per-process accounting that excluded the probe's own tree *and* attributed
+  scanner CPU to the probe's own file operations would be the real answer, and it is a considerable
+  amount of work for a case whose frequency nobody has measured yet.
+- **Whether `agent_process_names` should default to matching every `node` process.** It is what makes the
+  agent covariate fire on a developer machine most of the day, which is arguably correct and arguably
+  useless. The alternative is matching the Claude Code process specifically and accepting that other
+  agents go unattributed. Worth deciding with phase 4's baselines in hand, since the cost of the current
+  default is exactly "how small does the comparable subset get".

@@ -1,6 +1,8 @@
 // Dashboard boot: polls the API, renders the live tiles, the history chart, and daemon health.
 
-import { percent, gib, mib, count, duration, dateTime, latency, ratio } from './format.js';
+import {
+  percent, gib, mib, count, duration, dateTime, latency, ratio, unitFormatter,
+} from './format.js';
 import { createChart } from './chart.js';
 
 /** Live tiles refresh on this cadence; the server samples independently of it. */
@@ -24,21 +26,35 @@ const dom = {
   tiles: document.getElementById('tiles'),
   today: document.getElementById('today'),
   ranges: document.getElementById('ranges'),
+  uncontended: document.getElementById('uncontended'),
   statusLine: document.getElementById('status-line'),
   events: document.querySelector('#events tbody'),
 };
 
-/** Stacked charts, in reading order. Each owns one metric and one y-axis. */
+/** Stacked charts, in reading order. Each owns one metric and one y-axis.
+ *
+ *  A panel with no `format` derives one from the unit the server reports, which is how a probe series
+ *  named after a catalogue entry gets a correct axis without the page knowing what it measures.
+ */
 const CHARTS = [
   { id: 'chart-cpu', metric: 'cpu_percent', format: percent, label: 'system CPU' },
   { id: 'chart-tools', metric: 'tool_read_ms', format: latency, label: 'median latency' },
+  { id: 'chart-probe-fs', metric: 'probe:filesystem.small_file_ops_s', label: 'probe throughput' },
 ].map((config) => {
   const element = document.getElementById(config.id);
-  return {
+  const panel = {
     ...config,
-    chart: createChart(element, config.format, config.label),
+    unit: '',
     empty: document.querySelector(`[data-empty-for="${config.id}"]`),
   };
+  // The closure reads `panel.unit` on every call rather than capturing it, so the first response can
+  // supply the unit without the plot having to be rebuilt.
+  panel.chart = createChart(
+    element,
+    config.format ?? ((value) => unitFormatter(panel.unit)(value)),
+    config.label,
+  );
+  return panel;
 });
 
 /** Fetch JSON, surfacing the server's error message rather than a bare status code. */
@@ -64,6 +80,29 @@ function tile(value, label, absent = false) {
   return node;
 }
 
+/** The most recent controlled measurement, and whether it was worth anything.
+ *
+ *  A contended probe is not a bad probe — it is deliberately collected and deliberately excluded later —
+ *  so the tile says which it was rather than hiding it. Without that, a reader comparing the chart to the
+ *  tile would find numbers that disagree and no explanation.
+ */
+function probeTile(probe) {
+  if (!probe) {
+    return tile('No probes yet', 'the first runs after one probe interval', true);
+  }
+  const age = duration(Date.now() - probe.ts);
+  if (probe.contended) {
+    const because = probe.agent_active
+      ? 'an agent was working'
+      : probe.scanner_at !== null && probe.scanner_at > 0
+        ? 'a scanner was active'
+        : 'the machine was busy';
+    return tile(age, `since the last probe · contended, ${because}`);
+  }
+  const power = probe.on_battery === true ? ' · on battery' : '';
+  return tile(age, `since the last probe · uncontended${power}`);
+}
+
 function renderTiles(live) {
   const sample = live.sample;
   dom.tiles.replaceChildren();
@@ -86,6 +125,7 @@ function renderTiles(live) {
     sample.agent_cpu === null
       ? tile('not running', 'coding agent', true)
       : tile(percent(sample.agent_cpu), `agent CPU · ${mib(sample.agent_rss)} · ${count(sample.agent_processes)} proc`),
+    probeTile(live.probe),
   );
 }
 
@@ -138,7 +178,10 @@ function renderStatus(status) {
 
   const facts = [
     `${count(status.health.samples)} samples`,
-    `${count(status.health.probe_runs)} probes`,
+    // Both numbers, because the clean subset is what a baseline can actually use and on a busy week it
+    // is a small fraction of the total.
+    `${count(status.health.probe_runs_clean)}/${count(status.health.probe_runs)} clean probes`,
+    `${count(status.health.run_markers)} marked runs`,
     `${count(status.health.session_turns)} turns`,
     `${count(status.health.session_tools)} tool calls`,
     `${count(status.health.imported_files)} transcripts`,
@@ -209,11 +252,16 @@ async function loadLive() {
 async function loadHistory() {
   const to = Date.now();
   const from = to - selectedRange.ms;
+  // Only probe series carry contention, so the filter is appended only where it means something.
+  const contended = dom.uncontended.checked ? '&contended=exclude' : '';
   // Each chart loads independently, so one failing metric leaves the others readable.
   await Promise.all(
     CHARTS.map(async (panel) => {
+      const filter = panel.metric.includes(':') ? contended : '';
       try {
-        const series = await api(`/api/series?metric=${panel.metric}&from=${from}&to=${to}`);
+        const query = `metric=${encodeURIComponent(panel.metric)}&from=${from}&to=${to}${filter}`;
+        const series = await api(`/api/series?${query}`);
+        if (series.unit) panel.unit = series.unit;
         panel.chart.update(series.points, series.gap_ms);
         panel.empty.hidden = series.points.length > 0;
       } catch (error) {
@@ -225,6 +273,9 @@ async function loadHistory() {
 }
 
 renderRanges();
+// Toggling what a chart counts must redraw it immediately: waiting a minute for the next poll would
+// read as the filter having done nothing.
+dom.uncontended.addEventListener('change', () => void loadHistory());
 void loadLive();
 void loadHistory();
 setInterval(loadLive, LIVE_POLL_MS);

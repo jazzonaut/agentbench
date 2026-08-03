@@ -14,13 +14,17 @@ use std::{
 /// Endpoint used for the standalone HTTPS timing probe.
 const HTTPS_PROBE_URL: &str = "https://api.anthropic.com/";
 
-/// TCP connect latency and throughput over localhost.
+/// TCP connect latency and throughput over localhost, moving `bytes` through the socket.
 ///
 /// Exercises the OS network stack, memory copies, and scheduling without any internet variability.
-pub fn loopback() -> Result<Vec<Metric>> {
+///
+/// The volume is a parameter so the background prober can ask the same question far more cheaply.
+/// Connect latency barely depends on it — that is the number a loopback filter driver moves — whereas
+/// throughput is a memory-copy measurement that scales with the transfer and costs accordingly.
+pub fn loopback(bytes: usize) -> Result<Vec<Metric>> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let address = listener.local_addr()?;
-    let bytes = 16 << 20;
+    let bytes = bytes.max(64 << 10);
 
     let server = thread::spawn(move || -> std::io::Result<()> {
         let (mut stream, _) = listener.accept()?;

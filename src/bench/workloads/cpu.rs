@@ -12,7 +12,7 @@ use std::{
 /// Millions of xorshift iterations per second, single-threaded then saturated.
 pub fn run(seconds: u64, cancel: &Arc<AtomicBool>) -> Result<Vec<Metric>> {
     let duration = Duration::from_secs(seconds.max(1));
-    let single = spin(duration, cancel.clone());
+    let single = single_thread(duration, cancel);
     check_cancel(cancel)?;
 
     let workers = thread::available_parallelism()
@@ -29,10 +29,20 @@ pub fn run(seconds: u64, cancel: &Arc<AtomicBool>) -> Result<Vec<Metric>> {
     check_cancel(cancel)?;
 
     Ok(vec![
-        catalog::CPU_SINGLE_MOPS_S.scalar(single),
+        single,
         catalog::CPU_MULTI_MOPS_S.scalar(total),
         catalog::CPU_MULTI_ELAPSED_MS.scalar(started.elapsed().as_secs_f64() * 1000.0),
     ])
+}
+
+/// Single-thread throughput alone, over an arbitrary duration.
+///
+/// The background prober's entry point. It cannot call [`run`], because that saturates every logical
+/// processor: a probe is supposed to observe the machine four times an hour, not stall whatever the
+/// user is doing on it. Sharing `spin` is what makes the probe's number comparable to the benchmark's
+/// — same loop, same metric name, so a `diagnosis` threshold written for one applies to the other.
+pub fn single_thread(duration: Duration, cancel: &Arc<AtomicBool>) -> Metric {
+    catalog::CPU_SINGLE_MOPS_S.scalar(spin(duration, cancel.clone()))
 }
 
 /// Millions of iterations per second achieved by one thread over `duration`.

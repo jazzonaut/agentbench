@@ -8,9 +8,16 @@ use windows_sys::Win32::{
     Storage::FileSystem::{LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx},
     System::{
         IO::OVERLAPPED,
+        Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS},
         Threading::{GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN},
     },
 };
+
+/// `ACLineStatus` value meaning "running on battery".
+const AC_LINE_OFFLINE: u8 = 0;
+
+/// `ACLineStatus` value meaning "the system cannot tell".
+const AC_LINE_UNKNOWN: u8 = 255;
 
 pub(super) fn default_data_dir() -> Result<PathBuf> {
     if let Some(local) = env::var_os("LOCALAPPDATA") {
@@ -56,6 +63,23 @@ pub(super) fn try_lock_exclusive(file: &File) -> Result<bool> {
 /// Unix cannot and a capability that exists on one platform only would be a trap for the caller.
 pub(super) fn set_current_thread_background() -> Capability {
     apply(THREAD_MODE_BACKGROUND_BEGIN, "enter")
+}
+
+/// `GetSystemPowerStatus` is a single call into the power manager, cheap enough to ask immediately
+/// before a measurement. A desktop reports `AC_LINE_ONLINE`, which is the answer we want: not on
+/// battery.
+pub(super) fn on_battery() -> Option<bool> {
+    let mut status = SYSTEM_POWER_STATUS::default();
+    // SAFETY: `status` is a correctly sized, zeroed structure that the call may write to, and it
+    // outlives the call.
+    if unsafe { GetSystemPowerStatus(&mut status) } == 0 {
+        return None;
+    }
+    match status.ACLineStatus {
+        AC_LINE_OFFLINE => Some(true),
+        AC_LINE_UNKNOWN => None,
+        _ => Some(false),
+    }
 }
 
 fn apply(mode: i32, verb: &str) -> Capability {

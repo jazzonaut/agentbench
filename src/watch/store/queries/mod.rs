@@ -7,9 +7,11 @@
 //! series. What stays here is shared by both — the point type, the health roll-up, and the
 //! operational log.
 
+pub mod probes;
 pub mod samples;
 pub mod sessions;
 
+pub use probes::{LatestProbe, ProbeSeries, latest_run, probe_series};
 pub use samples::{Latest, SampleSeries, latest, series};
 pub use sessions::{SessionSeries, Today, session_series};
 
@@ -30,6 +32,13 @@ pub struct Point {
 pub struct Health {
     pub samples: i64,
     pub probe_runs: i64,
+    /// Probe runs that were not competing with anything, which is the subset a baseline can use.
+    ///
+    /// Reported beside the total because probing is ungated: on a busy week the comparable subset can be
+    /// a small fraction of the runs collected, and a verdict computed from four points should say so.
+    pub probe_runs_clean: i64,
+    /// Foreground runs recorded as having loaded this machine.
+    pub run_markers: i64,
     pub session_turns: i64,
     pub session_tools: i64,
     /// Transcripts with a recorded import position.
@@ -63,6 +72,10 @@ pub fn health(conn: &Connection, machine_id: &str) -> Result<Health> {
     Ok(Health {
         samples: count("SELECT count(*) FROM samples WHERE machine_id = ?1")?,
         probe_runs: count("SELECT count(*) FROM probe_runs WHERE machine_id = ?1")?,
+        probe_runs_clean: count(
+            "SELECT count(*) FROM probe_runs WHERE machine_id = ?1 AND contended = 0",
+        )?,
+        run_markers: count("SELECT count(*) FROM run_markers WHERE machine_id = ?1")?,
         session_turns: count("SELECT count(*) FROM session_turns WHERE machine_id = ?1")?,
         session_tools: count("SELECT count(*) FROM session_tools WHERE machine_id = ?1")?,
         imported_files: sessions::imported_files(conn)?,

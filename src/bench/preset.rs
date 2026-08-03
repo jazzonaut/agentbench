@@ -32,6 +32,14 @@ pub(crate) struct Limits {
 }
 
 impl Preset {
+    /// The preset's name as it appears in a report and in a dashboard run marker.
+    ///
+    /// Reads it off [`Limits`] rather than repeating the string, so a preset cannot be called one thing in
+    /// a report and another in the database that annotates it.
+    pub fn name(self) -> &'static str {
+        self.limits().name
+    }
+
     pub(crate) fn limits(self) -> Limits {
         match self {
             Self::Quick => Limits {

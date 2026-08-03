@@ -3,7 +3,9 @@
 //! Every function here runs inside the writer's transaction and is the only place a given table is
 //! written, so a table's conflict policy is stated once.
 
-use crate::watch::store::records::{Event, Sample, ToolCall, ToolVersion, Turn, Watermark};
+use crate::watch::store::records::{
+    Event, ProbeRun, RunMarker, Sample, ToolCall, ToolVersion, Turn, Watermark,
+};
 use anyhow::{Context, Result};
 use rusqlite::{Transaction, params};
 
@@ -36,6 +38,79 @@ pub fn sample(tx: &Transaction<'_>, machine_id: &str, sample: &Sample) -> Result
         sample.agent_processes.map(|count| count as i64),
     ])
     .context("insert sample")?;
+    Ok(())
+}
+
+/// One probe run and every metric it measured, in one transaction.
+///
+/// The run row goes in first because the metric rows reference its rowid, which SQLite only assigns on
+/// insert. This is the reason a [`ProbeRun`] carries its metrics rather than each metric arriving as its
+/// own record: nothing outside this function ever has to know the id, and a partial run cannot exist.
+///
+/// `INSERT OR REPLACE` on the metrics because `(run_id, name, source)` is the primary key and a
+/// workload that somehow emitted a name twice should leave one row rather than fail the batch — losing
+/// the whole run over a duplicate would discard the covariates too.
+pub fn probe_run(tx: &Transaction<'_>, machine_id: &str, run: &ProbeRun) -> Result<()> {
+    tx.prepare_cached(
+        "INSERT INTO probe_runs (machine_id, ts, contended, cpu_at, scanner_at, agent_active,
+             on_battery)
+         VALUES (?1,?2,?3,?4,?5,?6,?7)",
+    )?
+    .execute(params![
+        machine_id,
+        run.ts,
+        run.covariates.contended as i64,
+        run.covariates.cpu_percent,
+        run.covariates.scanner_percent,
+        run.covariates.agent_active as i64,
+        run.covariates.on_battery.map(|value| value as i64),
+    ])
+    .context("insert probe run")?;
+    let run_id = tx.last_insert_rowid();
+
+    let mut insert = tx.prepare_cached(
+        "INSERT OR REPLACE INTO probe_metrics (run_id, name, value, unit, lower_is_better, source)
+         VALUES (?1,?2,?3,?4,?5,?6)",
+    )?;
+    for metric in &run.metrics {
+        insert
+            .execute(params![
+                run_id,
+                metric.name,
+                metric.value,
+                metric.unit,
+                metric.lower_is_better as i64,
+                metric.source.as_str(),
+            ])
+            .with_context(|| format!("insert probe metric {}", metric.name))?;
+    }
+    Ok(())
+}
+
+/// A foreground run's marker, written once when it starts and again when it ends.
+///
+/// The upsert is what makes two writes one row. Only the closing fields are overwritten: a second
+/// write must not move `started`, or a run that took four minutes would be recorded as instantaneous.
+/// `ended` and `report_path` use `coalesce` so the opening write's `NULL` cannot erase a value the
+/// closing write already supplied out of order.
+pub fn run_marker(tx: &Transaction<'_>, machine_id: &str, marker: &RunMarker) -> Result<()> {
+    tx.prepare_cached(
+        "INSERT INTO run_markers (run_id, machine_id, kind, preset, started, ended, report_path)
+         VALUES (?1,?2,?3,?4,?5,?6,?7)
+         ON CONFLICT(run_id) DO UPDATE SET
+             ended = coalesce(excluded.ended, ended),
+             report_path = coalesce(excluded.report_path, report_path)",
+    )?
+    .execute(params![
+        marker.run_id,
+        machine_id,
+        marker.kind,
+        marker.preset,
+        marker.started,
+        marker.ended,
+        marker.report_path,
+    ])
+    .context("insert run marker")?;
     Ok(())
 }
 

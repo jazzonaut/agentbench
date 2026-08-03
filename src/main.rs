@@ -66,6 +66,12 @@ enum Command {
         /// Override the probe interval, e.g. 15m.
         #[arg(long)]
         probe_interval: Option<String>,
+        /// Do not run the controlled micro-workload. Collection stays passive.
+        #[arg(long)]
+        no_probes: bool,
+        /// Do not make the probe's outbound HTTPS timing request.
+        #[arg(long)]
+        no_probe_network: bool,
         /// Do not read Claude Code transcripts.
         #[arg(long)]
         no_sessions: bool,
@@ -191,6 +197,10 @@ fn main() -> Result<()> {
             options.llm_cost_cap_usd = llm_cost_cap_usd;
             options.headroom_port = headroom_port;
             let use_tui = !no_tui && crossterm::tty::IsTty::is_tty(&std::io::stdout());
+            // Marked before the load starts and again after the report is written, so an interrupted run
+            // still explains the cliff it left in the dashboard's passive series. Silently a no-op when
+            // no dashboard database exists, which is the common case.
+            let marking = mark_run("benchmark", Some(preset.name()));
             let completed = if use_tui {
                 let tui_options = options.clone();
                 let run =
@@ -200,6 +210,11 @@ fn main() -> Result<()> {
                 bench::run(preset, &target_dir, options)?
             };
             let paths = report::write_report(&completed, output.as_deref())?;
+            marking.finish(
+                watch::store::now_ms(),
+                paths.json.to_str(),
+                &completed.metrics,
+            );
             println!(
                 "JSON: {}\nSummary: {}",
                 paths.json.display(),
@@ -213,6 +228,8 @@ fn main() -> Result<()> {
             sample_interval,
             sample_interval_idle,
             probe_interval,
+            no_probes,
+            no_probe_network,
             no_sessions,
             sessions_root,
             status,
@@ -236,6 +253,8 @@ fn main() -> Result<()> {
                     sample_interval,
                     sample_interval_idle,
                     probe_interval,
+                    no_probes,
+                    no_probe_network,
                     no_sessions,
                     sessions_root,
                     status,
@@ -255,6 +274,7 @@ fn main() -> Result<()> {
             output,
             command,
         } => {
+            let marking = mark_run("profile", None);
             let completed = profile::run_report(
                 &label,
                 &command,
@@ -263,6 +283,9 @@ fn main() -> Result<()> {
                 elevated,
             )?;
             let paths = report::write_report(&completed, output.as_deref())?;
+            // No metrics: a profile measures somebody else's command, so its numbers describe that
+            // command rather than this machine and have no business in a capability trend.
+            marking.finish(watch::store::now_ms(), paths.json.to_str(), &[]);
             println!(
                 "JSON: {}\nSummary: {}",
                 paths.json.display(),
@@ -274,8 +297,11 @@ fn main() -> Result<()> {
             elevated,
             output,
         } => {
+            let marking = mark_run("experiment", None);
             let completed = experiment::run(&config, elevated)?;
             let paths = report::write_report(&completed, output.as_deref())?;
+            // Also no metrics, for the same reason: an experiment's cases are whatever the TOML said.
+            marking.finish(watch::store::now_ms(), paths.json.to_str(), &[]);
             println!(
                 "JSON: {}\nSummary: {}",
                 paths.json.display(),
@@ -292,6 +318,21 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Start marking a foreground run in the dashboard database, if one exists.
+///
+/// Every command that loads this machine calls this, because every one of them puts a cliff in the passive
+/// series that a later baseline would otherwise average in as degradation. A machine with no dashboard
+/// gets a no-op that says nothing and costs nothing.
+fn mark_run(kind: &str, preset: Option<&str>) -> watch::marker::Marking {
+    watch::marker::Marking::begin(
+        None,
+        &uuid::Uuid::new_v4().to_string(),
+        kind,
+        preset,
+        watch::store::now_ms(),
+    )
+}
+
 /// Everything `dashboard` accepts that is not the deprecated TUI form.
 ///
 /// Grouped rather than passed positionally: nine parameters of which four are `Option<String>` is a
@@ -303,6 +344,8 @@ struct DashboardArgs {
     sample_interval: Option<String>,
     sample_interval_idle: Option<String>,
     probe_interval: Option<String>,
+    no_probes: bool,
+    no_probe_network: bool,
     no_sessions: bool,
     sessions_root: Vec<PathBuf>,
     status: bool,
@@ -317,6 +360,8 @@ fn run_dashboard(args: DashboardArgs) -> Result<()> {
         sample_interval,
         sample_interval_idle,
         probe_interval,
+        no_probes,
+        no_probe_network,
         no_sessions,
         sessions_root,
         status,
@@ -327,6 +372,12 @@ fn run_dashboard(args: DashboardArgs) -> Result<()> {
     }
     if no_serve {
         config.server.enabled = false;
+    }
+    if no_probes {
+        config.collect.probes_enabled = false;
+    }
+    if no_probe_network {
+        config.collect.probe_network = false;
     }
     if no_sessions {
         config.sessions.enabled = false;
@@ -352,8 +403,11 @@ fn run_dashboard(args: DashboardArgs) -> Result<()> {
         config.collect.sample_interval_idle = idle.max(config.collect.sample_interval);
     }
     if let Some(value) = probe_interval {
-        config.collect.probe_interval =
-            watch::config::parse_duration(&value).context("--probe-interval")?;
+        // Clamped to the configuration's floor for the same reason the file is: a probe is real load, and
+        // back-to-back probing stops being background collection.
+        config.collect.probe_interval = watch::config::parse_duration(&value)
+            .context("--probe-interval")?
+            .max(watch::config::SHORTEST_PROBE);
     }
 
     if status {
@@ -385,12 +439,17 @@ fn print_status(config: &watch::WatchConfig) -> Result<()> {
     );
     println!("Last sample:    {age}");
     println!(
-        "Rows:           {} samples, {} probe runs, {} session turns, {} tool calls",
-        status.health.samples,
-        status.health.probe_runs,
-        status.health.session_turns,
-        status.health.session_tools
+        "Rows:           {} samples, {} session turns, {} tool calls",
+        status.health.samples, status.health.session_turns, status.health.session_tools
     );
+    // The clean count is reported beside the total because probing is ungated: on a busy week the
+    // comparable subset can be a small fraction of what was collected, and that is the number a baseline
+    // will actually have to work with.
+    println!(
+        "Probes:         {} runs, {} uncontended",
+        status.health.probe_runs, status.health.probe_runs_clean
+    );
+    println!("Marked runs:    {}", status.health.run_markers);
     println!("Transcripts:    {} imported", status.health.imported_files);
     println!("Import errors:  {}", status.health.import_errors);
     println!("Schema version: {}", status.health.schema_version);

@@ -31,7 +31,8 @@ pub struct Status {
     /// Whether collection appears to be running.
     pub collecting: bool,
     pub health: queries::Health,
-    pub series: Vec<&'static str>,
+    /// Every series name the dashboard may request, including the prefixed probe family.
+    pub series: Vec<String>,
     pub events: Vec<queries::EventRow>,
 }
 

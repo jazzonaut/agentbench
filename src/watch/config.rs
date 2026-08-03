@@ -17,6 +17,12 @@ use std::{
 /// Name of the configuration file inside the data directory.
 pub const CONFIG_FILE: &str = "watch.toml";
 
+/// Name of the SQLite database inside the data directory.
+///
+/// Public because a foreground run looks for an existing database to write a marker into, and two places
+/// spelling the same file name is how one of them ends up writing to a file nothing reads.
+pub const DATABASE_FILE: &str = "watch.db";
+
 /// Default HTTP port for the dashboard.
 pub const DEFAULT_PORT: u16 = 7878;
 
@@ -30,6 +36,16 @@ pub const IDLE_INTERVAL_RATIO: u32 = 6;
 ///
 /// A pass stats every transcript, so polling in a tight loop would turn a free stream into a busy one.
 const SHORTEST_POLL: Duration = Duration::from_secs(1);
+
+/// Floor on the probe interval.
+///
+/// A probe is a second and a half of real load. Back-to-back probing would stop being background
+/// collection and start being a benchmark that never ends, so the shortest interval accepted is one
+/// second — short enough for a test to drive the loop, long enough that the floor is a floor.
+///
+/// Public because the CLI override has to apply the same floor. A flag that could go below the file's
+/// minimum would make the minimum decorative.
+pub const SHORTEST_PROBE: Duration = Duration::from_secs(1);
 
 /// Validated daemon configuration.
 #[derive(Debug, Clone)]
@@ -63,7 +79,21 @@ pub struct CollectConfig {
     pub agent_process_names: Vec<String>,
     /// Substrings identifying security scanners whose activity is worth correlating against.
     pub scanner_process_names: Vec<String>,
-    /// Interval between probe runs. Stored now; used from phase 3.
+    /// Whether the controlled micro-workload runs at all.
+    ///
+    /// The one collector that costs the machine anything, so it gets a single switch rather than a
+    /// search through the code. Turning it off leaves the passive and session streams intact and gives
+    /// up the ability to tell "the disk got slower" from "the disk got busier".
+    pub probes_enabled: bool,
+    /// Whether a probe includes one outbound HTTPS timing request.
+    ///
+    /// Separate from [`probes_enabled`] because it is the only part of the daemon that leaves the
+    /// machine. The request carries no prompt and no credentials and costs nothing, but a tool that
+    /// otherwise uploads nothing owes the user a switch for 96 outbound requests a day.
+    ///
+    /// [`probes_enabled`]: CollectConfig::probes_enabled
+    pub probe_network: bool,
+    /// Interval between probe runs.
     pub probe_interval: Duration,
     /// Directory probes write to. Must sit on the volume whose performance matters.
     pub scratch_dir: Option<PathBuf>,
@@ -98,7 +128,7 @@ pub struct AnalysisConfig {
 impl WatchConfig {
     /// Path of the SQLite database.
     pub fn database_path(&self) -> PathBuf {
-        self.data_dir.join("watch.db")
+        self.data_dir.join(DATABASE_FILE)
     }
 
     /// Path of the single-instance lock file.
@@ -193,6 +223,13 @@ scanner_process_names = [
     "msmpeng", "windefend", "sophos", "crowdstrike",
     "sentinelone", "clamd", "eset", "avast", "avg",
 ]
+# The controlled micro-workload: ~1.5s of real work per run, which is what makes a day-over-day
+# number comparable. Without it the dashboard cannot tell a slower disk from a busier one.
+probes_enabled = true
+# Each probe makes one HTTPS request to api.anthropic.com to time the round trip. No prompt, no
+# credentials, no cost — but it is the only part of the daemon that leaves this machine, so it has
+# its own switch. Roughly 96 requests a day at the default interval.
+probe_network = true
 probe_interval = "15m"
 # Probes must run on the volume whose performance matters. Defaults to the data directory.
 # scratch_dir = "D:/Stuff/.agentbench-scratch"
@@ -247,6 +284,8 @@ struct FileCollect {
     discovery_interval: Option<String>,
     agent_process_names: Option<Vec<String>>,
     scanner_process_names: Option<Vec<String>>,
+    probes_enabled: Option<bool>,
+    probe_network: Option<bool>,
     probe_interval: Option<String>,
     scratch_dir: Option<String>,
 }
@@ -312,7 +351,9 @@ impl FileConfig {
                     .collect
                     .scanner_process_names
                     .unwrap_or_else(default_scanner_names),
-                probe_interval: interval(self.collect.probe_interval, "15m")?,
+                probes_enabled: self.collect.probes_enabled.unwrap_or(true),
+                probe_network: self.collect.probe_network.unwrap_or(true),
+                probe_interval: interval(self.collect.probe_interval, "15m")?.max(SHORTEST_PROBE),
                 scratch_dir: self.collect.scratch_dir.as_deref().map(expand_home),
             },
             sessions: SessionsConfig {
@@ -406,6 +447,8 @@ mod tests {
         assert_eq!(config.collect.sample_interval, Duration::from_secs(5));
         assert_eq!(config.collect.sample_interval_idle, Duration::from_secs(30));
         assert_eq!(config.collect.probe_interval, Duration::from_secs(900));
+        assert!(config.collect.probes_enabled);
+        assert!(config.collect.probe_network);
         assert_eq!(config.retention.samples_raw_days, 14);
         assert_eq!(config.analysis.baseline_window_days, 7);
         assert!(
@@ -443,6 +486,26 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("must not be shorter"), "{error}");
+    }
+
+    /// A probe is real load, so an interval short enough to make probing continuous is clamped rather
+    /// than honoured. It is clamped rather than rejected because the value is a preference, not a claim
+    /// about the data, and refusing to start over one would be worse than collecting slightly less often
+    /// than asked.
+    #[test]
+    fn an_absurdly_short_probe_interval_is_clamped_to_the_floor() {
+        let file: FileConfig = toml::from_str("[collect]\nprobe_interval = \"10ms\"\n").unwrap();
+        let config = file.resolve(PathBuf::from("/tmp/agentbench")).unwrap();
+        assert_eq!(config.collect.probe_interval, SHORTEST_PROBE);
+    }
+
+    /// The outbound request is switchable independently of probing itself.
+    #[test]
+    fn the_network_probe_can_be_switched_off_without_switching_off_probing() {
+        let file: FileConfig = toml::from_str("[collect]\nprobe_network = false\n").unwrap();
+        let config = file.resolve(PathBuf::from("/tmp/agentbench")).unwrap();
+        assert!(config.collect.probes_enabled);
+        assert!(!config.collect.probe_network);
     }
 
     #[test]

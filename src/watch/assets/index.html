@@ -93,7 +93,12 @@
   .card-title { font-size: 13px; font-weight: 600; }
   .card-note { color: var(--ink-muted); font-size: 11px; }
 
-  .ranges { display: flex; gap: 6px; margin-bottom: 10px; }
+  .controls { display: flex; align-items: center; flex-wrap: wrap; gap: 14px; margin-bottom: 10px; }
+  .ranges { display: flex; gap: 6px; }
+  /* A filter that changes what a chart means gets a label, not just a box. */
+  .filter { display: flex; align-items: center; gap: 6px; color: var(--ink-secondary); font-size: 12px; }
+  .filter input { width: 15px; height: 15px; accent-color: var(--series-1); }
+  .filter:focus-within { outline: 2px solid var(--series-1); outline-offset: 3px; border-radius: 4px; }
   .ranges button {
     font: inherit;
     font-size: 12px;
@@ -149,7 +154,13 @@
 
   <section aria-labelledby="history-heading">
     <h2 id="history-heading">History</h2>
-    <div class="ranges" id="ranges" role="group" aria-label="Time range"></div>
+    <div class="controls">
+      <div class="ranges" id="ranges" role="group" aria-label="Time range"></div>
+      <label class="filter" for="uncontended">
+        <input type="checkbox" id="uncontended" checked>
+        Uncontended probes only
+      </label>
+    </div>
     <!-- Stacked frames sharing one cursor: hovering either reads the same instant in both. -->
     <div class="card">
       <div class="card-head">
@@ -169,6 +180,18 @@
       <div id="chart-tools"></div>
       <p class="empty" data-empty-for="chart-tools" hidden>
         No tool calls in this range. Transcripts are imported on startup and every 30 seconds.
+      </p>
+    </div>
+    <div class="card">
+      <div class="card-head">
+        <span class="card-title">Probe: small-file operations</span>
+        <!-- The scale is stated because these values are not comparable to a bench report's, which
+             runs the same workload over 5,000 files. -->
+        <span class="card-note">controlled workload · 200 files · not comparable to a bench report</span>
+      </div>
+      <div id="chart-probe-fs"></div>
+      <p class="empty" data-empty-for="chart-probe-fs" hidden>
+        No probes in this range yet. The first one runs once a full probe interval has elapsed.
       </p>
     </div>
   </section>

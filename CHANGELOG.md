@@ -19,11 +19,35 @@ All notable changes to AgentBench are documented here. The project follows [Sema
   cursor shared across both charts so a slow afternoon can be read down a single vertical line.
 - A "Today" summary on the dashboard: requests, tool calls, sessions, projects, output tokens, cache
   hit rate and median file-tool latency, counted since local midnight.
-- `agentbench dashboard --status` for checking collection health, row counts, imported transcripts,
-  and recent daemon events without starting anything.
+- Background capability probes: a controlled micro-workload every 15 minutes — single-thread CPU,
+  memory bandwidth, an 8 MiB sequential write, 200 small-file operations, 2,000 SQLite rows, five
+  process launches, loopback TCP, and one HTTPS round trip — costing about 0.17% of the machine. They
+  reuse the `bench` workload functions at micro scale and emit the same metric names, so a threshold
+  written once applies to both. Probe and benchmark values are stored side by side under different
+  sources and are never averaged together: the same workload over 200 files and over 5,000 answers the
+  same question at scales two orders of magnitude apart.
+- Every probe is stamped with what the machine was competing with — CPU, security-scanner CPU, whether
+  a coding agent was working, and whether the machine is on battery — read both immediately before and
+  immediately after the measurement, so a probe clobbered halfway through is not filed as a clean one.
+  Probing is never gated on an idle machine; contention is recorded at collection time and excluded at
+  analysis time, which is what the dashboard's "uncontended probes only" filter does.
+- A probe chart on the dashboard and a tile reporting when the last probe ran and whether it was
+  contended, sharing the cursor with the system and tool-latency charts.
+- Run markers: `bench`, `profile` and `experiment` record when they started and finished in the
+  dashboard database, so the cliff a three-minute benchmark puts in the passive series is explained
+  rather than mistaken for a machine getting slower. A benchmark also contributes its metrics, under
+  the same names as the probes and a `bench` source. Entirely silent and entirely optional — nothing
+  creates a database, so a machine that has never started the dashboard is unaffected.
+- `agentbench dashboard --status` for checking collection health, row counts, probe runs and how many
+  of them were uncontended, marked runs, imported transcripts, and recent daemon events without
+  starting anything.
 - `watch.toml` configuration, written with commented defaults on first run, overridable per run by
   `--port`, `--data-dir`, `--no-serve`, `--sample-interval`, `--sample-interval-idle`,
-  `--probe-interval`, `--no-sessions`, and `--sessions-root`.
+  `--probe-interval`, `--no-probes`, `--no-probe-network`, `--no-sessions`, and `--sessions-root`.
+- The probe's one outbound request — an HTTPS round trip to `api.anthropic.com`, no prompt, no
+  credentials, no cost — has its own switch, `probe_network` / `--no-probe-network`. It is the only
+  part of the daemon that leaves the machine, and 96 requests a day in a tool that otherwise uploads
+  nothing is worth being able to turn off on its own.
 - Single-instance locking so two collectors cannot double-count the same machine.
 - `docs/adr/` recording architectural decisions and their rejected alternatives.
 
@@ -47,6 +71,10 @@ All notable changes to AgentBench are documented here. The project follows [Sema
   reports remain comparable.
 - `bench` internals split into `bench/` with one module per workload, so a workload can be reused
   independently of a preset. No change to emitted metrics.
+- The CPU, process-launch and loopback workloads take their scale as a parameter, so the background
+  prober can ask the same questions far more cheaply — one core for 200 ms instead of every core for
+  five seconds, five child processes instead of ten, 1 MiB through the socket instead of 16. The
+  benchmark's own numbers are unchanged.
 - Metric names, units, directions, and descriptions consolidated into a single `metrics` catalog,
   replacing string literals duplicated across benchmarking, comparison, and diagnosis.
 - Process-tree selection and resource aggregation consolidated into one `process_tree` module,

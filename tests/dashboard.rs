@@ -31,8 +31,24 @@ impl Daemon {
     ///
     /// What most tests want: the transcript directory of whoever runs the suite is somebody's real
     /// work, not a fixture, and importing hundreds of megabytes of it would be both slow and rude.
+    ///
+    /// Probing is off too. It is a second of real CPU and disk work every interval, which on a shared
+    /// runner would slow every other test in the suite for no benefit to any of them; the one test that
+    /// wants probes asks for them.
     fn start(extra: &[&str]) -> Self {
-        Self::spawn(extra, &["--no-sessions"])
+        Self::spawn(extra, &["--no-sessions", "--no-probes"])
+    }
+
+    /// Start probing on the shortest permitted interval, with no outbound requests.
+    ///
+    /// `--no-probe-network` is not politeness — it is what keeps the test from depending on the internet,
+    /// and therefore from failing on a runner with no egress for reasons that have nothing to do with the
+    /// code under test.
+    fn start_probing() -> Self {
+        Self::spawn(
+            &["--probe-interval", "1s", "--no-probe-network"],
+            &["--no-sessions"],
+        )
     }
 
     /// Start importing transcripts from `root`, and from nowhere else.
@@ -150,6 +166,15 @@ impl Drop for Daemon {
     }
 }
 
+/// A short-lived command for `profile` to launch.
+///
+/// The test binary's own executable, so the test depends on nothing being installed and the child exits
+/// immediately. `profile` needs a real process to time; what it does is irrelevant here, since these tests
+/// are about the marker written around it.
+fn profiled_command() -> std::path::PathBuf {
+    assert_cmd::cargo::cargo_bin("agentbench")
+}
+
 /// Ask the OS for an unused port by binding and immediately releasing one.
 fn free_port() -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
@@ -256,6 +281,80 @@ fn the_daemon_collects_serves_and_shuts_down_cleanly() {
     }
 }
 
+/// The probe stream end to end: a controlled workload becomes a chart, a tile, and a covariate.
+///
+/// This is the one test that lets the daemon actually load the machine, because nothing cheaper proves the
+/// part that matters — that the workloads run on real files, the covariates are read either side of them,
+/// the metrics reach the database under names the catalogue knows, and the scratch directory is left clean
+/// for the next run.
+#[test]
+fn probes_run_are_charted_and_carry_their_covariates() {
+    let daemon = Daemon::start_probing();
+    daemon.wait_until_listening();
+
+    let status = daemon.wait_for_status("a probe is recorded", |status| {
+        status["health"]["probe_runs"].as_i64().unwrap_or(0) > 0
+    });
+    assert!(
+        status["series"].as_array().is_some_and(|series| series
+            .iter()
+            .any(|name| name == "probe:filesystem.small_file_ops_s")),
+        "the probe family should be advertised: {status}"
+    );
+
+    // The live tile's payload: a real measurement with real covariates.
+    let live: serde_json::Value =
+        serde_json::from_str(&daemon.get("/api/live")).expect("live json");
+    let probe = &live["probe"];
+    assert!(probe["ts"].as_i64().is_some(), "{live}");
+    assert!(
+        probe["cpu_at"].as_f64().is_some(),
+        "a probe must say what it was competing with: {live}"
+    );
+    assert!(
+        probe["metrics"].as_i64().unwrap_or(0) >= 4,
+        "a probe should record several measurements: {live}"
+    );
+
+    // A metric the probe genuinely runs, under the name the benchmark uses for the same workload.
+    let series: serde_json::Value =
+        serde_json::from_str(&daemon.get("/api/series?metric=probe:filesystem.small_file_ops_s"))
+            .expect("series json");
+    assert_eq!(series["unit"], "ops/s", "{series}");
+    assert_eq!(series["lower_is_better"], false, "{series}");
+    let points = series["points"].as_array().expect("points array");
+    assert!(!points.is_empty(), "{series}");
+    assert!(
+        points
+            .iter()
+            .all(|point| point["value"].as_f64().is_some_and(|value| value > 0.0)),
+        "every probe should have measured something: {series}"
+    );
+
+    // A metric the probe deliberately does not run: an 8 MiB read is page cache, not disk.
+    let cached: serde_json::Value = serde_json::from_str(
+        &daemon.get("/api/series?metric=probe:filesystem.sequential_read_mib_s"),
+    )
+    .expect("series json");
+    assert!(
+        cached["points"].as_array().expect("points").is_empty(),
+        "the cached read must not be recorded: {cached}"
+    );
+
+    // Probes write beside the database by default, which is the point: the volume measured is the one the
+    // user chose for the data directory rather than whatever `%TEMP%` happens to be on.
+    //
+    // What is deliberately not asserted here is that the directory is empty. This daemon is killed at an
+    // arbitrary instant and probes run back to back at the interval the test asked for, so a kill landing
+    // mid-workload legitimately leaves files behind. That the *prober* cleans up after itself is a unit
+    // test, where the boundary is a function return rather than a signal.
+    let data_dir = daemon.stop();
+    assert!(
+        data_dir.path().join("probe-scratch").is_dir(),
+        "probes should write inside the data directory"
+    );
+}
+
 /// The session stream end to end: a transcript on disk becomes a chart and a tile.
 #[test]
 fn transcripts_are_imported_charted_and_summarised() {
@@ -340,6 +439,80 @@ fn transcripts_are_imported_charted_and_summarised() {
         status["health"]["session_turns"].as_i64(),
         Some(1),
         "{status}"
+    );
+}
+
+/// A foreground run annotates the dashboard, and does so without a daemon needing to be up.
+///
+/// Run through `profile` rather than `bench` on purpose: a benchmark takes minutes and saturates the
+/// runner, whereas this exercises the identical marker path — `mark_run` before, `finish` after — in about
+/// a second. `--status` is then the assertion, so the test reads the same payload a user would.
+#[test]
+fn a_foreground_run_marks_itself_in_an_existing_dashboard_database() {
+    // A database has to exist first, and only the daemon creates one: a foreground run must never bring
+    // a metrics database into being as a side effect.
+    let daemon = Daemon::start(&[]);
+    daemon.wait_until_listening();
+    daemon.wait_for_status("the database is written", |status| {
+        status["health"]["samples"].as_i64().unwrap_or(0) > 0
+    });
+    let data_dir = daemon.stop();
+
+    let reports = tempfile::tempdir().expect("temp reports dir");
+    let output = Command::cargo_bin("agentbench")
+        .expect("built binary")
+        // The marker resolves the per-user data directory, and this is the override that redirects it.
+        .env("AGENTBENCH_DATA_DIR", data_dir.path())
+        .args(["profile", "--label", "marker-test", "--output"])
+        .arg(reports.path().join("profile.json"))
+        .arg("--")
+        .arg(profiled_command())
+        .arg("--version")
+        .output()
+        .expect("run profile");
+    assert!(
+        output.status.success(),
+        "profile failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output = Command::cargo_bin("agentbench")
+        .expect("built binary")
+        .args(["dashboard", "--status", "--data-dir"])
+        .arg(data_dir.path())
+        .output()
+        .expect("run status");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    assert!(
+        stdout.contains("Marked runs:    1"),
+        "the run should be marked once, not twice: {stdout}"
+    );
+}
+
+/// The common case: no dashboard database, so a foreground run must not create one.
+#[test]
+fn a_foreground_run_does_not_create_a_dashboard_database() {
+    let data_dir = tempfile::tempdir().expect("temp dir");
+    let reports = tempfile::tempdir().expect("temp reports dir");
+    let output = Command::cargo_bin("agentbench")
+        .expect("built binary")
+        .env("AGENTBENCH_DATA_DIR", data_dir.path())
+        .args(["profile", "--label", "no-dashboard", "--output"])
+        .arg(reports.path().join("profile.json"))
+        .arg("--")
+        .arg(profiled_command())
+        .arg("--version")
+        .output()
+        .expect("run profile");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !data_dir.path().join("watch.db").exists(),
+        "collecting is something the user starts, not something a profile run decides for them"
     );
 }
 

@@ -88,6 +88,21 @@ pub fn set_current_thread_background() -> Capability {
     imp::set_current_thread_background()
 }
 
+/// Whether the machine is currently running on battery, if the platform will say.
+///
+/// `None` means "this platform cannot be asked cheaply", not "on mains". A probe stamped with an
+/// unknown power source is still usable; one stamped with a guess is not, because on a laptop the
+/// difference between mains and battery is a third of the CPU's clock and would otherwise be
+/// indistinguishable from a machine that had genuinely degraded.
+///
+/// Deliberately not shared with [`crate::system`]'s power-source detection. That one answers a
+/// different question — *which* source, in prose, once per report — and is free to spend a child
+/// process on it. This one is asked every fifteen minutes immediately before a measurement, so on
+/// Windows and Linux it is a syscall and a sysfs read respectively.
+pub fn on_battery() -> Option<bool> {
+    imp::on_battery()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,5 +153,19 @@ mod tests {
         if !applied.is_applied() {
             assert!(applied.reason().is_some_and(|reason| !reason.is_empty()));
         }
+    }
+
+    /// Asking is safe on every target, and the answer is a reading rather than a coin toss.
+    ///
+    /// The value cannot be asserted: a CI runner is a mains-powered virtual machine, a laptop reports
+    /// either, and a container reports nothing at all. What can be asserted is that two adjacent calls
+    /// agree, which fails if an implementation ever returns something it did not read.
+    #[test]
+    fn the_power_source_is_read_consistently_or_declined() {
+        assert_eq!(
+            on_battery(),
+            on_battery(),
+            "two adjacent readings disagree, so at least one was not a reading"
+        );
     }
 }
