@@ -4,6 +4,8 @@ All notable changes to AgentBench are documented here. The project follows [Sema
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-03
+
 ### Added
 
 - **The control centre can start collection, compare reports, and erase what has been collected.** The
@@ -19,76 +21,6 @@ All notable changes to AgentBench are documented here. The project follows [Sema
   visible on their own. `tool_search_ms` is the closest thing the tool has to a directory-walk
   measurement, which is what moves when a filter driver or a cloud-sync placeholder provider gets into
   the path of an enumeration.
-
-### Changed
-
-- **`tool_read_ms` is the latency of `Read` alone**, where it used to pool `Read`, `Grep`, `Glob` and
-  `Edit`. It is the only session series that carries a verdict, and pooling put a composition confound
-  inside it: measured over 15,035 real tool calls, the four medians are 11, 72, 223 and 35 ms, and the
-  pooled daily median correlated with *the share of calls that happened to be reads* at r = −0.86. Three
-  quarters of the movement in the judged series was the model's choice of tool rather than the machine.
-  One day in the sample sat near the month's worst pooled figure while its `Read` median was the month's
-  best. **Values before this release are not comparable with values after it.**
-- **A slow small-file result no longer blames an idle security scanner.** The threshold was 2.0 against a
-  reading that is a percentage of *one core*, so on a sixteen-core machine it fired at one eightieth of
-  the machine — which anything installed clears. It is now 10.0, the same value the dashboard's own
-  contention tag uses for the same reading, and the evidence line states the scale it is on. The scale is
-  documented once, on `process_tree::TreeUsage::cpu_percent`, rather than at each reader.
-- **The benchmark's sampler warms up before it records, and walks the process table four times less
-  often.** Per-process CPU needs three refreshes before it is a measurement rather than a `0.0`, so the
-  first sample of every run previously reported no scanner activity whatever was happening — and because
-  the scanner evidence takes the maximum over a run, a missing real reading mattered while a phantom quiet
-  one did not. The whole-machine figure was inflated on that sample too: 9.0% against 4.4% once settled.
-  The walk itself costs about 10 ms of every 500 ms interval on Windows, spent observing during the two
-  measurements most sensitive to someone else using the machine, so it now runs every two seconds while
-  the cheap counters are still read every 500 ms.
-- **`network.https_latency_ms` establishes the connection before it starts timing**, when more than one
-  sample is asked for. The first request through a fresh client pays DNS, TCP and TLS; the rest reuse the
-  pooled connection, and at every preset's sample count the reported p95 *was* that first request, since
-  `round((n - 1) × 0.95)` reaches the last index for any n up to 11. The diagnostic threshold now reads
-  the median and reports the slowest request as evidence under its own name. A single-sample probe is
-  left alone: warming up would double the daemon's outbound requests, and one cold request every fifteen
-  minutes is consistent with the one before it.
-- **`cpu.single_mops_s` discards a 25 ms warm-up.** An idle processor takes tens of milliseconds to raise
-  its clock, and how long depends on the power plan and how idle it had been — a systematic bias, and a
-  larger one for the prober's 200 ms reading than for a benchmark's seconds, which is backwards.
-  **Values before this release are not comparable with values after it.**
-- **`filesystem.small_file_total_ms` is informational.** It is `seconds × 1000` where
-  `filesystem.small_file_ops_s` is `4 × count / seconds`: with the count fixed by the preset, each is the
-  reciprocal of the other, and treating them as two comparable metrics counted one measurement twice in
-  the comparison table.
-- **Two metric descriptions now say what the number is.** `filesystem.sequential_read_mib_s` reports the
-  cached read path, not the device: it measures 4,820 MiB/s at the quick preset's 64 MiB and 9,447 MiB/s
-  at the standard preset's 512 MiB, against 1,463 MiB/s written to the same file moments earlier. And
-  `memory.read_gib_s` is a rate at which memory can be *reached*, sampling one byte per cache line, so it
-  is not comparable with the write figure beside it.
-- **The first probe of a daemon session takes an extra priming reading.** Its covariates were previously
-  a scanner at exactly 0.0% and an agent reported inactive whatever either was doing, so a probe that
-  competed with a working agent could be recorded as comparable. Measured on one machine: the first probe
-  said no agent was active where the second and third, with the same thirty-seven-process agent tree in
-  front of them, said one was.
-- **The terminal screens have a colour for their own structure.** 0.5.0 gave colour a job but gave chrome
-  none, so every panel title, heading and key hint was grey and the screens read as greyscale whatever the
-  data was doing. Cyan is now reserved for structure — titles, section headings, bracketed key
-  hints, the control centre's focus marker — and reserved in both directions: it left the series palette, so
-  the process-tree CPU plot keeps its blue while the system CPU plot and the benchmark's phase gauge move
-  from cyan to magenta. A hue can still only mean one thing, and the control centre's status band now tints
-  the one word in its title that is a state rather than a label: green while collecting, dim when not.
-
-### Fixed
-
-- **A panel title is no longer dimmed by its own border.** Titles are drawn over the border area, so the
-  deliberately recessive border style reached them and every bordered heading in the tool came out bold
-  *and* dim at once — which is part of why the screens read as greyscale. The heading style now says it is
-  not dim, and a test renders a panel and checks the pixels, since neither end of that interaction says
-  anything about the other.
-- `filesystem.sequential_write_mib_s` divides the bytes actually written by the elapsed time rather than
-  the bytes requested. Every caller today passes a multiple of the 1 MiB block size, so the two agreed;
-  the point is that they stop agreeing silently.
-
-## [0.5.0] - 2026-08-03
-
-### Added
 
 - **`agentbench` with no arguments opens a control centre.** One screen showing whether collection is
   working and letting every setting that was previously a flag or a hand-edited TOML key be changed in
@@ -136,6 +68,61 @@ All notable changes to AgentBench are documented here. The project follows [Sema
 - `cargo clippy` runs on every platform in CI, not only Linux. The lint job's `-D warnings` had never seen
   a `#[cfg(windows)]` module, which is where nearly all of this release's new code lives.
 
+### Changed — measurement accuracy
+
+- **`tool_read_ms` is the latency of `Read` alone**, where it used to pool `Read`, `Grep`, `Glob` and
+  `Edit`. It is the only session series that carries a verdict, and pooling put a composition confound
+  inside it: measured over 15,035 real tool calls, the four medians are 11, 72, 223 and 35 ms, and the
+  pooled daily median correlated with *the share of calls that happened to be reads* at r = −0.86. Three
+  quarters of the movement in the judged series was the model's choice of tool rather than the machine.
+  One day in the sample sat near the month's worst pooled figure while its `Read` median was the month's
+  best. **Values before this release are not comparable with values after it.**
+- **A slow small-file result no longer blames an idle security scanner.** The threshold was 2.0 against a
+  reading that is a percentage of *one core*, so on a sixteen-core machine it fired at one eightieth of
+  the machine — which anything installed clears. It is now 10.0, the same value the dashboard's own
+  contention tag uses for the same reading, and the evidence line states the scale it is on. The scale is
+  documented once, on `process_tree::TreeUsage::cpu_percent`, rather than at each reader.
+- **The benchmark's sampler warms up before it records, and walks the process table four times less
+  often.** Per-process CPU needs three refreshes before it is a measurement rather than a `0.0`, so the
+  first sample of every run previously reported no scanner activity whatever was happening — and because
+  the scanner evidence takes the maximum over a run, a missing real reading mattered while a phantom quiet
+  one did not. The whole-machine figure was inflated on that sample too: 9.0% against 4.4% once settled.
+  The walk itself costs about 10 ms of every 500 ms interval on Windows, spent observing during the two
+  measurements most sensitive to someone else using the machine, so it now runs every two seconds while
+  the cheap counters are still read every 500 ms.
+- **`network.https_latency_ms` establishes the connection before it starts timing**, when more than one
+  sample is asked for. The first request through a fresh client pays DNS, TCP and TLS; the rest reuse the
+  pooled connection, and at every preset's sample count the reported p95 *was* that first request, since
+  `round((n - 1) × 0.95)` reaches the last index for any n up to 11. The diagnostic threshold now reads
+  the median and reports the slowest request as evidence under its own name. A single-sample probe is
+  left alone: warming up would double the daemon's outbound requests, and one cold request every fifteen
+  minutes is consistent with the one before it.
+- **`cpu.single_mops_s` discards a 25 ms warm-up.** An idle processor takes tens of milliseconds to raise
+  its clock, and how long depends on the power plan and how idle it had been — a systematic bias, and a
+  larger one for the prober's 200 ms reading than for a benchmark's seconds, which is backwards.
+  **Values before this release are not comparable with values after it.**
+- **`filesystem.small_file_total_ms` is informational.** It is `seconds × 1000` where
+  `filesystem.small_file_ops_s` is `4 × count / seconds`: with the count fixed by the preset, each is the
+  reciprocal of the other, and treating them as two comparable metrics counted one measurement twice in
+  the comparison table.
+- **Two metric descriptions now say what the number is.** `filesystem.sequential_read_mib_s` reports the
+  cached read path, not the device: it measures 4,820 MiB/s at the quick preset's 64 MiB and 9,447 MiB/s
+  at the standard preset's 512 MiB, against 1,463 MiB/s written to the same file moments earlier. And
+  `memory.read_gib_s` is a rate at which memory can be *reached*, sampling one byte per cache line, so it
+  is not comparable with the write figure beside it.
+- **The first probe of a daemon session takes an extra priming reading.** Its covariates were previously
+  a scanner at exactly 0.0% and an agent reported inactive whatever either was doing, so a probe that
+  competed with a working agent could be recorded as comparable. Measured on one machine: the first probe
+  said no agent was active where the second and third, with the same thirty-seven-process agent tree in
+  front of them, said one was.
+- **The terminal screens have a colour for their own structure.** The rewrite above gave colour a job but
+  gave chrome none, so every panel title, heading and key hint was grey and the screens read as greyscale whatever the
+  data was doing. Cyan is now reserved for structure — titles, section headings, bracketed key
+  hints, the control centre's focus marker — and reserved in both directions: it left the series palette, so
+  the process-tree CPU plot keeps its blue while the system CPU plot and the benchmark's phase gauge move
+  from cyan to magenta. A hue can still only mean one thing, and the control centre's status band now tints
+  the one word in its title that is a state rather than a label: green while collecting, dim when not.
+
 ### Changed — measurement values move
 
 - **`memory.write_gib_s` now reports roughly an order of magnitude more, on both the probe and the
@@ -148,7 +135,48 @@ All notable changes to AgentBench are documented here. The project follows [Sema
   `cargo run -- bench` writing figures forty times low into the dashboard's history beside a release
   build's.
 
+### Changed
+
+- The dashboard polls `/api/status` and `/api/verdicts` once a minute rather than every five seconds.
+  Between them they cost more than the collectors they report on — six `count(*)` aggregates and a
+  re-derived trailing window — so an open page was biasing the series it was drawing. Live tiles are
+  unchanged at five seconds.
+- `profile` walks the process table once per tick rather than twice, and asks for only the fields it
+  reads.
+- `profile` no longer retains every chunk of a child's output in memory. It kept an owned `String` per
+  8 KiB read, uncapped, for stdout and stderr, where the one consumer wanted a single substring test.
+- Transcript discovery reuses the metadata a directory entry already carries, which on Windows removes
+  a file open per transcript per pass, and the poll interval floor is 10 seconds rather than 1.
+- A verdict computed from a thin partial day says how thin it is: "today rests on N measurements against
+  a baseline of about M a day".
+- `--llm-route auto` documents that it runs both routes and pays for every scenario twice, and a run
+  that reported no cost is now named in the warnings rather than silently omitted from the cap's
+  arithmetic.
+- Directories under the sessions roots that cannot be listed are reported once, and again when the
+  count changes, instead of being counted and never mentioned.
+- `bench --scratch-dir` moves the filesystem workloads out of the target directory. The default still
+  writes inside it, since the disk numbers are meant to describe that volume, but up to two gigabytes
+  landing inside a repository wakes IDE indexers and file-watching test runners, and the report attributes
+  that to the disk. The live file-seek fixture stays under the target directory, where the agent's working
+  directory is.
+- Elevation is read from the process itself — `geteuid` on Unix, the process token on Windows — rather than
+  by spawning `id -u` or `net session` on every `inventory()`.
+- The dashboard's process-count tile says in its tooltip that the number comes from the sampler's discovery
+  pass and can be up to a minute old.
+- The README's privacy section states what the live file-seek case gives a model access to: read-only tools,
+  no prompts, and anything readable beneath `--target-dir` for the duration of that case.
+- CI runs doctests. `cargo test --all-targets` silently skips them.
+
 ### Fixed
+
+- **A panel title is no longer dimmed by its own border.** Titles are drawn over the border area, so the
+  deliberately recessive border style reached them and every bordered heading in the tool came out bold
+  *and* dim at once — which is part of why the screens read as greyscale. The heading style now says it is
+  not dim, and a test renders a panel and checks the pixels, since neither end of that interaction says
+  anything about the other.
+- `filesystem.sequential_write_mib_s` divides the bytes actually written by the elapsed time rather than
+  the bytes requested. Every caller today passes a multiple of the 1 MiB block size, so the two agreed;
+  the point is that they stop agreeing silently.
 
 - A single refused row no longer ends all collection. The writer logged nothing and exited on any
   insert failure, after which every collector's `send` silently returned `false`, the page kept serving,
@@ -195,38 +223,6 @@ All notable changes to AgentBench are documented here. The project follows [Sema
   claiming it is missing history it has every point of.
 - A baseline band whose floor equals its measured spread reports itself as floored rather than measured.
 - The per-pass transcript dedupe set is bounded like every other map beside it.
-
-### Changed
-
-- The dashboard polls `/api/status` and `/api/verdicts` once a minute rather than every five seconds.
-  Between them they cost more than the collectors they report on — six `count(*)` aggregates and a
-  re-derived trailing window — so an open page was biasing the series it was drawing. Live tiles are
-  unchanged at five seconds.
-- `profile` walks the process table once per tick rather than twice, and asks for only the fields it
-  reads.
-- `profile` no longer retains every chunk of a child's output in memory. It kept an owned `String` per
-  8 KiB read, uncapped, for stdout and stderr, where the one consumer wanted a single substring test.
-- Transcript discovery reuses the metadata a directory entry already carries, which on Windows removes
-  a file open per transcript per pass, and the poll interval floor is 10 seconds rather than 1.
-- A verdict computed from a thin partial day says how thin it is: "today rests on N measurements against
-  a baseline of about M a day".
-- `--llm-route auto` documents that it runs both routes and pays for every scenario twice, and a run
-  that reported no cost is now named in the warnings rather than silently omitted from the cap's
-  arithmetic.
-- Directories under the sessions roots that cannot be listed are reported once, and again when the
-  count changes, instead of being counted and never mentioned.
-- `bench --scratch-dir` moves the filesystem workloads out of the target directory. The default still
-  writes inside it, since the disk numbers are meant to describe that volume, but up to two gigabytes
-  landing inside a repository wakes IDE indexers and file-watching test runners, and the report attributes
-  that to the disk. The live file-seek fixture stays under the target directory, where the agent's working
-  directory is.
-- Elevation is read from the process itself — `geteuid` on Unix, the process token on Windows — rather than
-  by spawning `id -u` or `net session` on every `inventory()`.
-- The dashboard's process-count tile says in its tooltip that the number comes from the sampler's discovery
-  pass and can be up to a minute old.
-- The README's privacy section states what the live file-seek case gives a model access to: read-only tools,
-  no prompts, and anything readable beneath `--target-dir` for the duration of that case.
-- CI runs doctests. `cargo test --all-targets` silently skips them.
 
 ## [0.4.0] - 2026-08-03
 
