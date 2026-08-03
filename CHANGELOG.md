@@ -40,6 +40,11 @@ All notable changes to AgentBench are documented here. The project follows [Sema
   terminal view moved to `agentbench top`. Passing the old `--pid`, `--name`, or `--interval-ms` flags
   to `dashboard` still works for this release and prints a notice pointing at `top`; the shim is
   removed in 0.5.0.
+- Dependencies updated: rusqlite 0.32 to 0.40, sysinfo 0.33 to 0.38, toml 0.8 to 1.1, rand 0.9 to
+  0.10, sha2 0.10 to 0.11. Two needed source changes: rusqlite no longer accepts `u64` for a column
+  SQLite stores as a signed 64-bit integer, and `System::physical_core_count` became an associated
+  function. Hashed machine identity is unchanged, so existing databases and previously exported
+  reports remain comparable.
 - `bench` internals split into `bench/` with one module per workload, so a workload can be reused
   independently of a preset. No change to emitted metrics.
 - Metric names, units, directions, and descriptions consolidated into a single `metrics` catalog,

@@ -12,6 +12,10 @@ const EVENT_RETENTION: i64 = 5_000;
 
 /// `INSERT OR REPLACE` because a clock adjustment can produce a duplicate timestamp, and one
 /// overwritten sample is preferable to a failed batch.
+///
+/// Byte counts and process counts are cast to `i64` at the boundary. SQLite has no unsigned integer,
+/// and rusqlite stopped accepting `u64` rather than keep silently converting values it cannot
+/// represent. Nothing measured here comes close: `i64` runs to eight exabytes.
 pub fn sample(tx: &Transaction<'_>, machine_id: &str, sample: &Sample) -> Result<()> {
     tx.prepare_cached(
         "INSERT OR REPLACE INTO samples (machine_id, ts, cpu_percent, used_memory, total_memory,
@@ -22,14 +26,14 @@ pub fn sample(tx: &Transaction<'_>, machine_id: &str, sample: &Sample) -> Result
         machine_id,
         sample.ts,
         sample.cpu_percent,
-        sample.used_memory,
-        sample.total_memory,
-        sample.used_swap,
-        sample.process_count,
+        sample.used_memory as i64,
+        sample.total_memory as i64,
+        sample.used_swap as i64,
+        sample.process_count as i64,
         sample.scanner_cpu,
         sample.agent_cpu,
-        sample.agent_rss,
-        sample.agent_processes,
+        sample.agent_rss.map(|bytes| bytes as i64),
+        sample.agent_processes.map(|count| count as i64),
     ])
     .context("insert sample")?;
     Ok(())

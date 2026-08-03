@@ -36,7 +36,9 @@ pub fn inventory(elevated_requested: bool) -> Inventory {
         architecture: env::consts::ARCH.into(),
         hostname_hash: hash_private(hostname),
         cpu,
-        physical_cores: system.physical_core_count(),
+        // An associated function since sysinfo 0.34: the physical count comes from the OS directly
+        // and needs no refreshed `System`.
+        physical_cores: System::physical_core_count(),
         logical_cores: system.cpus().len(),
         memory_bytes: system.total_memory(),
         disks: disks
