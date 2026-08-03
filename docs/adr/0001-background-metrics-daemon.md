@@ -199,7 +199,7 @@ machine look faster the more went wrong. On real data they are 3.3% of calls.
 
 ### ratatui and the MSRV
 
-**Decided: adopt ratatui 0.30, MSRV raised to 1.86.**
+**Decided: adopt ratatui 0.30. MSRV is 1.88, and is now verified.**
 
 ratatui 0.29 requires crossterm 0.28.1 against this project's 0.29, which would link two crossterm
 versions into one binary with two independent owners of terminal raw mode. ratatui 0.30 matches
@@ -210,9 +210,19 @@ Keep the dependency narrow when adopting it: `default-features = false` with onl
 actually needed, since the defaults pull `all-widgets`, `macros`, `layout-cache`, and — on non-Windows
 targets — the termion and termwiz backends, none of which this project uses.
 
-Note that CI has no MSRV verification job, so `rust-version` is documentation rather than something
-enforced. Raising it does not break any build that currently passes, and equally would not catch an
-accidental use of a newer language feature.
+This was originally recorded as an MSRV of 1.86, with the note that CI had no verification job and that
+`rust-version` was therefore documentation rather than something enforced. Adding the job proved the
+point immediately: the crate does not compile on 1.86 at all, and never did. It uses `let` chains,
+which stabilised for edition 2024 in **1.88**, in code that predates the daemon work
+(`diagnosis.rs`, `supervisor.rs`). Both 1.85 and 1.86 were claims nobody had tested.
+
+The declared version is now 1.88, and the `msrv` CI job reads it out of `Cargo.toml` rather than
+repeating it, so the manifest and the check cannot disagree. The job checks the library and binary
+only: an MSRV is a promise to whoever builds the crate, and they do not build its tests, so including
+test targets would only invite a failure the day a dev-dependency raises its own minimum.
+
+The general lesson is worth keeping: a version constraint that nothing executes is a guess with a
+number in it.
 
 ### Open questions carried into phase 3
 

@@ -23,7 +23,7 @@ Release assets are provided for:
 
 ### Build from source
 
-Rust 1.86 or newer is required.
+Rust 1.88 or newer is required.
 
 ```text
 git clone https://github.com/jazzonaut/agentbench.git

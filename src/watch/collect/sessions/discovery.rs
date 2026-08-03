@@ -82,10 +82,10 @@ fn walk(dir: &Path, depth: usize, scan: &mut Scan) {
         };
         if kind.is_dir() {
             walk(&path, depth + 1, scan);
-        } else if is_transcript(&path) {
-            if let Some(transcript) = describe(path) {
-                scan.transcripts.push(transcript);
-            }
+        } else if is_transcript(&path)
+            && let Some(transcript) = describe(path)
+        {
+            scan.transcripts.push(transcript);
         }
         if scan.transcripts.len() >= MAX_FILES {
             scan.truncated = true;

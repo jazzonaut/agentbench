@@ -8,9 +8,12 @@ repository = "https://github.com/jazzonaut/agentbench"
 homepage = "https://github.com/jazzonaut/agentbench"
 documentation = "https://docs.rs/agentbench"
 readme = "README.md"
-# Raised from 1.85 for ratatui 0.30, which is the first release built against crossterm 0.29 and so
-# the first that does not link a second copy of crossterm alongside this project's.
-rust-version = "1.86"
+# 1.88 is where `let` chains stabilised for edition 2024, and this crate uses them. ratatui 0.30
+# separately requires 1.86 — it is the first release built against crossterm 0.29, and so the first
+# that does not link a second copy of crossterm alongside this project's — but the language feature is
+# the binding constraint. Verified by the `msrv` CI job, which reads this value; do not raise it
+# without a reason recorded here.
+rust-version = "1.88"
 keywords = ["benchmark", "diagnostics", "llm", "claude", "performance"]
 categories = ["command-line-utilities", "development-tools", "hardware-support"]
 include = [

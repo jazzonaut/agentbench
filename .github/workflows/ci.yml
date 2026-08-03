@@ -26,6 +26,34 @@ jobs:
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - run: cargo package --locked
 
+  msrv:
+    name: Minimum supported Rust version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Read the version from the manifest instead of repeating it here. A number written twice
+      # drifts, and a job that verifies a version nobody promised is worse than no job: it reports
+      # success for a claim it never checked.
+      - id: msrv
+        run: |
+          version="$(sed -n 's/^rust-version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -1)"
+          if [ -z "$version" ]; then
+            echo "::error file=Cargo.toml::no rust-version declared, so there is no MSRV to verify"
+            exit 1
+          fi
+          echo "Declared MSRV: $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv-${{ steps.msrv.outputs.version }}
+      # The library and binary only. An MSRV is a promise to whoever builds this crate, and they do
+      # not build its tests; checking every target would fail the day a dev-dependency raises its own
+      # MSRV, which says nothing about whether this crate still compiles on the version it claims.
+      - run: cargo check --locked --all-features
+
   test:
     name: Test (${{ matrix.os }})
     strategy:
