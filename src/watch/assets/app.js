@@ -3,6 +3,9 @@
 import {
   percent, gib, mib, count, duration, dateTime, latency, ratio, unitFormatter,
 } from './format.js';
+import {
+  SYSTEM_SERIES, AGENT_SERIES, PROBE_METRICS, CONDITION_SERIES,
+} from './series.js';
 import { createChart } from './chart.js';
 
 /** Live tiles refresh on this cadence; the server samples independently of it.
@@ -26,44 +29,6 @@ const RANGES = [
 
 let selectedRange = RANGES.find((range) => range.label === '48h');
 
-/** Probe metrics the one probe frame switches between, and what each measurement actually is.
- *
- *  The four the comparison judges, in the order it lists them — see `comparison::subjects::SUBJECTS`.
- *  Charting exactly the judged set is the point: a verdict tile a reader wants to check has a line to
- *  check it against, and a line that earns a verdict is never silently absent from the chart.
- *
- *  Every entry carries its own note because the working set is part of the reading. 200 files is not
- *  8 MiB, and a note left over from the previous selection would describe a different workload than the
- *  line on screen. The unit is not listed: the server reports it per series and the axis derives from
- *  that, so a name here can never disagree with the catalogue.
- */
-const PROBE_METRICS = [
-  {
-    label: 'small-file ops',
-    metric: 'probe:filesystem.small_file_ops_s',
-    note: 'controlled workload · 200 files · not comparable to a bench report',
-  },
-  {
-    label: 'sequential write',
-    metric: 'probe:filesystem.sequential_write_mib_s',
-    // The read half is deliberately not collected: at 8 MiB it is served from the page cache, so it
-    // would report memory bandwidth under a name that means disk everywhere else in the tool.
-    note: 'controlled workload · 8 MiB write · write only, a read this size is page cache',
-  },
-  {
-    label: 'SQLite lookup',
-    metric: 'probe:sqlite.lookup_ms',
-    note: 'controlled workload · 2,000 rows · lower is better',
-  },
-  {
-    label: 'single-core CPU',
-    metric: 'probe:cpu.single_mops_s',
-    note: 'controlled workload · one core for 200 ms · never all cores',
-  },
-];
-
-let selectedProbe = PROBE_METRICS[0];
-
 const dom = {
   subtitle: document.getElementById('subtitle'),
   tiles: document.getElementById('tiles'),
@@ -71,25 +36,34 @@ const dom = {
   verdicts: document.getElementById('verdicts'),
   verdictsNote: document.getElementById('verdicts-note'),
   ranges: document.getElementById('ranges'),
+  systemMetrics: document.getElementById('system-metrics'),
+  agentMetrics: document.getElementById('agent-metrics'),
   probeMetrics: document.getElementById('probe-metrics'),
+  conditionMetrics: document.getElementById('condition-metrics'),
   uncontended: document.getElementById('uncontended'),
   marks: document.getElementById('marks'),
   statusLine: document.getElementById('status-line'),
   events: document.querySelector('#events tbody'),
 };
 
-/** Stacked charts, in reading order. Each owns one metric and one y-axis.
+/** Stacked frames, in reading order: what the machine did, what the agent experienced, the controlled
+ *  measurement, and the conditions that measurement was taken under.
+ *
+ *  Four frames rather than twenty-seven. Every frame owns one metric and one y-axis at a time and switches
+ *  between the choices its catalogue offers, because these series share nothing but a timeline — percentages,
+ *  bytes, milliseconds, tokens per second — and stacking them would give a page of axes to read where the
+ *  whole design is one shared cursor read straight down.
  *
  *  No panel names a formatter. Every series reports its unit and the axis is derived from it, which is how a
  *  probe series named after a catalogue entry gets a correct axis without the page knowing what it measures
  *  — and, more to the point, what makes a switchable frame safe: a panel that hardcoded `percent` and was
  *  then pointed at a byte rate would render 1,066 MiB/s as "1066.0%" with nothing on screen looking wrong.
- *  The probe frame's entry opens on the default selection rather than hardcoding a metric of its own.
  */
 const CHARTS = [
-  { id: 'chart-cpu', metric: 'cpu_percent', label: 'system CPU' },
-  { id: 'chart-tools', metric: 'tool_read_ms', label: 'median latency' },
-  { id: 'chart-probe', metric: selectedProbe.metric, label: selectedProbe.label },
+  { id: 'chart-cpu', switchNode: dom.systemMetrics, choices: SYSTEM_SERIES },
+  { id: 'chart-tools', switchNode: dom.agentMetrics, choices: AGENT_SERIES },
+  { id: 'chart-probe', switchNode: dom.probeMetrics, choices: PROBE_METRICS },
+  { id: 'chart-conditions', switchNode: dom.conditionMetrics, choices: CONDITION_SERIES },
 ].flatMap((config) => {
   const element = document.getElementById(config.id);
   // Reported and skipped rather than thrown. This runs while the module is still evaluating, so an
@@ -99,15 +73,31 @@ const CHARTS = [
     console.error(`no element #${config.id} in the page, so its chart is skipped`);
     return [];
   }
-  const note = element.closest('.card')?.querySelector('.card-note') ?? null;
+  const line = element.closest('.card')?.querySelector('.card-note') ?? null;
   const empty = document.querySelector(`[data-empty-for="${config.id}"]`);
+  // Both halves of that line are written from the catalogue, so the markup holds an empty paragraph: a
+  // caption authored in two places is how a frame comes to describe the previous selection's scale.
+  let caption = null;
+  let anchor = null;
+  if (line) {
+    caption = document.createElement('span');
+    anchor = document.createElement('span');
+    anchor.className = 'note-anchor';
+    // The mark goes after the caption, and the anchor is what it hangs from: the note it reveals is
+    // positioned against that, so it opens under the mark rather than under the whole frame.
+    line.replaceChildren(caption, anchor);
+  }
+  const [selected] = config.choices;
   const panel = {
     ...config,
+    selected,
+    metric: selected.metric,
     unit: '',
-    note,
-    // The note as authored in the markup, so a resolution caveat can be appended and later removed
-    // without the original wording being lost after the first poll.
-    baseNote: note?.textContent.trim() ?? '',
+    caption,
+    anchor,
+    // The caption as the switch last wrote it, so a resolution caveat can be appended and later removed
+    // without the selection's own wording being lost after the first poll.
+    baseCaption: selected.caption,
     empty,
     // Likewise the empty state, which a failed load overwrites with the reason. Without the original to
     // restore, a metric that failed once would keep explaining itself under the next metric selected.
@@ -115,20 +105,9 @@ const CHARTS = [
   };
   // The closure reads `panel.unit` on every call rather than capturing it, so a response can change the
   // unit — which switching the metric does — without the plot having to be rebuilt.
-  panel.chart = createChart(element, (value) => unitFormatter(panel.unit)(value), config.label);
+  panel.chart = createChart(element, (value) => unitFormatter(panel.unit)(value), panel.selected.label);
   return [panel];
 });
-
-/** The frame the probe switch drives.
- *
- *  Absent if the markup has no such panel, which the switch's renderer checks for rather than assuming.
- *  A `find` that misses is reported by whichever line first dereferences it, and that line names the
- *  property it wanted instead of the panel it never had.
- */
-const probePanel = CHARTS.find((panel) => panel.id === 'chart-probe');
-if (!probePanel) {
-  console.error('no chart-probe panel, so the probe metric switch is not drawn');
-}
 
 /** Fetch JSON, surfacing the server's error message rather than a bare status code. */
 async function api(path) {
@@ -149,6 +128,10 @@ async function api(path) {
  *
  *  A tile whose key has no entry here simply gets no mark, which is what the placeholder tiles want: "No
  *  samples yet" is already its own explanation.
+ *
+ *  The history frames' notes are not here but in `series.js`, beside the choice each one describes: a frame
+ *  says something different for every measurement it can be pointed at, so its note belongs to the entry
+ *  that selects it rather than to the panel that displays it.
  */
 const NOTES = {
   cpu: {
@@ -709,43 +692,48 @@ function renderRanges() {
   }
 }
 
-/** Draw the probe switch and point the probe frame at what it selects.
+/** Draw one frame's switch and point the frame at what it selects.
  *
- *  One frame rather than four stacked ones. The four measurements share nothing but a workload — ops/s,
- *  MiB/s, ms and Mops/s — so stacking them would add three y-axes to a page whose charts stack precisely
- *  because they can be read down a single shared cursor.
+ *  One renderer for all four, which is the only way the fourth frame was affordable: the switch, the
+ *  caption, the tooltip label and the note behind the mark all have to change together, and four copies of
+ *  that sequence is four chances for one of them to be left describing the previous selection.
  *
  *  The unit is left alone here. It is replaced by the response, and until then the axis still describes
  *  the data still on screen, which is the previous metric's.
  */
-function renderProbeMetrics() {
-  // Nothing to point at means nothing to draw. Guarded because the alternative is `Cannot set properties
-  // of undefined`, thrown from the switch's own renderer, which says nothing about the panel that is
-  // actually missing — and takes the rest of the page down with it.
-  if (!probePanel) {
-    return;
-  }
-  dom.probeMetrics.replaceChildren();
-  for (const choice of PROBE_METRICS) {
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.textContent = choice.label;
-    button.setAttribute('aria-pressed', String(choice === selectedProbe));
-    button.addEventListener('click', () => {
-      selectedProbe = choice;
-      renderProbeMetrics();
-      void loadHistory();
-    });
-    dom.probeMetrics.append(button);
+function renderSwitch(panel) {
+  const choice = panel.selected;
+  if (!panel.switchNode) {
+    // A missing switch costs the reader the ability to change metric and nothing else, so the frame still
+    // charts its default. Guarded because the alternative is `Cannot read properties of null` thrown from
+    // here, which would take the rest of the page down over one absent element.
+    console.error(`no switch element for #${panel.id}, so its metric cannot be changed`);
+  } else {
+    panel.switchNode.replaceChildren();
+    for (const option of panel.choices) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.textContent = option.label;
+      button.setAttribute('aria-pressed', String(option === choice));
+      button.addEventListener('click', () => {
+        panel.selected = option;
+        renderSwitch(panel);
+        void loadHistory();
+      });
+      panel.switchNode.append(button);
+    }
   }
 
-  probePanel.metric = selectedProbe.metric;
-  probePanel.baseNote = selectedProbe.note;
-  probePanel.chart.setLabel(selectedProbe.label);
-  if (probePanel.note) probePanel.note.textContent = selectedProbe.note;
+  panel.metric = choice.metric;
+  panel.baseCaption = choice.caption;
+  panel.chart.setLabel(choice.label);
+  if (panel.caption) panel.caption.textContent = choice.caption;
+  // Rewritten rather than rebuilt, like a verdict's note: recreating the mark would close a note the reader
+  // has open and take the keyboard focus out of the page with it.
+  if (panel.anchor) setNote(panel.anchor, choice.note);
   // Reset before the fetch rather than after it: an error from the metric being left behind must not
   // stand as the explanation for the one being selected.
-  if (probePanel.empty) probePanel.empty.textContent = probePanel.baseEmpty;
+  if (panel.empty) panel.empty.textContent = panel.baseEmpty;
 }
 
 /** Reported by /api/status, which is polled far less often than the tiles that display it. */
@@ -848,8 +836,9 @@ async function loadHistory() {
         panel.empty.hidden = series.points.length > 0;
         panel.empty.textContent = panel.baseEmpty;
         const note = resolutionNote(series);
-        if (note && panel.note) panel.note.textContent = `${panel.baseNote} · ${note}`;
-        else if (panel.note) panel.note.textContent = panel.baseNote;
+        if (panel.caption) {
+          panel.caption.textContent = note ? `${panel.baseCaption} · ${note}` : panel.baseCaption;
+        }
       } catch (error) {
         panel.empty.hidden = false;
         panel.empty.textContent = `Could not load ${panel.metric}: ${error.message}`;
@@ -882,7 +871,12 @@ function polled(load) {
 }
 
 renderRanges();
-renderProbeMetrics();
+// The mark is created once per frame and its wording rewritten by every later selection, for the same
+// reason a tile's is: rebuilding it would close a note a reader is in the middle of.
+for (const panel of CHARTS) {
+  if (panel.anchor) addNote(panel.anchor, panel.selected.note);
+  renderSwitch(panel);
+}
 // Toggling what a chart counts must redraw it immediately: waiting a minute for the next poll would
 // read as the filter having done nothing.
 dom.uncontended.addEventListener('change', () => void loadHistory());

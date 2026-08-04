@@ -188,12 +188,30 @@
   .info-title { display: block; color: var(--ink-primary); }
   .info-text { display: block; margin-top: 3px; }
 
+  /* On a chart frame the top corner is taken by the switch, so the mark sits at the end of the caption
+     instead. The anchor is what the note is positioned against: hung from the card, a note revealed by a
+     mark at the top would open below the plot, a frame's height away from the pointer that revealed it. */
+  .note-anchor {
+    position: relative;
+    display: inline-block;
+    width: 20px;
+    height: 12px;
+    vertical-align: -2px;
+  }
+  .note-anchor .info-mark { top: -6px; right: -2px; }
+  /* Opens rightwards from the mark. Anchored to a 20px span near the left of a frame, a right-aligned note
+     would start off the left edge of the page and spend its first paint being nudged back across it. */
+  .note-anchor .info-note { right: auto; left: -6px; }
+
   .card {
+    /* Positioned so a note opened on this frame paints over the frame below rather than under it. */
+    position: relative;
     background: var(--surface-1);
     border: 1px solid var(--ring);
     border-radius: 8px;
     padding: 14px 14px 6px;
   }
+  .card:hover, .card:focus-within { z-index: 2; }
   /* Stacked charts read as one instrument, so the gap between them is a seam, not a margin. */
   .card + .card { margin-top: 10px; }
   /* Wraps rather than compressing: a narrow viewport puts the switch under the title it belongs to,
@@ -314,12 +332,17 @@
         Uncontended probes only
       </label>
     </div>
-    <!-- Stacked frames sharing one cursor: hovering either reads the same instant in both. -->
+    <!-- Four stacked frames sharing one cursor: hovering any of them reads the same instant in all four,
+         which is how a slow afternoon gets explained. Every frame's switch sits in its head, next to the
+         title it completes, and the selected button is the only thing that says which measurement is on
+         screen. The caption is on its own line under it, and is written by the script rather than authored
+         here: it changes with the selection, so the catalogue in `series.js` is its one authority. -->
     <div class="card">
       <div class="card-head">
-        <span class="card-title">System CPU</span>
-        <span class="card-note">percent of all cores · hover for values</span>
+        <span class="card-title">System</span>
+        <div class="metrics" id="system-metrics" role="group" aria-label="System measurement"></div>
       </div>
+      <p class="card-note"></p>
       <div id="chart-cpu"></div>
       <p class="empty" data-empty-for="chart-cpu" hidden>
         No samples in this range yet. Leave the daemon running and refresh.
@@ -327,28 +350,39 @@
     </div>
     <div class="card">
       <div class="card-head">
-        <span class="card-title">Agent file-read latency</span>
-        <!-- One tool, not a family. `Read` medians around 11 ms where `Grep` is 72 and `Glob` is 223,
-             so a pooled series moved with whichever the model happened to call. -->
-        <span class="card-note">median per bucket · Read only</span>
+        <span class="card-title">Agent</span>
+        <div class="metrics" id="agent-metrics" role="group" aria-label="Agent measurement"></div>
       </div>
+      <p class="card-note"></p>
       <div id="chart-tools"></div>
       <p class="empty" data-empty-for="chart-tools" hidden>
         No tool calls in this range. Transcripts are imported on startup and every 30 seconds.
       </p>
     </div>
     <div class="card">
-      <!-- The switch sits in the head, next to the title it completes: one frame, four measurements,
-           and the selected button is the only thing that says which is on screen. The note moves to its
-           own line because the scale is part of the reading and changes with the selection. -->
       <div class="card-head">
         <span class="card-title">Probe</span>
         <div class="metrics" id="probe-metrics" role="group" aria-label="Probe metric"></div>
       </div>
-      <p class="card-note">controlled workload · 200 files · not comparable to a bench report</p>
+      <p class="card-note"></p>
       <div id="chart-probe"></div>
       <p class="empty" data-empty-for="chart-probe" hidden>
         No probes in this range yet. The first one runs once a full probe interval has elapsed.
+      </p>
+    </div>
+    <div class="card">
+      <!-- Directly under the probe frame on purpose: these are the covariates of the runs plotted above,
+           so the shared cursor is what turns "small-file ops dropped at 14:00" into "…and something was
+           writing 60 MiB/s at the time". Both frames honour the filter above, so both hold one population. -->
+      <div class="card-head">
+        <span class="card-title">Conditions at each probe</span>
+        <div class="metrics" id="condition-metrics" role="group" aria-label="Probe condition"></div>
+      </div>
+      <p class="card-note"></p>
+      <div id="chart-conditions"></div>
+      <p class="empty" data-empty-for="chart-conditions" hidden>
+        No probes in this range yet. Conditions are recorded alongside each run, so this frame fills when
+        the one above it does.
       </p>
     </div>
     <ul class="marks" id="marks" aria-label="Marked events in this range"></ul>

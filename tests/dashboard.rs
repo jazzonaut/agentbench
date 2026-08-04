@@ -385,7 +385,12 @@ fn the_daemon_collects_serves_and_shuts_down_cleanly() {
         daemon.get("/assets/uplot.min.js").len() > 10_000,
         "vendored uPlot should be served"
     );
-    for asset in ["/assets/app.js", "/assets/chart.js", "/assets/format.js"] {
+    for asset in [
+        "/assets/app.js",
+        "/assets/chart.js",
+        "/assets/format.js",
+        "/assets/series.js",
+    ] {
         assert!(!daemon.get(asset).is_empty(), "{asset} should be served");
     }
 }

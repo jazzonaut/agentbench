@@ -12,6 +12,7 @@ const INDEX_HTML: &str = include_str!("../assets/index.html");
 const APP_JS: &[u8] = include_bytes!("../assets/app.js");
 const CHART_JS: &[u8] = include_bytes!("../assets/chart.js");
 const FORMAT_JS: &[u8] = include_bytes!("../assets/format.js");
+const SERIES_JS: &[u8] = include_bytes!("../assets/series.js");
 const UPLOT_JS: &[u8] = include_bytes!("../assets/uplot.min.js");
 const UPLOT_CSS: &[u8] = include_bytes!("../assets/uplot.min.css");
 const UPLOT_LICENSE: &[u8] = include_bytes!("../assets/uplot.LICENSE");
@@ -25,6 +26,7 @@ pub fn get(path: &str) -> Option<Resp> {
         "/assets/app.js" => Resp::asset(JAVASCRIPT, APP_JS),
         "/assets/chart.js" => Resp::asset(JAVASCRIPT, CHART_JS),
         "/assets/format.js" => Resp::asset(JAVASCRIPT, FORMAT_JS),
+        "/assets/series.js" => Resp::asset(JAVASCRIPT, SERIES_JS),
         "/assets/uplot.min.js" => Resp::asset(JAVASCRIPT, UPLOT_JS),
         "/assets/uplot.min.css" => Resp::asset("text/css; charset=utf-8", UPLOT_CSS),
         "/assets/uplot.LICENSE" => Resp::asset("text/plain; charset=utf-8", UPLOT_LICENSE),
@@ -35,6 +37,7 @@ pub fn get(path: &str) -> Option<Resp> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::watch::store::queries::{CondSeries, SampleSeries, SessionSeries};
 
     #[test]
     fn the_index_is_served_at_root_and_by_name() {
@@ -51,6 +54,7 @@ mod tests {
             ("/assets/app.js", "text/javascript"),
             ("/assets/chart.js", "text/javascript"),
             ("/assets/format.js", "text/javascript"),
+            ("/assets/series.js", "text/javascript"),
             ("/assets/uplot.min.js", "text/javascript"),
             ("/assets/uplot.min.css", "text/css"),
         ] {
@@ -78,6 +82,7 @@ mod tests {
             "/assets/app.js",
             "/assets/chart.js",
             "/assets/format.js",
+            "/assets/series.js",
             "/assets/uplot.min.js",
             "/assets/uplot.min.css",
         ] {
@@ -100,6 +105,7 @@ mod tests {
             include_str!("../assets/app.js"),
             include_str!("../assets/chart.js"),
             include_str!("../assets/format.js"),
+            CATALOGUE,
         ];
         let mut checked = 0;
         for script in scripts {
@@ -135,6 +141,83 @@ mod tests {
             }
         }
         ids
+    }
+
+    /// The catalogue of measurements the four history switches offer, as authored.
+    ///
+    /// Read as text for the same reason the id check above is: there is no JavaScript tooling in this
+    /// project and none is needed here. The two checks below search for `metric: '…'`, which is the one
+    /// field in that file whose spelling has to agree with the server, and the quotes are part of the
+    /// pattern so that `output_tokens` cannot pass by matching `output_tokens_per_s`.
+    const CATALOGUE: &str = include_str!("../assets/series.js");
+
+    /// Every series the daemon collects is reachable from the page.
+    ///
+    /// Collection that cannot be read is cost without benefit, and this is the test that makes that stick:
+    /// the daemon spent a release advertising thirteen series from `/api/series` against two that were
+    /// charted, which nothing failed on because a series nobody can request simply costs disk quietly. A
+    /// new variant on any of these three closed enums now fails the build until a frame offers it.
+    ///
+    /// The three enums only. Probe and `bench:` metrics stay curated — eighteen catalogued metrics from two
+    /// sources is a list, not a set of charts — and the judged four are asserted separately, in
+    /// `comparison::subjects`, which is where the set that earns a verdict is defined.
+    #[test]
+    fn every_collected_series_has_a_button_on_the_page() {
+        let collected = SampleSeries::ALL
+            .iter()
+            .map(|series| series.wire_name().to_string())
+            .chain(
+                SessionSeries::ALL
+                    .iter()
+                    .map(|series| series.wire_name().to_string()),
+            )
+            .chain(CondSeries::ALL.iter().map(|series| series.wire_name()));
+        let mut checked = 0;
+        for name in collected {
+            assert!(
+                CATALOGUE.contains(&format!("metric: '{name}'")),
+                "{name} is collected, so some frame has to offer a chart of it"
+            );
+            checked += 1;
+        }
+        // A pattern that silently matched nothing would pass for ever while checking nothing.
+        assert!(checked >= 20, "only found {checked} collected series");
+    }
+
+    /// Every measurement the page offers is one the server would answer for.
+    ///
+    /// The other direction, and the cheaper failure to cause: a mistyped name here costs a button that
+    /// loads nothing, and the symptom is one empty frame on a page whose frames are legitimately empty for
+    /// the first day of collection. Checked against the endpoint's own advertised list, so probe and
+    /// `bench:` names are covered by the same assertion as the closed enums.
+    #[test]
+    fn every_metric_the_page_offers_is_a_series_the_server_answers() {
+        let known = crate::watch::serve::handlers::series::known_series();
+        let offered = catalogue_metrics();
+        assert!(
+            offered.len() >= 20,
+            "only found {} metrics in the catalogue",
+            offered.len()
+        );
+        for metric in offered {
+            assert!(
+                known.contains(&metric),
+                "the page offers {metric}, which /api/series would reject as unknown"
+            );
+        }
+    }
+
+    /// The `metric: '…'` fields of the catalogue, in the order they are authored.
+    fn catalogue_metrics() -> Vec<String> {
+        let mut metrics = Vec::new();
+        let mut rest = CATALOGUE;
+        while let Some(start) = rest.find("metric: '") {
+            rest = &rest[start + "metric: '".len()..];
+            let Some(end) = rest.find('\'') else { break };
+            metrics.push(rest[..end].to_string());
+            rest = &rest[end..];
+        }
+        metrics
     }
 
     /// Vendored third-party code must ship its licence, and it must be the expected one.

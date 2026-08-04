@@ -70,14 +70,15 @@ mod tests {
     /// here would leave a button requesting a series the server rejects, and the symptom would be one
     /// empty frame on a page whose frames are legitimately empty for the first day of collection — so the
     /// drift would be invisible exactly when it happened. Asserted in this direction only: charting a
-    /// metric no verdict is computed for is a reasonable thing to do.
+    /// metric no verdict is computed for is a reasonable thing to do, and the page does it for two dozen
+    /// series — see `serve::assets`, which asserts the converse for every series the daemon collects.
     #[test]
     fn the_dashboard_switch_offers_every_judged_probe_metric() {
-        const APP_JS: &str = include_str!("../../assets/app.js");
+        const CATALOGUE: &str = include_str!("../../assets/series.js");
         for (subject, _) in SUBJECTS {
             if let Subject::Probe(name) = subject {
                 assert!(
-                    APP_JS.contains(&format!("probe:{name}")),
+                    CATALOGUE.contains(&format!("probe:{name}")),
                     "probe:{name} earns a verdict, so the dashboard must offer a chart of it"
                 );
             }
