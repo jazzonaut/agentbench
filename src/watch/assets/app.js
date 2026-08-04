@@ -88,8 +88,15 @@ const CHARTS = [
   { id: 'chart-cpu', metric: 'cpu_percent', format: percent, label: 'system CPU' },
   { id: 'chart-tools', metric: 'tool_read_ms', format: latency, label: 'median latency' },
   { id: 'chart-probe', metric: selectedProbe.metric, label: selectedProbe.label },
-].map((config) => {
+].flatMap((config) => {
   const element = document.getElementById(config.id);
+  // Reported and skipped rather than thrown. This runs while the module is still evaluating, so an
+  // exception here does not cost one chart — it stops the rest of the file, and the page renders nothing
+  // at all. That is exactly what a stale cached copy of this script used to do after a panel was renamed.
+  if (!element) {
+    console.error(`no element #${config.id} in the page, so its chart is skipped`);
+    return [];
+  }
   const note = element.closest('.card')?.querySelector('.card-note') ?? null;
   const empty = document.querySelector(`[data-empty-for="${config.id}"]`);
   const panel = {
@@ -111,11 +118,19 @@ const CHARTS = [
     config.format ?? ((value) => unitFormatter(panel.unit)(value)),
     config.label,
   );
-  return panel;
+  return [panel];
 });
 
-/** The frame the probe switch drives, found by id so a renamed panel fails loudly at boot. */
+/** The frame the probe switch drives.
+ *
+ *  Absent if the markup has no such panel, which the switch's renderer checks for rather than assuming.
+ *  A `find` that misses is reported by whichever line first dereferences it, and that line names the
+ *  property it wanted instead of the panel it never had.
+ */
 const probePanel = CHARTS.find((panel) => panel.id === 'chart-probe');
+if (!probePanel) {
+  console.error('no chart-probe panel, so the probe metric switch is not drawn');
+}
 
 /** Fetch JSON, surfacing the server's error message rather than a bare status code. */
 async function api(path) {
@@ -663,6 +678,12 @@ function renderRanges() {
  *  the data still on screen, which is the previous metric's.
  */
 function renderProbeMetrics() {
+  // Nothing to point at means nothing to draw. Guarded because the alternative is `Cannot set properties
+  // of undefined`, thrown from the switch's own renderer, which says nothing about the panel that is
+  // actually missing — and takes the rest of the page down with it.
+  if (!probePanel) {
+    return;
+  }
   dom.probeMetrics.replaceChildren();
   for (const choice of PROBE_METRICS) {
     const button = document.createElement('button');

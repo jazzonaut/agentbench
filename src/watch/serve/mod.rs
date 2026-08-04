@@ -178,11 +178,7 @@ impl Server {
 
 /// The request's `Host`, if it sent one.
 fn host_header(request: &tiny_http::Request) -> Option<&str> {
-    request
-        .headers()
-        .iter()
-        .find(|header| header.field.equiv("Host"))
-        .map(|header| header.value.as_str())
+    header_value(request, "Host")
 }
 
 /// Write a [`Resp`] to a `tiny_http` request.
@@ -202,21 +198,46 @@ fn respond(request: tiny_http::Request, response: &Resp) -> std::io::Result<()> 
              frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
         ),
     ];
-    headers.push(header(
-        "Cache-Control",
-        if response.immutable {
-            "public, max-age=604800, immutable"
-        } else {
-            "no-store"
-        },
-    ));
+    // `no-cache` permits storing and requires asking, which is what an unversioned asset URL needs: the
+    // browser keeps its copy and finds out in one loopback round trip whether it is still the right one.
+    // `immutable` here instead would let a week-old script run against today's markup — see [`Resp::etag`].
+    let (cache_control, matched) = match &response.etag {
+        Some(etag) => {
+            headers.push(header("ETag", &format!("\"{etag}\"")));
+            let matched = header_value(&request, "If-None-Match")
+                .is_some_and(|value| response::matches_etag(value, etag));
+            ("no-cache", matched)
+        }
+        None => ("no-store", false),
+    };
+    headers.push(header("Cache-Control", cache_control));
+    // A 304 carries no body, and its `Content-Length` must be absent rather than zero — a zero would tell
+    // the browser the resource is now empty instead of unchanged.
+    let (status, body) = if matched {
+        (304, Vec::new())
+    } else {
+        (response.status, response.body.clone())
+    };
+    let length = (!matched).then_some(body.len());
     request.respond(tiny_http::Response::new(
-        tiny_http::StatusCode(response.status),
+        tiny_http::StatusCode(status),
         headers,
-        std::io::Cursor::new(response.body.clone()),
-        Some(response.body.len()),
+        std::io::Cursor::new(body),
+        length,
         None,
     ))
+}
+
+/// One request header's value, if the request carries it.
+///
+/// `name` is `&'static str` because `tiny_http`'s case-insensitive comparison requires one; every caller
+/// passes a literal anyway.
+fn header_value<'a>(request: &'a tiny_http::Request, name: &'static str) -> Option<&'a str> {
+    request
+        .headers()
+        .iter()
+        .find(|header| header.field.equiv(name))
+        .map(|header| header.value.as_str())
 }
 
 fn header(name: &str, value: &str) -> tiny_http::Header {

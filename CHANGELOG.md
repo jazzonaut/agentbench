@@ -2,6 +2,24 @@
 
 All notable changes to AgentBench are documented here. The project follows [Semantic Versioning](https://semver.org/).
 
+## [0.6.1] - 2026-08-04
+
+### Fixed
+
+- **The dashboard no longer renders a blank page against a cached copy of its own script.** Assets were
+  served as `Cache-Control: public, max-age=604800, immutable` at a URL carrying no version, while
+  `index.html` was sent `no-store`. So a browser that had opened the dashboard within the previous week
+  paired a freshly fetched document with a week-old `app.js` and ran each against the other's markup. In
+  0.6.0 that was fatal rather than cosmetic: the probe panel's element id changed, the stale script looked
+  up the old one, and `Cannot read properties of null (reading 'closest')` was thrown while the module was
+  still evaluating — which stops the rest of the file and leaves the whole page empty. Assets now carry an
+  entity tag derived from their bytes and are sent `no-cache`, so the browser keeps its copy and finds out
+  in one loopback round trip whether it is still the right one.
+- **A panel the markup does not define no longer takes the rest of the dashboard with it.** A missing chart
+  container is reported to the console and its chart skipped, and the probe metric switch is left undrawn
+  rather than throwing from inside its own renderer. A test asserts that every element id the scripts look
+  up exists in the markup they are served beside, which is the drift that caused this.
+
 ## [0.6.0] - 2026-08-04
 
 ### Added
@@ -409,6 +427,8 @@ All notable changes to AgentBench are documented here. The project follows [Sema
 - Privacy-safe JSON and Markdown reports with offline machine comparison.
 - Evidence-ranked diagnoses for system, network, security-scanner, and proxy bottlenecks.
 - Tag-driven Windows, Linux, macOS Intel, and macOS Apple Silicon GitHub releases.
+
+[0.6.1]: https://github.com/jazzonaut/agentbench/releases/tag/v0.6.1
 
 [0.6.0]: https://github.com/jazzonaut/agentbench/releases/tag/v0.6.0
 

@@ -4,6 +4,7 @@
 //! binding a socket, and `tiny_http` appears in exactly one file.
 
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 /// A parsed request, reduced to what handlers actually need.
@@ -50,8 +51,14 @@ pub struct Resp {
     pub status: u16,
     pub content_type: &'static str,
     pub body: Vec<u8>,
-    /// Whether the body may be cached by the browser.
-    pub immutable: bool,
+    /// Entity tag for a body the browser may reuse after asking, when there is one.
+    ///
+    /// Present on assets and absent everywhere else, which is the whole caching policy. The assets used to
+    /// be sent as `immutable` for a week instead, at a URL carrying no version — so a browser that had
+    /// opened the dashboard in the previous week paired a fresh `index.html` with a stale `app.js` and ran
+    /// whichever one it had against the other's markup. That is not a theoretical staleness: renaming one
+    /// element's id took the entire page down with `Cannot read properties of null`.
+    pub etag: Option<String>,
 }
 
 impl Resp {
@@ -65,7 +72,7 @@ impl Resp {
                 status: 200,
                 content_type: "application/json; charset=utf-8",
                 body,
-                immutable: false,
+                etag: None,
             },
             Err(error) => Self::error(500, &format!("failed to serialise response: {error}")),
         }
@@ -76,17 +83,17 @@ impl Resp {
             status: 200,
             content_type: "text/html; charset=utf-8",
             body: body.as_bytes().to_vec(),
-            immutable: false,
+            etag: None,
         }
     }
 
-    /// A vendored static asset, safe to cache because it only changes with the binary.
+    /// A static asset compiled into the binary, tagged so a browser can ask whether its copy still stands.
     pub fn asset(content_type: &'static str, body: &'static [u8]) -> Self {
         Self {
             status: 200,
             content_type,
+            etag: Some(etag(body)),
             body: body.to_vec(),
-            immutable: true,
         }
     }
 
@@ -97,13 +104,36 @@ impl Resp {
             status,
             content_type: "application/json; charset=utf-8",
             body: serde_json::to_vec(&body).unwrap_or_else(|_| b"{}".to_vec()),
-            immutable: false,
+            etag: None,
         }
     }
 
     pub fn not_found() -> Self {
         Self::error(404, "not found")
     }
+}
+
+/// A short entity tag over an asset's bytes.
+///
+/// Derived from the content and not from the release version, which is the distinction that matters here.
+/// The assets change whenever the binary does, including between two builds of the same version — so a tag
+/// naming the version would go stale precisely while someone was editing them, which is where a browser
+/// serving yesterday's script is hardest to suspect.
+///
+/// Eight bytes of SHA-256. This is a cache validator on a loopback server, not a security boundary: it has
+/// to change when the bytes do, and nothing is deciding trust on it.
+fn etag(body: &[u8]) -> String {
+    hex::encode(&Sha256::digest(body)[..8])
+}
+
+/// Whether an `If-None-Match` value covers `etag`.
+///
+/// Quotes and the weak marker are stripped, and the value is treated as the comma-separated list the
+/// specification allows, because a browser is entitled to send one. `*` matches any current representation.
+pub fn matches_etag(if_none_match: &str, etag: &str) -> bool {
+    if_none_match.split(',').map(str::trim).any(|candidate| {
+        candidate == "*" || candidate.trim_start_matches("W/").trim_matches('"') == etag
+    })
 }
 
 /// Parse `a=1&b=2`, percent-decoding both sides.
@@ -214,5 +244,29 @@ mod tests {
         let missing = Resp::not_found();
         assert_eq!(missing.status, 404);
         assert!(String::from_utf8_lossy(&missing.body).contains("not found"));
+    }
+
+    /// The tag has to follow the bytes, or a browser keeps yesterday's script for ever.
+    #[test]
+    fn an_entity_tag_changes_with_the_body() {
+        assert_ne!(etag(b"one"), etag(b"two"));
+        assert_eq!(etag(b"one"), etag(b"one"));
+    }
+
+    /// What browsers actually send back: the tag in quotes, sometimes weak, sometimes several.
+    #[test]
+    fn a_returned_entity_tag_is_recognised_however_it_is_quoted() {
+        assert!(matches_etag("\"abc123\"", "abc123"));
+        assert!(matches_etag("W/\"abc123\"", "abc123"));
+        assert!(matches_etag("\"other\", \"abc123\"", "abc123"));
+        assert!(matches_etag("*", "abc123"));
+    }
+
+    /// A tag that does not match must produce the body, not a 304 the browser cannot satisfy.
+    #[test]
+    fn a_different_entity_tag_does_not_match() {
+        assert!(!matches_etag("\"stale\"", "abc123"));
+        assert!(!matches_etag("", "abc123"));
+        assert!(!matches_etag("\"abc\"", "abc123"));
     }
 }
