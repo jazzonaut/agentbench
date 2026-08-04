@@ -79,7 +79,10 @@ impl Draft {
         // A zero-day window compares today against nothing and reports every metric as insufficient,
         // which looks like a broken daemon rather than a setting.
         self.baseline_window_days = self.baseline_window_days.max(1);
-        self.samples_raw_days = self.samples_raw_days.max(1);
+        // `samples_raw_days` is deliberately *not* floored with it. Zero there is a coherent request —
+        // keep no raw samples, summarise every minute as soon as it finishes — which the loader accepts
+        // and the writer already implements; raising it to one here made this the only one of the three
+        // paths that disagreed, so a user who asked for nothing raw got a day of it without being told.
     }
 
     /// Normalise, then write the changed keys into `watch.toml`.
@@ -286,6 +289,24 @@ mod tests {
         assert_eq!(written.probe_interval, config::SHORTEST_PROBE);
         assert_eq!(written.baseline_window_days, 1);
         let loaded = WatchConfig::load(Some(temp.path().to_path_buf())).unwrap();
+        assert_eq!(Draft::from_config(&loaded), written);
+    }
+
+    /// Keeping no raw samples is a choice, and the file, the save path and the loader all read it the same.
+    #[test]
+    fn a_retention_window_of_no_days_survives_the_save_and_the_loader() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join(CONFIG_FILE), DEFAULT_CONFIG_TOML).unwrap();
+        let mut nothing_raw = draft();
+        nothing_raw.samples_raw_days = 0;
+        let written = nothing_raw.save(temp.path()).unwrap();
+        assert_eq!(
+            written.samples_raw_days, 0,
+            "the save path used to raise this to a day without saying so"
+        );
+
+        let loaded = WatchConfig::load(Some(temp.path().to_path_buf())).unwrap();
+        assert_eq!(loaded.retention.samples_raw_days, 0);
         assert_eq!(Draft::from_config(&loaded), written);
     }
 

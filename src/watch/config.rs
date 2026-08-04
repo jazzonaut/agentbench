@@ -335,7 +335,7 @@ probes_enabled = true
 probe_network = true
 probe_interval = "15m"
 # Probes must run on the volume whose performance matters. Defaults to the data directory.
-# scratch_dir = "D:/Stuff/.agentbench-scratch"
+# scratch_dir = "D:/.agentbench-scratch"
 
 [sessions]
 # Reading transcripts costs nothing and is where the real agent timings come from.
@@ -346,7 +346,8 @@ roots = ["~/.claude/projects"]
 poll_interval = "30s"
 
 [retention]
-# Raw samples are rolled up to one-minute aggregates after this many days.
+# Raw samples are rolled up to one-minute aggregates after this many days. 0 keeps none of them:
+# every minute is summarised as soon as it has finished.
 samples_raw_days = 14
 
 [analysis]
@@ -471,6 +472,9 @@ impl FileConfig {
                 poll_interval: interval(self.sessions.poll_interval, "30s")?.max(SHORTEST_POLL),
             },
             retention: RetentionConfig {
+                // No floor, unlike the window below it, and the asymmetry is deliberate: zero days here
+                // asks for no raw samples at all, which the rollup implements exactly, whereas zero days
+                // of baseline asks for a comparison against nothing.
                 samples_raw_days: self.retention.samples_raw_days.unwrap_or(14),
             },
             analysis: AnalysisConfig {

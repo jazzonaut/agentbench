@@ -16,7 +16,7 @@ use crate::watch::{
     store::{Level, Sink, Store, WriterHealth},
 };
 use anyhow::{Context, Result};
-use response::{Req, Resp};
+use response::{Method, Req, Resp};
 use std::{
     net::SocketAddr,
     sync::{
@@ -174,7 +174,11 @@ impl Server {
             // server, and answering it at all is the whole of the vulnerability.
             let response = if origin::is_own_host(host_header(&request), port) {
                 match store.reader() {
-                    Ok(reader) => router::route(&Req::parse(request.url()), &reader, &settings),
+                    Ok(reader) => {
+                        let req = Req::parse(request.url())
+                            .with_method(Method::parse(request.method().as_str()));
+                        router::route(&req, &reader, &settings)
+                    }
                     Err(error) => Resp::error(503, &format!("database unavailable: {error}")),
                 }
             } else {
@@ -225,6 +229,11 @@ fn respond(request: tiny_http::Request, response: &Resp) -> std::io::Result<()> 
         None => ("no-store", false),
     };
     headers.push(header("Cache-Control", cache_control));
+    // A refusal has to say what would have been accepted, and for this server that is the whole read
+    // surface. Keyed off the status because [`Resp::method_not_allowed`] is the only thing that produces it.
+    if response.status == 405 {
+        headers.push(header("Allow", "GET, HEAD"));
+    }
     // A 304 carries no body, and its `Content-Length` must be absent rather than zero — a zero would tell
     // the browser the resource is now empty instead of unchanged.
     let (status, body) = if matched {

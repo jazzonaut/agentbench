@@ -334,7 +334,8 @@ path and branch a session ran in. No prompts, no code, no command output, nothin
 
 The database does not grow without limit. Passive samples arrive every few seconds, so after
 `samples_raw_days` (14 by default) each whole minute is summarised into one row and the raw samples are
-deleted. Charts cross that boundary without being asked to, and the response says which part of the line is
+deleted; `0` keeps none of them, summarising every minute as soon as it has finished. Charts cross that
+boundary without being asked to, and the response says which part of the line is
 summarised and whether each point is that minute's mean or its peak: a swap chart keeps peaks, because a
 thirty-second burst is the event, while memory in use keeps its average. Nothing else is pruned - probe
 runs, session metrics and run markers arrive slowly and are the whole point of keeping a record, so a year

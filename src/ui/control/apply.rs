@@ -140,7 +140,7 @@ pub fn commit(state: &mut State, field: Field, text: &str) -> Result<String> {
             save(state, "raw sample retention")
         }
         Field::BaselineWindowDays => {
-            state.draft.baseline_window_days = days(text)?;
+            state.draft.baseline_window_days = window_days(text)?;
             save(state, "the baseline window")
         }
         Field::ServerPort => {
@@ -333,11 +333,24 @@ fn recorded(applied: bool, message: &str) -> String {
 }
 
 /// A whole number of days, with or without a trailing `d`.
+///
+/// Zero is a number of days like any other here, and whether it means anything is the caller's question:
+/// see [`window_days`] for the one field where it does not. Retention accepts it — keeping no raw samples
+/// is a real choice, and the loader and the writer have always honoured it.
 fn days(text: &str) -> Result<u32> {
     let trimmed = text.trim().trim_end_matches(['d', 'D']);
-    let value: u32 = trimmed
+    trimmed
         .parse()
-        .with_context(|| format!("{text:?} is not a number of days"))?;
+        .with_context(|| format!("{text:?} is not a number of days"))
+}
+
+/// A number of days that has to span something.
+///
+/// The baseline window is the one field a zero breaks: with nothing to compare against, every metric
+/// reports `insufficient` and the page reads like a broken daemon rather than a setting. Rejected here
+/// rather than silently raised to one, for the reason [`commit`] gives.
+fn window_days(text: &str) -> Result<u32> {
+    let value = days(text)?;
     if value == 0 {
         bail!("a window of zero days compares today against nothing");
     }
@@ -357,9 +370,25 @@ mod tests {
     }
 
     #[test]
-    fn days_reject_nonsense_and_zero() {
-        for text in ["", "d", "seven", "-3", "0", "0d"] {
+    fn days_reject_nonsense() {
+        for text in ["", "d", "seven", "-3"] {
             assert!(days(text).is_err(), "{text:?} should be refused");
+        }
+    }
+
+    /// Zero days means one thing for retention and nothing at all for a comparison window.
+    ///
+    /// The three paths used to disagree: the loader took a `samples_raw_days` of zero at its word, the
+    /// control centre refused to type it and then raised it to one on save anyway.
+    #[test]
+    fn zero_days_is_retention_keeping_nothing_and_never_a_baseline_window() {
+        assert_eq!(days("0").unwrap(), 0);
+        assert_eq!(days("0d").unwrap(), 0);
+        for text in ["0", "0d"] {
+            assert!(
+                window_days(text).is_err(),
+                "{text:?} is not a window to compare against"
+            );
         }
     }
 

@@ -57,8 +57,15 @@ const AGENT_WORKING_CORE_PERCENT: f32 = 20.0;
 /// Takes the reading that precedes a measurement.
 ///
 /// Owns a `System` because CPU percentages are a delta between two refreshes and therefore need
-/// continuity. Reused across probes rather than rebuilt, so the process-table walk happens on the
-/// discovery cadence rather than four times an hour.
+/// continuity: rebuilt per probe, the first refresh of each new `System` would be no reading at all.
+///
+/// The target set is *not* carried over for that reason. [`Observer::prime`] rediscovers on every probe —
+/// once per probe interval, so four process-table walks an hour at the shipped 15 minutes — because a set
+/// discovered fifteen minutes ago describes whatever was running then, and the whole claim the tag makes is
+/// about the moment this measurement began. The walk is affordable at that cadence precisely because it is
+/// the probe's own cadence and not the sampler's; what matters is that it happens in `prime`, outside the
+/// interval whose CPU use is being measured. The field is here so `prime` and [`Observer::read`] can share
+/// one set across the sub-second gap between them.
 pub struct Observer {
     system: System,
     targets: Targets,

@@ -18,6 +18,22 @@ All notable changes to AgentBench are documented here. The project follows [Sema
   invisible, and it is the setting most likely to be wrong: a name matching most of a developer's machine
   tags every probe as contended, which empties the comparable subset and leaves every verdict reading
   `insufficient` indefinitely, with nothing anywhere to say why.
+- **The day's totals moved off the dashboard's five-second poll to a new `/api/today`.** `/api/live` is
+  meant to be one row per stream, which is what makes it affordable twelve times a minute, but it also
+  aggregated the whole day: two counts, a median and a cache ratio, recomputed on every tick while the
+  server answers one request at a time on its own thread. None of those numbers can move faster than the
+  importer that feeds them, which polls every thirty seconds at best. They are now on the minute cadence
+  beside status and verdicts, and the page ticks "since the last agent activity" against its own clock from
+  the timestamp it already holds, so that tile still reads at five-second resolution for no query at all.
+- **The dashboard answers `GET` and `HEAD`, and refuses everything else with a `405`.** Dispatch was on the
+  path alone, so `POST /api/series` was answered as though it were a `GET`. Harmless while every handler is
+  a read through `Reader` — and a hole in the router rather than in the new handler on the day one is not,
+  which is the harder place to notice it. One match arm now, while it costs one match arm.
+- **`samples_raw_days = 0` means the same thing wherever it is written.** Three paths disagreed: the loader
+  took it at its word, the control centre refused to accept the value and then raised it to a day on save
+  anyway. Keeping no raw samples is a coherent request — every minute is summarised as soon as it has
+  finished, which is exactly what the rollup already did — so it is now accepted by all three. The baseline
+  window keeps its floor of one day, because zero there asks for a comparison against nothing.
 
 ### Fixed
 
@@ -106,6 +122,23 @@ All notable changes to AgentBench are documented here. The project follows [Sema
   the delay and tray choice follow that reading, so a registration that was refused leaves the rows
   describing the task that is still there rather than the change that did not happen. Both rows also say
   which of the two things happened: applied to the task, or recorded for when autostart is switched on.
+- **An append that does not move a transcript's timestamp is imported.** The modification time was the only
+  change detector, and it is not a reliable one: file times are coarse on some filesystems, and on Windows
+  the directory entry a scan reads is updated lazily for a file another process still holds open — which is
+  every live transcript. Rows appended inside the recorded tick were invisible until some later append moved
+  the timestamp. The length is compared as well now, which the scan already had in hand.
+- **A machine row follows the machine it describes.** The upsert refreshed `last_seen`, `os_version`, `cpu`,
+  the core count and the memory size, but not `os` or `architecture` — so a reinstalled machine kept
+  describing the system it was first seen running, under the id every measurement in the file is attributed
+  to. `first_seen` remains the one column that does not move.
+- **A slow query no longer makes the dashboard queue more work behind it.** Three unguarded `setInterval`
+  loaders against a server that answers one request at a time: a slow query did not delay one poll, it
+  queued every poll behind it, so the moment the machine was busiest was the moment the page asked it for
+  the most. A tick that arrives while the previous one is still in flight is now dropped — every payload is
+  a snapshot rather than a delta, and the next tick is already scheduled. Clicking a range or the contention
+  filter still redraws immediately.
+- **The shipped `watch.toml` no longer carries a developer's directory as its example.** The commented-out
+  `scratch_dir` line was written on first run with the path it happened to be authored on.
 
 ## [0.6.0] - 2026-08-04
 

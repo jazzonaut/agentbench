@@ -33,9 +33,29 @@ const MAX_REPORTED_FAILURES: usize = 3;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Position {
     /// Byte offset the next pass starts at.
+    ///
+    /// Not the same as [`Position::size`]: a measurement whose second row has not arrived yet holds this
+    /// back to the row still waiting, so it can sit a long way behind the end of the file.
     offset: i64,
-    /// Modification time when that offset was recorded, and the only change detector.
+    /// Length of the file when it was last read.
+    ///
+    /// The second half of the change detector. mtime alone is not enough: file times are coarse on some
+    /// filesystems and, on Windows, the directory entry a scan reads is updated lazily for a file another
+    /// process still holds open — which is every live transcript. An append landing inside the same
+    /// recorded tick was then invisible until a later one moved the timestamp.
+    size: i64,
+    /// Modification time when that offset was recorded.
     mtime_ms: i64,
+}
+
+impl Position {
+    /// Whether a scanned transcript still looks exactly like what was read.
+    ///
+    /// Both facts have to agree. Either one moving is a file to read again; a size that has *shrunk* is a
+    /// replaced file, which [`import`] handles by starting over.
+    fn matches(&self, transcript: &discovery::Transcript) -> bool {
+        self.mtime_ms == transcript.mtime_ms && self.size == transcript.size
+    }
 }
 
 /// What one pass over every transcript did.
@@ -147,7 +167,7 @@ fn import_once(
             break;
         }
         let recorded = positions.get(&transcript.path).copied();
-        if recorded.is_some_and(|position| position.mtime_ms == transcript.mtime_ms) {
+        if recorded.is_some_and(|position| position.matches(transcript)) {
             continue;
         }
         let offset = recorded.map_or(0, |position| position.offset);
@@ -168,6 +188,10 @@ fn import_once(
                     transcript.path.clone(),
                     Position {
                         offset: mark.size,
+                        // The length the scan saw, not the length the read found. If the file grew while
+                        // this pass was reading it, the next pass sees a size it has not accounted for and
+                        // reads again, which is the answer that loses nothing.
+                        size: transcript.size,
                         mtime_ms: mark.mtime,
                     },
                 );
@@ -279,6 +303,12 @@ fn report(sink: &Sink, pass: &Pass, what: &str, started: Instant) {
 ///
 /// Read once, at startup, and maintained in memory afterwards: the importer is the only writer of
 /// these positions, so re-reading them every pass would only re-read what it just wrote.
+///
+/// The recorded watermark is a resume offset rather than a file length, so [`Position::size`] starts as the
+/// one the database can supply. For a transcript with nothing left open the two are the same value; for one
+/// still waiting on a row the recovered size is short, and the first pass after a restart reads it again —
+/// at most the re-read budget, once. Recording the length as well would need a column, and a column is a
+/// migration for a fact that costs one bounded read to rediscover.
 fn load_positions(reader: &Reader) -> anyhow::Result<HashMap<PathBuf, Position>> {
     Ok(queries::sessions::watermarks(reader.conn())?
         .into_iter()
@@ -287,6 +317,7 @@ fn load_positions(reader: &Reader) -> anyhow::Result<HashMap<PathBuf, Position>>
                 PathBuf::from(mark.path),
                 Position {
                     offset: mark.size,
+                    size: mark.size,
                     mtime_ms: mark.mtime,
                 },
             )
@@ -452,6 +483,41 @@ mod tests {
             "one new turn, and no duplicate of the first"
         );
         assert_eq!(second.tools, 2);
+    }
+
+    /// An append the modification time does not admit to is still imported.
+    ///
+    /// mtime is written back to what it was before the append, which is what a coarse-granularity
+    /// filesystem does for free and what Windows does of its own accord while another process holds the
+    /// file open: the directory entry a scan reads goes on reporting the timestamp from before the write.
+    /// With mtime as the only change detector those rows were invisible until some later append moved it.
+    #[test]
+    fn an_append_that_does_not_move_the_modification_time_is_still_imported() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("watch.db");
+        let root = temp.path().join("projects");
+        write(&root, "one.jsonl", &transcript("1"));
+        let path = root.join("D--Work").join("one.jsonl");
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(import_into(&db, &root, 1).turns, 1);
+
+        write(
+            &root,
+            "one.jsonl",
+            &format!("{}{}", transcript("1"), transcript("9")),
+        );
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(before)
+            .expect("restore the modification time");
+
+        let second = import_into(&db, &root, 1);
+        assert_eq!(
+            second.turns, 2,
+            "the appended turn is longer than the file was, whatever the timestamp says"
+        );
     }
 
     /// The table that used to have no delete path at all.

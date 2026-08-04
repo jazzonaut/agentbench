@@ -170,6 +170,11 @@ fn configure(conn: &Connection) -> Result<()> {
 ///
 /// Identity is the existing hashed hostname, so the local database uses the same machine key that
 /// exported reports do.
+///
+/// Every column except `first_seen` is refreshed, because every one of them can change under a key that
+/// does not: a machine is reinstalled with a different operating system, or the same disk is moved into a
+/// new box. Leaving `os` and `architecture` out — they were, until this comment — left a row describing a
+/// machine that no longer exists, under an id every measurement in the file is attributed to.
 fn register_machine(conn: &Connection, inventory: &Inventory) -> Result<String> {
     let id = inventory.hostname_hash.clone();
     let now = now_ms();
@@ -177,8 +182,8 @@ fn register_machine(conn: &Connection, inventory: &Inventory) -> Result<String> 
         "INSERT INTO machines (id, hostname_hash, os, os_version, architecture, cpu,
              logical_cores, memory_bytes, first_seen, last_seen)
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?9)
-         ON CONFLICT(id) DO UPDATE SET last_seen = ?9, os_version = ?4, cpu = ?6,
-             logical_cores = ?7, memory_bytes = ?8",
+         ON CONFLICT(id) DO UPDATE SET last_seen = ?9, os = ?3, os_version = ?4,
+             architecture = ?5, cpu = ?6, logical_cores = ?7, memory_bytes = ?8",
         params![
             id,
             inventory.hostname_hash,
@@ -308,6 +313,10 @@ mod tests {
         assert!(error.to_lowercase().contains("readonly"), "{error}");
     }
 
+    /// One row per machine, and every mutable column on it follows the machine.
+    ///
+    /// The reinstall case: same hostname, different operating system and architecture. Those two used to be
+    /// written once and never updated, so the row went on describing the machine as it was first seen.
     #[test]
     fn reopening_keeps_one_machine_row_and_refreshes_it() {
         let temp = tempfile::tempdir().unwrap();
@@ -318,13 +327,47 @@ mod tests {
                 .shutdown()
                 .unwrap();
         }
-        let store = Store::open(&path, &inventory()).unwrap();
+        let first_seen: i64 = {
+            let store = Store::open(&path, &inventory()).unwrap();
+            let reader = store.reader().unwrap();
+            reader
+                .conn()
+                .query_row("SELECT first_seen FROM machines", [], |row| row.get(0))
+                .unwrap()
+        };
+
+        let reinstalled = Inventory {
+            os: "OtherOS".into(),
+            architecture: "aarch64".into(),
+            logical_cores: 12,
+            ..inventory()
+        };
+        let store = Store::open(&path, &reinstalled).unwrap();
         let reader = store.reader().unwrap();
-        let machines: i64 = reader
+        let (machines, os, architecture, cores, seen): (i64, String, String, i64, i64) = reader
             .conn()
-            .query_row("SELECT count(*) FROM machines", [], |row| row.get(0))
+            .query_row(
+                "SELECT count(*), os, architecture, logical_cores, first_seen FROM machines",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
             .unwrap();
         assert_eq!(machines, 1);
+        assert_eq!(os, "OtherOS");
+        assert_eq!(architecture, "aarch64");
+        assert_eq!(cores, 12);
+        assert_eq!(
+            seen, first_seen,
+            "first_seen is the one column that must not move"
+        );
     }
 
     /// Every session record kind through the real writer, including the one that must not duplicate.

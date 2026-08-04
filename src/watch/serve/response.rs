@@ -7,9 +7,41 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
+/// The request methods this server recognises.
+///
+/// Not a general HTTP method type. Every endpoint is a read through `Reader`, so the only distinction worth
+/// modelling is whether a request may be answered at all, and everything else collapses into one arm.
+/// `Head` is separate from `Get` only because the transport has to know not to write a body; the router
+/// treats the two identically.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Method {
+    #[default]
+    Get,
+    Head,
+    Other,
+}
+
+impl Method {
+    /// Recognise a method name. Method names are case-sensitive, unlike header field names.
+    pub fn parse(name: &str) -> Self {
+        match name {
+            "GET" => Self::Get,
+            "HEAD" => Self::Head,
+            _ => Self::Other,
+        }
+    }
+
+    /// Whether a request arriving by this method may be answered.
+    pub fn is_read(self) -> bool {
+        matches!(self, Self::Get | Self::Head)
+    }
+}
+
 /// A parsed request, reduced to what handlers actually need.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Req {
+    /// How the request arrived.
+    pub method: Method,
     /// Path with the query string removed, e.g. `/api/series`.
     pub path: String,
     /// Decoded query parameters.
@@ -18,12 +50,22 @@ pub struct Req {
 
 impl Req {
     /// Split a raw request target into path and decoded query parameters.
+    ///
+    /// The method defaults to `GET`, which is what a bare target means: every caller with a real method to
+    /// report adds it with [`Req::with_method`], and a test naming only a path is asking about a read.
     pub fn parse(target: &str) -> Self {
         let (path, query) = target.split_once('?').unwrap_or((target, ""));
         Self {
+            method: Method::Get,
             path: path.to_string(),
             query: parse_query(query),
         }
+    }
+
+    /// The same request, arriving by `method`.
+    pub fn with_method(mut self, method: Method) -> Self {
+        self.method = method;
+        self
     }
 
     /// A query parameter, if present and non-empty.
@@ -110,6 +152,16 @@ impl Resp {
 
     pub fn not_found() -> Self {
         Self::error(404, "not found")
+    }
+
+    /// A refusal for a method this server does not answer.
+    ///
+    /// The gate exists while it costs nothing rather than on the day it is needed. Dispatching on the path
+    /// alone answered `POST /api/series` as though it were a `GET`, which is harmless only for as long as
+    /// every handler is a read — and the day one is not, the hole is in the router rather than in the new
+    /// handler, which is the harder place to notice it.
+    pub fn method_not_allowed() -> Self {
+        Self::error(405, "this dashboard answers GET and HEAD only")
     }
 }
 

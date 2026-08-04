@@ -196,7 +196,7 @@ impl Field {
                 "Reads Claude Code transcripts. Costs nothing and is where real agent timings come from."
             }
             Self::SamplesRawDays => {
-                "Raw samples are rolled up to per-minute aggregates after this."
+                "Raw samples are rolled up to per-minute aggregates after this. 0 keeps none."
             }
             Self::BaselineWindowDays => "Trailing days today is compared against.",
             Self::ServerEnabled => "Serve the web dashboard on loopback while collecting.",

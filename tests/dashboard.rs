@@ -513,18 +513,18 @@ fn transcripts_are_imported_charted_and_summarised() {
     assert_eq!(points[0]["value"].as_f64(), Some(11.0), "{series}");
 
     // And the same numbers appear in the tiles, counted since local midnight.
-    let live: serde_json::Value =
-        serde_json::from_str(&daemon.get("/api/live")).expect("live json");
-    let today = &live["today"];
-    let day_start = live["day_start_ts"].as_i64().expect("day start");
+    let payload: serde_json::Value =
+        serde_json::from_str(&daemon.get("/api/today")).expect("today json");
+    let today = &payload["today"];
+    let day_start = payload["day_start_ts"].as_i64().expect("day start");
     if base.timestamp_millis() >= day_start {
-        assert_eq!(today["turns"].as_i64(), Some(1), "{live}");
-        assert_eq!(today["tool_calls"].as_i64(), Some(1), "{live}");
-        assert_eq!(today["sessions"].as_i64(), Some(1), "{live}");
-        assert_eq!(today["output_tokens"].as_i64(), Some(42), "{live}");
-        assert_eq!(today["tool_read_p50_ms"].as_f64(), Some(11.0), "{live}");
+        assert_eq!(today["turns"].as_i64(), Some(1), "{payload}");
+        assert_eq!(today["tool_calls"].as_i64(), Some(1), "{payload}");
+        assert_eq!(today["sessions"].as_i64(), Some(1), "{payload}");
+        assert_eq!(today["output_tokens"].as_i64(), Some(42), "{payload}");
+        assert_eq!(today["tool_read_p50_ms"].as_f64(), Some(11.0), "{payload}");
         // 900 of 1000 prompt tokens came from the cache.
-        assert_eq!(today["cache_hit_ratio"].as_f64(), Some(0.9), "{live}");
+        assert_eq!(today["cache_hit_ratio"].as_f64(), Some(0.9), "{payload}");
     }
 
     // An unchanged transcript is not read again, which is what the watermark is for.

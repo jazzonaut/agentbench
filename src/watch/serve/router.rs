@@ -6,19 +6,27 @@
 use crate::watch::{
     serve::{
         Settings, assets,
-        handlers::{annotations, live, series, status, verdicts},
+        handlers::{annotations, live, series, status, today, verdicts},
         response::{Req, Resp},
     },
     store::Reader,
 };
 
 /// Route a request to its handler.
+///
+/// The method is checked before the path, and before the database is touched: what a `POST` asks for is not
+/// something any of these endpoints can do, so which one it names does not matter. See
+/// [`Resp::method_not_allowed`].
 pub fn route(req: &Req, reader: &Reader, settings: &Settings) -> Resp {
+    if !req.method.is_read() {
+        return Resp::method_not_allowed();
+    }
     if let Some(asset) = assets::get(&req.path) {
         return asset;
     }
     match req.path.as_str() {
         "/api/live" => live::handle(req, reader),
+        "/api/today" => today::handle(req, reader),
         "/api/series" => series::handle(req, reader),
         "/api/status" => status::handle(req, reader, settings),
         "/api/verdicts" => verdicts::handle(req, reader, settings.baseline_window_days),
@@ -30,7 +38,10 @@ pub fn route(req: &Req, reader: &Reader, settings: &Settings) -> Resp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{model::Inventory, watch::store::Store};
+    use crate::{
+        model::Inventory,
+        watch::{serve::response::Method, store::Store},
+    };
     use serde_json::Value;
 
     struct Fixture {
@@ -85,6 +96,7 @@ mod tests {
         let fixture = Fixture::new();
         for target in [
             "/api/live",
+            "/api/today",
             "/api/series?metric=cpu_percent",
             "/api/series?metric=probe:filesystem.small_file_ops_s",
             "/api/series?metric=probe:filesystem.small_file_ops_s&contended=exclude",
@@ -119,6 +131,13 @@ mod tests {
         assert!(live["machine_id"].as_str().is_some());
 
         assert!(live["probe"].is_null(), "{live}");
+
+        // A day with no imported transcripts is a day of zeroes, not a missing payload: the tiles read
+        // "No agent activity" from the turn count, and the day they say it about comes from the server.
+        let today = fixture.json("/api/today");
+        assert!(today["day_start_ts"].as_i64().is_some(), "{today}");
+        assert_eq!(today["today"]["turns"], 0, "{today}");
+        assert!(today["today"]["last_activity_ts"].is_null(), "{today}");
 
         let status = fixture.json("/api/status");
         assert_eq!(status["health"]["samples"], 0);
@@ -450,6 +469,27 @@ mod tests {
                 .status,
             400
         );
+    }
+
+    /// A write method is refused whatever it names, and the two read methods are not.
+    #[test]
+    fn anything_that_is_not_a_read_is_refused_before_the_path_is_considered() {
+        let fixture = Fixture::new();
+        let reader = fixture.store.reader().unwrap();
+        let answer = |method: Method, target: &str| -> Resp {
+            let req = Req::parse(target).with_method(method);
+            route(&req, &reader, &Settings::default())
+        };
+
+        for target in ["/", "/assets/app.js", "/api/live", "/api/nonsense"] {
+            let refused = answer(Method::Other, target);
+            assert_eq!(refused.status, 405, "{target}: {}", body(&refused));
+            assert_ne!(answer(Method::Get, target).status, 405, "{target}");
+        }
+        // A HEAD is a GET whose body the transport drops, so the router must answer it in full.
+        let head = answer(Method::Head, "/api/live");
+        assert_eq!(head.status, 200, "{}", body(&head));
+        assert!(!head.body.is_empty(), "the handler ran");
     }
 
     #[test]

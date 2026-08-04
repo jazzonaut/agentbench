@@ -11,4 +11,5 @@ pub mod annotations;
 pub mod live;
 pub mod series;
 pub mod status;
+pub mod today;
 pub mod verdicts;

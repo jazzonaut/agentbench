@@ -26,8 +26,9 @@ const MAX_FILES: usize = 20_000;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Transcript {
     pub path: PathBuf,
+    /// Length in bytes, which the importer compares as well as the timestamp.
     pub size: i64,
-    /// Last modification time in epoch milliseconds, and the only change detector used.
+    /// Last modification time in epoch milliseconds.
     pub mtime_ms: i64,
 }
 

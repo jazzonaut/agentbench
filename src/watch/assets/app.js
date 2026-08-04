@@ -7,12 +7,13 @@ import { createChart } from './chart.js';
 
 /** Live tiles refresh on this cadence; the server samples independently of it.
  *
- *  Only /api/live rides this poll. It reads one row per stream, which is what makes it affordable
- *  five times a minute; the aggregate endpoints are on {@link HISTORY_POLL_MS} for the opposite reason.
+ *  Only /api/live rides this poll, and it reads one row per stream, which is what makes it affordable
+ *  twelve times a minute. Every endpoint that aggregates — status, verdicts, the day's activity — is on
+ *  {@link HISTORY_POLL_MS} for the opposite reason.
  */
 const LIVE_POLL_MS = 5000;
 
-/** History, health, and verdicts reload here: they change slowly and each costs a scan to compute. */
+/** History, health, verdicts and the day's totals reload here: each costs a scan to compute. */
 const HISTORY_POLL_MS = 60000;
 
 const RANGES = [
@@ -233,8 +234,10 @@ const NOTES = {
   },
   lastActivity: {
     title: 'Last agent activity',
-    text: 'Time since the most recent turn or tool call in an imported transcript. Not a measure of the'
-      + " daemon's own freshness — that is at the foot of the page.",
+    text: 'Time since the most recent turn or tool call in an imported transcript. The age ticks with the'
+      + ' live tiles, but the totals in this section are re-counted once a minute, so a turn that has just'
+      + " landed can take that long to appear. Not a measure of the daemon's own freshness — that is at the"
+      + ' foot of the page.',
   },
 };
 
@@ -710,11 +713,26 @@ function renderProbeMetrics() {
 /** Reported by /api/status, which is polled far less often than the tiles that display it. */
 let uplotVersion = null;
 
+/** The day's activity as last fetched, and the day it covers.
+ *
+ *  Held rather than refetched with the live tiles. /api/today is a scan of the whole day — two aggregates
+ *  plus two percentile passes — and the importer feeding it polls every thirty seconds at best, so there is
+ *  nothing there to see twelve times a minute. The one figure that does move continuously is "since the last
+ *  agent activity", and that is a timestamp: re-rendering the cached payload against the browser's clock on
+ *  every live poll keeps the tile ticking for no query at all.
+ *
+ *  The day start comes from the server both here and on /api/live, because a boundary computed from the
+ *  browser's clock could name a different day than the one the totals were counted over.
+ */
+let todayActivity = null;
+let dayStartTs = null;
+
 async function loadLive() {
   try {
     const live = await api('/api/live');
     renderTiles(live);
-    renderToday(live.today, live.day_start_ts);
+    dayStartTs = live.day_start_ts;
+    renderToday(todayActivity, dayStartTs);
     const machine = `machine ${live.machine_id.slice(0, 12)}`;
     dom.subtitle.textContent = uplotVersion ? `${machine} · uPlot ${uplotVersion}` : machine;
   } catch (error) {
@@ -722,21 +740,27 @@ async function loadLive() {
   }
 }
 
-/** Daemon health and today's verdicts, on the slow cadence.
+/** Daemon health, today's verdicts and today's totals, on the slow cadence.
  *
- *  Both used to ride along with the live tiles every five seconds, and between them they cost the
+ *  All three used to ride along with the live tiles every five seconds, and between them they cost the
  *  machine more than the collectors they report on: /api/status runs six count(*) aggregates over the
- *  fact tables, and /api/verdicts re-derives a whole trailing window, one aggregation per day in it.
- *  The server handles requests one at a time on the main thread at normal priority, so an open
- *  dashboard was biasing the very series it was drawing.
+ *  fact tables, /api/verdicts re-derives a whole trailing window, one aggregation per day in it, and
+ *  /api/today scans the day for a median and a cache ratio. The server handles requests one at a time on
+ *  the main thread at normal priority, so an open dashboard was biasing the very series it was drawing.
  *
- *  Neither payload changes on a five-second timescale. A verdict moves when a probe lands, four times
- *  an hour; the health counts move by a handful of rows. A minute is still far finer than either.
+ *  None of the three changes on a five-second timescale. A verdict moves when a probe lands, four times
+ *  an hour; the health counts move by a handful of rows; the day's totals cannot move faster than the
+ *  importer that feeds them. A minute is still far finer than any of them.
  */
 async function loadHealth() {
   try {
-    const [status, verdicts] = await Promise.all([api('/api/status'), api('/api/verdicts')]);
+    const [status, verdicts, today] = await Promise.all([
+      api('/api/status'), api('/api/verdicts'), api('/api/today'),
+    ]);
     uplotVersion = status.uplot_version;
+    todayActivity = today.today;
+    dayStartTs = today.day_start_ts;
+    renderToday(todayActivity, dayStartTs);
     renderVerdicts(verdicts);
     renderStatus(status);
   } catch (error) {
@@ -794,6 +818,29 @@ async function loadHistory() {
   );
 }
 
+/** Wrap a loader so a tick arriving while the previous one is still in flight is dropped.
+ *
+ *  The server answers one request at a time, so a slow query does not merely delay one poll: every poll
+ *  behind it queues, and an unguarded `setInterval` goes on adding to that queue while the page waits — so
+ *  the moment the machine is busiest is the moment the dashboard asks it for the most. Dropping a tick costs
+ *  nothing, because every payload is a snapshot rather than a delta and the next tick is already scheduled.
+ *
+ *  Only the timers are wrapped. A range button or the contention filter has to redraw the chart it was
+ *  clicked for, so those keep calling the loader directly.
+ */
+function polled(load) {
+  let inFlight = false;
+  return async () => {
+    if (inFlight) return;
+    inFlight = true;
+    try {
+      await load();
+    } finally {
+      inFlight = false;
+    }
+  };
+}
+
 renderRanges();
 renderProbeMetrics();
 // Toggling what a chart counts must redraw it immediately: waiting a minute for the next poll would
@@ -811,6 +858,6 @@ document.addEventListener('keydown', (event) => {
 void loadLive();
 void loadHealth();
 void loadHistory();
-setInterval(loadLive, LIVE_POLL_MS);
-setInterval(loadHealth, HISTORY_POLL_MS);
-setInterval(loadHistory, HISTORY_POLL_MS);
+setInterval(polled(loadLive), LIVE_POLL_MS);
+setInterval(polled(loadHealth), HISTORY_POLL_MS);
+setInterval(polled(loadHistory), HISTORY_POLL_MS);
