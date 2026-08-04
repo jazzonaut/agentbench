@@ -10,8 +10,9 @@ use windows_sys::Win32::{
     System::{
         IO::OVERLAPPED,
         Performance::{
-            PDH_FMT_COUNTERVALUE, PDH_FMT_DOUBLE, PdhAddEnglishCounterW, PdhCloseQuery,
-            PdhCollectQueryData, PdhGetFormattedCounterValue, PdhOpenQueryW,
+            PDH_CSTATUS_NEW_DATA, PDH_CSTATUS_VALID_DATA, PDH_FMT_COUNTERVALUE, PDH_FMT_DOUBLE,
+            PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData, PdhGetFormattedCounterValue,
+            PdhOpenQueryW,
         },
         Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS},
         Threading::{
@@ -205,6 +206,12 @@ impl Counters {
     ///
     /// A failure is not logged. `PDH_INVALID_DATA` is the *expected* answer after the first collect of a
     /// rate counter, and a daemon that warned about it would warn once per probe for ever.
+    ///
+    /// **Two places report failure and both have to be read.** `PdhGetFormattedCounterValue` can return
+    /// `ERROR_SUCCESS` while putting the real answer in the structure's `CStatus` field, in which case
+    /// `doubleValue` holds nothing meaningful. The plausibility guard below would let a garbage *zero*
+    /// through, and zero is the one value this module must never invent: a disk rate of zero is a claim
+    /// that the machine was quiet, which is exactly what a busy one would then look like.
     fn value(&self, counter: Option<*mut c_void>) -> Option<f64> {
         let counter = counter?;
         let mut value: PDH_FMT_COUNTERVALUE = unsafe { std::mem::zeroed() };
@@ -215,6 +222,9 @@ impl Counters {
             PdhGetFormattedCounterValue(counter, PDH_FMT_DOUBLE, std::ptr::null_mut(), &mut value)
         };
         if status != 0 {
+            return None;
+        }
+        if !matches!(value.CStatus, PDH_CSTATUS_VALID_DATA | PDH_CSTATUS_NEW_DATA) {
             return None;
         }
         // SAFETY: the union's `doubleValue` arm is the one `PDH_FMT_DOUBLE` fills in.

@@ -272,27 +272,53 @@ const DISKSTATS: &str = "/proc/diskstats";
 #[cfg(target_os = "linux")]
 const SECTOR_BYTES: u64 = 512;
 
-/// Sectors written across every whole block device.
+/// Sectors written across every block device that nothing else lies beneath.
 ///
-/// Whole devices only, established by asking whether `/sys/block/<name>` exists. Partitions appear in
-/// `/proc/diskstats` beside the disk that contains them, so summing every line would count the same write
-/// twice — and `dm-` and `md` devices stack, which would count some of them three times.
+/// Two kinds of double counting to avoid, and `/sys/block/<name>` alone only prevents the first.
+///
+/// A **partition** does not appear there at all — `sda1` lives at `/sys/block/sda/sda1` — so the existence
+/// check drops partitions, which is what it was written for: a partition's writes are also its disk's.
+///
+/// A **stacked** device does appear there. `/sys/block/dm-0` and `/sys/block/md0` both exist, so a write
+/// through LVM, LUKS, RAID or devicemapper was counted once for the mapping and again for the disk under
+/// it, doubling the reported rate. That is not an exotic configuration: it is the Ubuntu installer's
+/// default and it is how most container hosts are built, which made this wrong on the machines least able
+/// to check it. A doubled rate matters because the figure is compared against a threshold — 20 MiB/s of
+/// contention would have fired at 10 MiB/s of real traffic, quietly shrinking the comparable subset.
+///
+/// `/sys/block/<name>/slaves` is the kernel's own answer to "does anything lie beneath this": it is
+/// populated for exactly the stacked devices and empty for physical ones, so no list of name prefixes has
+/// to be maintained here as the kernel gains new mapping types.
 #[cfg(target_os = "linux")]
 fn sectors_written() -> Option<u64> {
     let text = std::fs::read_to_string(DISKSTATS).ok()?;
     let mut total = 0_u64;
     for line in text.lines() {
         let fields: Vec<&str> = line.split_whitespace().collect();
-        // major, minor, name, then four read fields before the write ones.
+        // major, minor, name, then reads completed, merged, sectors and milliseconds, then writes
+        // completed and merged, which puts sectors written at index 9.
         let (Some(name), Some(written)) = (fields.get(2), fields.get(9)) else {
             continue;
         };
-        if !std::path::Path::new("/sys/block").join(name).exists() {
+        let device = std::path::Path::new("/sys/block").join(name);
+        if !device.exists() || stacks_on_another_device(&device) {
             continue;
         }
         total = total.saturating_add(written.parse::<u64>().unwrap_or(0));
     }
     Some(total)
+}
+
+/// Whether this block device is a mapping over other devices rather than one of its own.
+///
+/// An unreadable `slaves` directory is treated as "physical", which is the reading that risks a missing
+/// write rather than a doubled one. Under-reporting a rate costs a probe that should have been tagged
+/// contended; over-reporting it costs every clean probe on the machine.
+#[cfg(target_os = "linux")]
+fn stacks_on_another_device(device: &std::path::Path) -> bool {
+    std::fs::read_dir(device.join("slaves"))
+        .map(|mut entries| entries.next().is_some())
+        .unwrap_or(false)
 }
 
 /// Current clock as a percentage of the maximum this CPU advertises, averaged over the cores that say.

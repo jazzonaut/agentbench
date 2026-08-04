@@ -95,10 +95,17 @@ impl Observer {
     /// Said once at startup, like the sampler's matched-process summary. Two absent covariates on a
     /// platform that declines are a documented outcome, but a reader looking at an empty clock chart has
     /// no way to tell that from a collector that is broken.
+    ///
+    /// The refusal is not restated as "no clock or disk conditions", which it used to be and which is
+    /// wrong whenever only one of the two was refused: the counters are independently optional, so a
+    /// machine with the disk object disabled records its clock perfectly well and used to be told it was
+    /// recording neither. The reason itself names exactly what was refused, which is the platform's job
+    /// rather than this sentence's — and a line that overstates the gap defeats the purpose of a line
+    /// whose whole function is to distinguish a gap from a fault.
     pub fn conditions_note(&self) -> String {
         match self.counters_available.reason() {
             None => "clock and whole-machine disk throughput are being recorded".to_string(),
-            Some(reason) => format!("no clock or disk conditions: {reason}"),
+            Some(reason) => format!("some probe conditions are unavailable: {reason}"),
         }
     }
 
@@ -297,9 +304,17 @@ mod tests {
         let note = observer.conditions_note();
         assert!(!note.is_empty());
         assert!(
-            note.contains("recorded") || note.contains("no clock or disk"),
+            note.contains("are being recorded") || note.contains("unavailable"),
             "the note has to say which of the two it is: {note}"
         );
+        // A refusal must not claim more than it knows. The counters are independently optional, so a
+        // machine that lost one of them still records the other and may not be told otherwise.
+        if let Some(reason) = observer.counters_available.reason() {
+            assert!(
+                note.contains(reason),
+                "the note has to carry the platform's own account of what was refused: {note}"
+            );
+        }
     }
 
     /// An idle machine reads as uncontended, taken exactly the way the prober takes it.
