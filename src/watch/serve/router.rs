@@ -287,7 +287,11 @@ mod tests {
             covariates: crate::watch::store::Covariates {
                 cpu_percent: Some(if contended { 90.0 } else { 4.0 }),
                 scanner_percent: Some(if contended { 30.0 } else { 0.1 }),
-                agent_percent: Some(if contended { 250.0 } else { 1.0 }),
+                // Under the agent threshold on both sides, and `agent_active` false to match. A fixture
+                // holding 250% of a core beside `agent_active: false` is a state the collector cannot
+                // produce, and an impossible fixture is one the agent arm of the contention rules can
+                // never be caught misreading.
+                agent_percent: Some(if contended { 8.0 } else { 1.0 }),
                 agent_active: false,
                 contended,
                 on_battery: Some(false),

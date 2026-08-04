@@ -65,6 +65,35 @@ instead of twelve flags, and one that compares two reports as a page instead of 
   closed set of values placed into a fixed argument template, passed to the operating system as a vector, so
   nothing a browser sends is parsed by a shell.
 
+### Fixed
+
+- **A response's span is recorded only when something proves the response ended.** `generation_ms` is the
+  interval from a request's first row to its last, and "the transcript has not changed for a while" does not
+  establish the last one: an mtime moves only when a row is appended, so a response that pauses for longer
+  than the settle window looked finished while it was still generating. The turn is still kept — its tokens
+  and its first-response time are known — but the span is left absent, because a truncated span is *shorter*
+  than the truth and the token rate derived from it is therefore higher. The artefact read as a machine
+  responding faster rather than as an error, which is the one shape of wrong number 0.7.0 set out not to
+  produce. There was no second chance to correct it either: the duplicate turn a later pass builds is
+  discarded by the unique index on the request id, so the first figure written was final. For the same
+  reason an unclassified transcript row no longer ends a response — a prompt and a tool result prove one
+  finished, an uninterpreted row can be interleaved with it.
+- **Whole-machine disk throughput no longer counts stacked devices twice on Linux.** Partitions were
+  excluded, correctly, but `/sys/block/dm-0` and `/sys/block/md0` exist as surely as `/sys/block/sda` does,
+  so a write through LVM, LUKS, RAID or devicemapper was counted once for the mapping and again for the disk
+  beneath it. That is the Ubuntu installer's default layout and how most container hosts are built. Because
+  the figure is compared against a threshold, the doubling meant 20 MiB/s of contention firing at 10 MiB/s of
+  real traffic and quietly shrinking the comparable subset. The kernel's own `slaves` directory is now the
+  test, so no list of device-name prefixes has to be kept up to date here.
+- **A performance counter that reports failure in its status field is no longer read as a value.**
+  `PdhGetFormattedCounterValue` can return success while putting the real answer in `CStatus`, in which case
+  the formatted number means nothing — and a garbage *zero* would have passed the plausibility check, which
+  for a disk rate is a claim that the machine was quiet.
+- **A partially available set of counters says so.** The clock and the disk counter are independently
+  optional, so a machine with the disk object disabled records its clock perfectly well; the startup log
+  told it that neither was being recorded. That line exists to distinguish an absent covariate from a broken
+  collector, so overstating the gap defeated its only purpose.
+
 ## [0.7.0] - 2026-08-04
 
 The "and what changed?" half of the dashboard's question. A verdict that says *worse* can now also say what

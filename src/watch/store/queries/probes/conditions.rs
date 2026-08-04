@@ -237,10 +237,17 @@ pub fn known_series() -> Vec<String> {
 /// machine, so it needs no bucketing to mean something. A run whose platform declined to report this
 /// covariate yields no point rather than a zero.
 ///
-/// `uncontended_only` is honoured, so this frame and the probe frame above it hold the same population and
-/// a shared cursor reads the same runs in both. That has a consequence worth stating on the page: with the
-/// filter on, [`CondSeries::DiskWriteBytesS`] cannot exceed the throughput threshold that defines
-/// contention, because every run that did was excluded by definition.
+/// `uncontended_only` is honoured, so this frame and the probe frame above it agree about which runs are
+/// comparable and a shared cursor reads the same runs in both. That has a consequence worth stating on the
+/// page: with the filter on, [`CondSeries::DiskWriteBytesS`] cannot exceed the throughput threshold that
+/// defines contention, because every run that did was excluded by definition.
+///
+/// The two populations are not *identical*, and the difference is deliberate. A probe series also filters
+/// on `probe_metrics.source`, because `probe:` and `bench:` are different scales of the same workload and
+/// mixing them would be meaningless. A covariate has no such split: a benchmark run is a run, and the CPU
+/// it started under is the same kind of fact whatever wrote it. So this frame carries points from run
+/// markers too, which the frame above will not show — visible in practice only on
+/// [`CondSeries::CpuAt`], since a marker records no other covariate.
 pub fn cond_series(
     conn: &Connection,
     machine_id: &str,

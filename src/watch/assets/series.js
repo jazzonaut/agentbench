@@ -215,11 +215,12 @@ export const AGENT_SERIES = [
     note: {
       title: 'Output tokens per second',
       text: 'The span of a response is its first assistant row to its last, so a single-row request has'
-        + ' none — about 37% of real requests, 1,844 of 2,926 when it was measured. Those are excluded'
-        + ' rather than divided by, which makes this a series about multi-row responses and not about all'
-        + ' output. Each bucket is tokens summed over seconds summed, never a mean of rates, so one'
-        + ' two-token reply cannot weigh the same as a thousand-token one. End of stream rather than end'
-        + ' of generation.',
+        + ' none: 1,844 of 2,926 real requests emitted more than one row, leaving about 37% with nothing'
+        + ' to measure. Those are excluded rather than divided by, which makes this a series about'
+        + ' multi-row responses and not about all output. A response whose end nothing in the transcript'
+        + ' proves is excluded too, rather than being measured to wherever the last poll landed. Each'
+        + ' bucket is tokens summed over seconds summed, never a mean of rates, so one two-token reply'
+        + ' cannot weigh the same as a thousand-token one. End of stream rather than end of generation.',
     },
   },
   {
@@ -303,10 +304,16 @@ export const PROBE_METRICS = [
  *  above rather than being judged themselves, which is why none of them reports a direction. A clock at
  *  137% of nominal is not better than one at 128%.
  *
- *  This frame shares the "uncontended probes only" filter with the probe frame, so a cursor read down
- *  both reaches one population. That has a consequence each caption has to state: with the filter on,
- *  a covariate that defines contention cannot exceed its own threshold here, because every run that did
- *  was excluded by definition.
+ *  This frame shares the "uncontended probes only" filter with the probe frame, so a cursor read down both
+ *  reaches runs the two frames agree are comparable. That has a consequence each caption has to state:
+ *  with the filter on, a covariate that defines contention cannot exceed its own threshold here, because
+ *  every run that did was excluded by definition.
+ *
+ *  It is not quite the same set of runs, and "machine CPU" is where that shows. A probe series is one
+ *  source at a time — the daemon's own probes or a benchmark's marker, never both, since they are
+ *  different scales of one workload — while a covariate is the same kind of fact whoever recorded it, so
+ *  this frame charts marker runs too. A marker records no covariate but the CPU it started under, so
+ *  that is the only line the difference can appear on.
  */
 export const CONDITION_SERIES = [
   {

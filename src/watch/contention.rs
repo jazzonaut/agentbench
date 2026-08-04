@@ -119,7 +119,15 @@ pub fn cause(
 /// Whether a reading describes a machine that had something else to do.
 ///
 /// Defined as "some threshold fired" rather than as its own chain of comparisons, so the tag and the
-/// explanation beside it can never disagree about whether a run was contended.
+/// explanation beside it can never disagree — for every reading that comes through here.
+///
+/// One writer deliberately does not. [`crate::watch::marker`] tags a benchmark run against its own,
+/// stricter CPU figure, because a benchmark is about to saturate the machine itself and the only contention
+/// worth recording is what was already there. So a marker row can be tagged at a level no threshold here
+/// would fire on, which is why [`crate::watch::store::queries::latest_run`] asks for a cause only of a run
+/// already tagged and falls back to [`ContentionCause::Machine`] rather than reporting a tagged run as
+/// clean. Read the fallback as "something fired and the stored figures cannot say which", never as an
+/// assertion that this module's own machine threshold was crossed.
 pub fn is_contended(
     machine_cpu: f32,
     scanner_cpu: Option<f32>,
