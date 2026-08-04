@@ -2,7 +2,7 @@
 
 All notable changes to AgentBench are documented here. The project follows [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.6.0] - 2026-08-04
 
 ### Added
 
@@ -409,6 +409,8 @@ All notable changes to AgentBench are documented here. The project follows [Sema
 - Privacy-safe JSON and Markdown reports with offline machine comparison.
 - Evidence-ranked diagnoses for system, network, security-scanner, and proxy bottlenecks.
 - Tag-driven Windows, Linux, macOS Intel, and macOS Apple Silicon GitHub releases.
+
+[0.6.0]: https://github.com/jazzonaut/agentbench/releases/tag/v0.6.0
 
 [0.5.0]: https://github.com/jazzonaut/agentbench/releases/tag/v0.5.0
 [0.4.0]: https://github.com/jazzonaut/agentbench/releases/tag/v0.4.0

@@ -1,6 +1,6 @@
 [package]
 name = "agentbench"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 # Required from the moment a second binary exists: without it `cargo run` cannot choose between
 # `agentbench` and `agentbench-tray` and fails, which breaks both the CI smoke check and anyone building
