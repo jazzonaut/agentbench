@@ -24,6 +24,9 @@
     /* Annotations are context, not data: they sit behind the line and never compete with it. */
     --annotation: #8c7ab8;
     --annotation-band: rgba(140, 122, 184, 0.14);
+    /* Lifts a note off the tiles it covers. On a light surface a shadow does that work; on a dark one it
+       has almost nothing to darken, so the dark twin leans on the note's border instead of on this. */
+    --float: 0 6px 18px rgba(11, 11, 11, 0.12);
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -40,6 +43,7 @@
       --warn: #d95926;
       --annotation: #a898cf;
       --annotation-band: rgba(168, 152, 207, 0.18);
+      --float: 0 6px 18px rgba(0, 0, 0, 0.45);
     }
   }
 
@@ -81,7 +85,8 @@
     padding: 12px 14px;
   }
   /* Values wear ink tokens, never a series colour: identity is carried by the mark, not the text. */
-  .tile-value { font-size: 21px; font-weight: 600; letter-spacing: -0.02em; }
+  /* The right edge is reserved for the info mark, which sits beside this line and no other. */
+  .tile-value { font-size: 21px; font-weight: 600; letter-spacing: -0.02em; padding-right: 20px; }
   .tile-label { color: var(--ink-secondary); font-size: 11px; margin-top: 2px; }
   .tile-value.absent { color: var(--ink-muted); font-weight: 400; font-size: 15px; }
 
@@ -100,7 +105,14 @@
   }
   .verdict.worse { border-left-color: var(--warn); }
   .verdict.better { border-left-color: var(--good); }
-  .verdict-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+  /* Padded on the right for the same reason a tile's value is: the word ends where the mark begins. */
+  .verdict-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 10px;
+    padding-right: 22px;
+  }
   .verdict-value { font-size: 19px; font-weight: 600; letter-spacing: -0.02em; }
   .verdict-word { font-size: 11px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; }
   .verdict-word.worse { color: var(--warn); }
@@ -108,6 +120,73 @@
   .verdict-word.normal, .verdict-word.insufficient { color: var(--ink-muted); }
   .verdict-label { color: var(--ink-secondary); font-size: 11px; margin-top: 2px; }
   .verdict-note { color: var(--ink-muted); font-size: 11px; margin-top: 6px; }
+
+  /* What a tile measures, in the corner of the tile, costing a reader nothing until they ask for it.
+     A button rather than a `title` attribute: the native tooltip cannot be reached by keyboard, does not
+     exist on a touch screen, and gives no sign that there is anything there to read. */
+  .tile, .verdict { position: relative; }
+  /* A note is drawn over whatever is beneath it, so the tile it belongs to comes forward while it is open.
+     Without this the row below would paint on top of the note explaining the row above. */
+  .tile:hover, .tile:focus-within, .verdict:hover, .verdict:focus-within { z-index: 2; }
+  .info-mark {
+    position: absolute;
+    top: 4px;
+    right: 4px;
+    /* A comfortable 24px target around a 17px mark: the ring is drawn by the pseudo-element, so the hit
+       area does not drag the icon's size up with it. */
+    width: 24px;
+    height: 24px;
+    display: grid;
+    place-items: center;
+    padding: 0;
+    font: inherit;
+    font-size: 11px;
+    font-weight: 700;
+    line-height: 1;
+    color: var(--ink-muted);
+    background: none;
+    border: 0;
+    border-radius: 50%;
+    cursor: pointer;
+  }
+  .info-mark::before {
+    content: "";
+    position: absolute;
+    inset: 3px;
+    border: 1px solid var(--axis);
+    border-radius: 50%;
+  }
+  .info-mark:hover, .info-mark[aria-expanded="true"] { color: var(--ink-primary); }
+  .info-mark:hover::before, .info-mark[aria-expanded="true"]::before { border-color: var(--ink-secondary); }
+  .info-mark:focus-visible { outline: 2px solid var(--series-1); outline-offset: -1px; }
+  .info-note {
+    position: absolute;
+    top: calc(100% + 6px);
+    right: 8px;
+    z-index: 3;
+    /* The page nudges a note that a tile near an edge would otherwise push off screen. */
+    transform: translateX(var(--nudge, 0px));
+    width: max-content;
+    max-width: min(300px, calc(100vw - 32px));
+    padding: 9px 11px;
+    color: var(--ink-secondary);
+    font-size: 11px;
+    background: var(--surface-1);
+    border: 1px solid var(--axis);
+    border-radius: 6px;
+    box-shadow: var(--float);
+    /* Hidden rather than absent: it stays laid out, so its position can be measured before it is shown. */
+    visibility: hidden;
+    pointer-events: none;
+  }
+  .info-mark:hover + .info-note,
+  .info-mark:focus-visible + .info-note,
+  .info-mark[aria-expanded="true"] + .info-note { visibility: visible; }
+  /* Selectable only once it has been opened deliberately; a note following the pointer would flicker as
+     soon as the pointer crossed onto it. */
+  .info-mark[aria-expanded="true"] + .info-note { pointer-events: auto; }
+  .info-title { display: block; color: var(--ink-primary); }
+  .info-text { display: block; margin-top: 3px; }
 
   .card {
     background: var(--surface-1);

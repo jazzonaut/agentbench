@@ -13,8 +13,21 @@ All notable changes to AgentBench are documented here. The project follows [Sema
   cursor. The set is exactly the judged one, so every verdict tile has a line to check it against, and a
   test fails if the two ever drift apart. Axis and tooltip both come from the unit the server reports for
   the series, so a fifth metric is one entry in a list rather than a formatter.
+- **Every tile on the dashboard says what it measures.** A mark in the corner, and a note behind it naming
+  what the number is and what would make it easy to misread — that the agent's CPU is counted per core
+  where the machine's is not, that the process count is a minute older than the tiles beside it, that an
+  absent value is not a zero, that a contended probe is recorded and charted but never judged. Verdict
+  tiles explain the rule that produced the word: which runs were eligible, which direction is good, and
+  what "normal" means. A button rather than a `title` attribute, because a native tooltip cannot be
+  reached by keyboard, does not exist on a touch screen, and advertises nothing; it opens on hover, on
+  click and on focus, and closes on Escape.
 
 ### Changed
+
+- **The live tiles are updated in place rather than rebuilt on every poll.** A section is only rebuilt
+  when the set of tiles in it changes. Rebuilding five times a minute was invisible while a tile was
+  nothing but text, and became a bug the moment one carried a note a reader could open: the poll would
+  close it under them and take the keyboard focus with it.
 
 - **The dashboard's "uncontended probes only" filter starts off.** It started on, which is right for
   comparability and wrong as a default. A machine with a coding agent on it produces mostly contended
