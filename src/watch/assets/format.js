@@ -40,14 +40,56 @@ export function latency(ms) {
   return `${(ms / 1000).toFixed(2)} s`;
 }
 
+/** A quantity of bytes, in the unit it is legible in: "103 GiB", "512 MiB", "8 KiB".
+ *
+ *  Adaptive rather than fixed to one scale, for the same reason {@link latency} has a microsecond branch:
+ *  the agent's resident memory is a couple of hundred MiB and the machine's is a couple of GiB, and one
+ *  divisor makes one of the two read as zero.
+ */
+export function bytes(value) {
+  if (value === null || value === undefined) return '—';
+  const magnitude = Math.abs(value);
+  if (magnitude >= 1073741824) return `${(value / 1073741824).toFixed(1)} GiB`;
+  if (magnitude >= 1048576) return `${(value / 1048576).toFixed(0)} MiB`;
+  if (magnitude >= 1024) return `${(value / 1024).toFixed(0)} KiB`;
+  return `${value.toFixed(0)} B`;
+}
+
+/** A throughput in bytes per second: "1,066 MiB/s", "17 KiB/s".
+ *
+ *  The quiet end is the one that matters. An idle desktop writes about 17 KiB/s, and rendering that as
+ *  "0.0 MiB/s" says the disk was doing nothing on a chart whose whole purpose is to show that it was not.
+ */
+export function byteRate(value) {
+  if (value === null || value === undefined) return '—';
+  const magnitude = Math.abs(value);
+  if (magnitude >= 1048576) {
+    return `${(value / 1048576).toLocaleString(undefined, { maximumFractionDigits: 1 })} MiB/s`;
+  }
+  if (magnitude >= 1024) return `${(value / 1024).toFixed(0)} KiB/s`;
+  return `${value.toFixed(0)} B/s`;
+}
+
 /** A formatter for a metric whose unit the server supplied rather than the page hardcoding it.
  *
- *  Probe series are named after catalogue entries, and the catalogue owns each metric's unit. Deriving
- *  the formatter from the response is what lets a second probe chart be one line of configuration
- *  instead of a new formatter — and keeps the axis, the tooltip and the tile spelling a unit the same way.
+ *  Every series reports its unit now, not only the probe ones, and every axis and tooltip on the page is
+ *  derived from it. That is what makes the switchable frames safe: a frame that changes metric at runtime
+ *  would otherwise keep the formatter it was built with, and render bytes as a percentage with nothing on
+ *  screen looking wrong.
+ *
+ *  The vocabulary is deliberately small and closed — see `SampleSeries::unit` for the list and why the
+ *  per-core distinction is a note rather than a unit. An unrecognised unit still renders, with the unit
+ *  appended verbatim, because the probe catalogue owns its own units ("ops/s", "Mops/s", "GiB/s") and this
+ *  page has no business being the second place they are enumerated.
  */
 export function unitFormatter(unit) {
   if (unit === 'ms') return latency;
+  if (unit === '%') return percent;
+  if (unit === 'B') return bytes;
+  if (unit === 'B/s') return byteRate;
+  if (unit === 'ratio') return ratio;
+  // A bare count: "401 processes" is the label's job, not the value's.
+  if (unit === '') return count;
   return (value) => {
     if (value === null || value === undefined) return '—';
     // Large rates read better whole; small ones lose their meaning rounded. Probe metrics span

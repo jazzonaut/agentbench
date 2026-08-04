@@ -119,6 +119,11 @@ impl Report {
                 if let Some(note) = &comparison.note {
                     notes.push(note.clone());
                 }
+                // The explanation goes last, after the provenance and any caveat, because it only means
+                // something once a reader knows what the finding rests on.
+                if let Some(conditions) = &comparison.conditions {
+                    notes.push(conditions.summary.clone());
+                }
                 ComparisonRow {
                     label: comparison.label.to_string(),
                     verdict: comparison.verdict,

@@ -44,6 +44,26 @@ pub enum SampleSeries {
     ScannerCpu,
     AgentCpu,
     AgentRss,
+    /// Bytes per second the agent's process tree wrote.
+    ///
+    /// **Absent on a discovery tick, not zero.** `sysinfo`'s first I/O delta for a newly seen process is its
+    /// whole lifetime's traffic, so the tick after every discovery pass has no rate to report — the same
+    /// priming rule the CPU delta follows, and the reason a rediscovered agent does not plant a spike.
+    AgentWriteBytesS,
+    /// Bytes per second the matched security scanners wrote.
+    ///
+    /// **This reads zero on Windows for the scanner most people have, and that is a property of the daemon
+    /// staying unelevated rather than a defect.** An ordinary process sees a SYSTEM-owned process's CPU and
+    /// not its I/O: Defender, Windows Update, the search indexer, `System` and `Registry` all reported
+    /// exactly zero bytes across 36 seconds while reporting their CPU. The series is kept because it is not
+    /// structurally zero — a user-owned scanner registers here — but the page's note for it has to say which
+    /// case a flat line is, because a chart that reads zero for ever otherwise says "nothing to see".
+    ///
+    /// Whole-machine throughput, which does count those writers, is a probe covariate instead:
+    /// [`CondSeries::DiskWriteBytesS`]. The two answer different questions and neither replaces the other.
+    ///
+    /// [`CondSeries::DiskWriteBytesS`]: crate::watch::store::queries::CondSeries::DiskWriteBytesS
+    ScannerWriteBytesS,
 }
 
 impl SampleSeries {
@@ -57,6 +77,8 @@ impl SampleSeries {
             "scanner_cpu" => Self::ScannerCpu,
             "agent_cpu" => Self::AgentCpu,
             "agent_rss" => Self::AgentRss,
+            "agent_write_bytes_s" => Self::AgentWriteBytesS,
+            "scanner_write_bytes_s" => Self::ScannerWriteBytesS,
             _ => return None,
         })
     }
@@ -71,6 +93,8 @@ impl SampleSeries {
             Self::ScannerCpu => "scanner_cpu",
             Self::AgentCpu => "agent_cpu",
             Self::AgentRss => "agent_rss",
+            Self::AgentWriteBytesS => "agent_write_bytes_s",
+            Self::ScannerWriteBytesS => "scanner_write_bytes_s",
         }
     }
 
@@ -84,18 +108,43 @@ impl SampleSeries {
             Self::ScannerCpu => "scanner_cpu_max",
             Self::AgentCpu => "agent_cpu_max",
             Self::AgentRss => "agent_rss_max",
+            Self::AgentWriteBytesS => "agent_write_bytes_s_max",
+            Self::ScannerWriteBytesS => "scanner_write_bytes_s_max",
         }
     }
 
     /// What a rolled-up point of this series is a summary of.
     ///
     /// Chosen per series rather than uniformly: memory in use wants its average, because the average is
-    /// what the machine was living with, while swap and scanner CPU want their peak, because a
-    /// thirty-second burst of either is the event and its mean over a minute hides it.
+    /// what the machine was living with, while swap, scanner CPU and the write rates want their peak,
+    /// because a thirty-second burst of any of those is the event and its mean over a minute hides it.
     pub fn reducer(self) -> Reducer {
         match self {
             Self::CpuPercent | Self::UsedMemory | Self::ProcessCount => Reducer::Mean,
-            Self::UsedSwap | Self::ScannerCpu | Self::AgentCpu | Self::AgentRss => Reducer::Max,
+            Self::UsedSwap
+            | Self::ScannerCpu
+            | Self::AgentCpu
+            | Self::AgentRss
+            | Self::AgentWriteBytesS
+            | Self::ScannerWriteBytesS => Reducer::Max,
+        }
+    }
+
+    /// Unit reported to the client, which derives its axis and tooltip from it.
+    ///
+    /// A closed vocabulary shared with every other family — `%`, `B`, `B/s`, `ms`, `ratio`, `tokens`, and
+    /// the empty string for a bare count — so one formatter on the page serves all four and a switchable
+    /// frame cannot keep the previous selection's axis. **The per-core scale is not encoded here**: the unit
+    /// of [`ScannerCpu`] really is a percentage, and "of one core rather than of the machine" is a caveat
+    /// for the note beside it, not a different unit.
+    ///
+    /// [`ScannerCpu`]: SampleSeries::ScannerCpu
+    pub fn unit(self) -> &'static str {
+        match self {
+            Self::CpuPercent | Self::ScannerCpu | Self::AgentCpu => "%",
+            Self::UsedMemory | Self::UsedSwap | Self::AgentRss => "B",
+            Self::AgentWriteBytesS | Self::ScannerWriteBytesS => "B/s",
+            Self::ProcessCount => "",
         }
     }
 
@@ -108,6 +157,8 @@ impl SampleSeries {
         Self::ScannerCpu,
         Self::AgentCpu,
         Self::AgentRss,
+        Self::AgentWriteBytesS,
+        Self::ScannerWriteBytesS,
     ];
 
     pub fn wire_name(self) -> &'static str {

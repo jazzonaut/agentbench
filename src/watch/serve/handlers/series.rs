@@ -1,16 +1,20 @@
 //! `GET /api/series` — points for one series over a time range.
 //!
-//! Three kinds of series answer here, and the difference between them is what a single row means. A
+//! Four kinds of series answer here, and the difference between them is what a single row means. A
 //! passive sample is already a measurement of the whole machine, so it is returned as it was recorded. A
 //! probe run is too — a controlled workload observed end to end — so it is also returned raw, optionally
-//! restricted to the runs that were not competing with anything. A derived session series is neither: one
-//! tool call is not a measurement of anything, so it is aggregated per time bucket.
+//! restricted to the runs that were not competing with anything. A conditions series is a covariate of
+//! those same runs and is returned the same way, under the same filter, so a shared cursor reads one
+//! population in both frames. A derived session series is none of these: one tool call is not a
+//! measurement of anything, so it is aggregated per time bucket.
 
 use crate::watch::{
     serve::response::{Req, Resp},
     store::{
         Reader,
-        queries::{self, ProbeSeries, Reducer, Resolution, SampleSeries, SessionSeries},
+        queries::{
+            self, CondSeries, ProbeSeries, Reducer, Resolution, SampleSeries, SessionSeries,
+        },
     },
 };
 use serde::Serialize;
@@ -38,12 +42,14 @@ const MIN_BUCKET_MS: i64 = 60_000;
 
 /// Which series was asked for.
 ///
-/// Probe names are tried last because they are the only prefixed family (`probe:` / `bench:`), so they
-/// cannot collide with a passive or session name however the other two grow.
+/// The two prefixed families are tried last — `probe:` / `bench:` and `cond:` — so neither can collide with
+/// a passive or session name however the unprefixed families grow. They cannot collide with each other
+/// either: a prefix belongs to exactly one family.
 enum Requested {
     Sample(SampleSeries),
     Session(SessionSeries),
     Probe(ProbeSeries),
+    Conditions(CondSeries),
 }
 
 impl Requested {
@@ -52,6 +58,7 @@ impl Requested {
             .map(Self::Sample)
             .or_else(|| SessionSeries::parse(name).map(Self::Session))
             .or_else(|| ProbeSeries::parse(name).map(Self::Probe))
+            .or_else(|| CondSeries::parse(name).map(Self::Conditions))
     }
 
     fn wire_name(&self) -> String {
@@ -59,6 +66,7 @@ impl Requested {
             Self::Sample(series) => series.wire_name().to_string(),
             Self::Session(series) => series.wire_name().to_string(),
             Self::Probe(series) => series.wire_name(),
+            Self::Conditions(series) => series.wire_name(),
         }
     }
 }
@@ -73,7 +81,8 @@ pub fn known_series() -> Vec<String> {
                 .iter()
                 .map(|series| series.wire_name().to_string()),
         )
-        .chain(queries::probes::known_series())
+        .chain(queries::probes::series::known_series())
+        .chain(queries::probes::conditions::known_series())
         .collect()
 }
 
@@ -86,9 +95,17 @@ struct Series {
     gap_ms: i64,
     /// Width of one aggregation bucket, or absent for a raw series.
     bucket_ms: Option<i64>,
-    /// Unit and direction, for a probe series whose name is not one the page hardcodes.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    unit: Option<&'static str>,
+    /// What the values are measured in, for every family.
+    ///
+    /// Always reported, so the page derives every axis and tooltip from the response instead of hardcoding a
+    /// formatter per frame. That is what makes a switchable frame safe: three of the four frames now change
+    /// metric at runtime, and a panel that kept the previous selection's formatter would render bytes as a
+    /// percentage without anything on screen looking wrong. The empty string means a bare count.
+    unit: &'static str,
+    /// Which direction is an improvement, where the question has an answer.
+    ///
+    /// Absent for a covariate, which has no direction, and for the families whose direction the page does
+    /// not use. A clock at 137% of nominal is not better than one at 128%.
     #[serde(skip_serializing_if = "Option::is_none")]
     lower_is_better: Option<bool>,
     /// Which tables a passive series was read from, absent where the question does not arise.
@@ -125,6 +142,13 @@ pub fn handle(req: &Req, reader: &Reader) -> Resp {
         return Resp::error(400, "from must not be after to");
     }
     let limit = req.param_usize("limit", MAX_POINTS).unwrap_or(MAX_POINTS);
+    // Defaults to every run. Restricting to the uncontended subset is what makes two days comparable, but
+    // it is also what makes a busy week look like a week with no data, so the choice belongs to whoever is
+    // reading rather than to this endpoint. Read once and applied to both run-shaped families, because a
+    // probe frame and the conditions frame beneath it share a cursor and must share a population.
+    let uncontended_only = req
+        .param("contended")
+        .is_some_and(|value| value == "exclude");
 
     match series {
         Requested::Sample(sample) => {
@@ -138,7 +162,7 @@ pub fn handle(req: &Req, reader: &Reader) -> Resp {
                     gap_ms: gap_threshold_ms(&rows.points),
                     bucket_ms: (rows.resolution != Resolution::Raw)
                         .then_some(queries::samples::ROLLUP_BUCKET_MS),
-                    unit: None,
+                    unit: sample.unit(),
                     lower_is_better: None,
                     resolution: Some(rows.resolution),
                     rollup_reducer: rows.reducer,
@@ -149,12 +173,6 @@ pub fn handle(req: &Req, reader: &Reader) -> Resp {
             }
         }
         Requested::Probe(probe) => {
-            // Defaults to every run. Restricting to the uncontended subset is what makes two days
-            // comparable, but it is also what makes a busy week look like a week with no data, so the
-            // choice belongs to whoever is reading rather than to this endpoint.
-            let uncontended_only = req
-                .param("contended")
-                .is_some_and(|value| value == "exclude");
             match queries::probe_series(
                 reader.conn(),
                 reader.machine_id(),
@@ -172,7 +190,7 @@ pub fn handle(req: &Req, reader: &Reader) -> Resp {
                     // configuration can have changed several times across the range.
                     gap_ms: gap_threshold_ms(&points),
                     bucket_ms: None,
-                    unit: Some(probe.spec.unit),
+                    unit: probe.spec.unit,
                     lower_is_better: Some(probe.spec.lower_is_better),
                     resolution: None,
                     rollup_reducer: None,
@@ -180,6 +198,33 @@ pub fn handle(req: &Req, reader: &Reader) -> Resp {
                     points,
                 }),
                 Err(error) => Resp::error(500, &format!("probe series query failed: {error}")),
+            }
+        }
+        Requested::Conditions(cond) => {
+            match queries::cond_series(
+                reader.conn(),
+                reader.machine_id(),
+                cond,
+                from,
+                to,
+                uncontended_only,
+            ) {
+                Ok(points) => Resp::json(&Series {
+                    metric: series.wire_name(),
+                    from,
+                    to,
+                    // One point per run, at the probe cadence, so a missed probe is as real a gap here as
+                    // it is in the frame above.
+                    gap_ms: gap_threshold_ms(&points),
+                    bucket_ms: None,
+                    unit: cond.unit(),
+                    lower_is_better: None,
+                    resolution: None,
+                    rollup_reducer: None,
+                    truncated: false,
+                    points,
+                }),
+                Err(error) => Resp::error(500, &format!("conditions query failed: {error}")),
             }
         }
         Requested::Session(session) => {
@@ -202,7 +247,7 @@ pub fn handle(req: &Req, reader: &Reader) -> Resp {
                     // A bucket with no activity in it is a gap, not a zero: the agent was not working.
                     gap_ms: bucket.saturating_mul(GAP_FACTOR),
                     bucket_ms: Some(bucket),
-                    unit: None,
+                    unit: session.unit(),
                     lower_is_better: None,
                     resolution: None,
                     rollup_reducer: None,
@@ -331,9 +376,15 @@ mod tests {
             Requested::parse("bench:cpu.single_mops_s"),
             Some(Requested::Probe(_))
         ));
+        assert!(matches!(
+            Requested::parse("cond:clock_percent"),
+            Some(Requested::Conditions(_))
+        ));
         assert!(Requested::parse("session_tools; DROP TABLE samples").is_none());
         // A probe metric with no source prefix is not a series: it would have to pick one silently.
         assert!(Requested::parse("filesystem.small_file_ops_s").is_none());
+        // A covariate's column name is not a series name either, for the same reason.
+        assert!(Requested::parse("clock_percent").is_none());
 
         let known = known_series();
         for expected in [
@@ -342,11 +393,24 @@ mod tests {
             "first_response_ms",
             "probe:filesystem.small_file_ops_s",
             "bench:filesystem.small_file_ops_s",
+            "cond:clock_percent",
+            "cond:disk_write_bytes_s",
         ] {
             assert!(
                 known.contains(&expected.to_string()),
                 "{expected} should be advertised"
             );
+        }
+    }
+
+    /// Every advertised name has to parse back, or the error message lists series nothing can read.
+    ///
+    /// The list is what a 400 hands a client, so a name in it that this endpoint rejects would send a reader
+    /// to a second 400 for following the first one's advice.
+    #[test]
+    fn every_advertised_series_is_one_this_endpoint_accepts() {
+        for name in known_series() {
+            assert!(Requested::parse(&name).is_some(), "{name}");
         }
     }
 
@@ -358,6 +422,7 @@ mod tests {
             "tool_read_ms",
             "probe:cpu.single_mops_s",
             "bench:cpu.single_mops_s",
+            "cond:scratch_free_bytes",
         ] {
             let requested = Requested::parse(name).expect(name);
             assert_eq!(requested.wire_name(), name);

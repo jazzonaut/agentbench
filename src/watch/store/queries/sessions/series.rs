@@ -63,6 +63,18 @@ pub enum SessionSeries {
     FirstResponseMs,
     /// Output tokens produced.
     OutputTokens,
+    /// Output tokens per second of generation.
+    ///
+    /// **Only the requests that had a span to measure.** `generation_ms` is the interval from a request's
+    /// first assistant row to its last, so a single-row request has none — about 37% of real requests, 1,844
+    /// of 2,926 when it was measured. Those turns are excluded rather than divided by, which makes this a
+    /// series about multi-row responses and not about all output. It is also end of *stream* rather than end
+    /// of generation.
+    ///
+    /// A rate rather than a duration because a slow day and a verbose day are different things and the token
+    /// count alone cannot tell them apart. Aggregated as a [`Aggregation::Ratio`] — tokens summed over
+    /// seconds summed — so one two-token response cannot contribute the same weight as a thousand-token one.
+    OutputTokensPerS,
     /// Share of prompt tokens served from the cache.
     CacheHitRatio,
 }
@@ -77,6 +89,7 @@ impl SessionSeries {
             "tool_bash_ms" => Self::ToolBashMs,
             "first_response_ms" => Self::FirstResponseMs,
             "output_tokens" => Self::OutputTokens,
+            "output_tokens_per_s" => Self::OutputTokensPerS,
             "cache_hit_ratio" => Self::CacheHitRatio,
             _ => return None,
         })
@@ -90,7 +103,27 @@ impl SessionSeries {
             Self::ToolBashMs => "tool_bash_ms",
             Self::FirstResponseMs => "first_response_ms",
             Self::OutputTokens => "output_tokens",
+            Self::OutputTokensPerS => "output_tokens_per_s",
             Self::CacheHitRatio => "cache_hit_ratio",
+        }
+    }
+
+    /// Unit reported to the client, which derives its axis and tooltip from it.
+    ///
+    /// Drawn from the same closed vocabulary [`SampleSeries::unit`] documents. `ratio` is 0–1 rather than
+    /// 0–100, which the page's formatter for that unit is what knows.
+    ///
+    /// [`SampleSeries::unit`]: crate::watch::store::queries::SampleSeries::unit
+    pub fn unit(self) -> &'static str {
+        match self {
+            Self::ToolReadMs
+            | Self::ToolEditMs
+            | Self::ToolSearchMs
+            | Self::ToolBashMs
+            | Self::FirstResponseMs => "ms",
+            Self::OutputTokens => "tokens",
+            Self::OutputTokensPerS => "tokens/s",
+            Self::CacheHitRatio => "ratio",
         }
     }
 
@@ -102,6 +135,7 @@ impl SessionSeries {
         Self::ToolBashMs,
         Self::FirstResponseMs,
         Self::OutputTokens,
+        Self::OutputTokensPerS,
         Self::CacheHitRatio,
     ];
 
@@ -113,7 +147,7 @@ impl SessionSeries {
             | Self::ToolBashMs
             | Self::FirstResponseMs => Aggregation::Median,
             Self::OutputTokens => Aggregation::Sum,
-            Self::CacheHitRatio => Aggregation::Ratio,
+            Self::OutputTokensPerS | Self::CacheHitRatio => Aggregation::Ratio,
         }
     }
 
@@ -154,6 +188,19 @@ impl SessionSeries {
             Self::OutputTokens => {
                 "SELECT ts, output_tokens, 1 FROM session_turns
                   WHERE machine_id = ?1 AND ts >= ?2 AND ts <= ?3
+                  ORDER BY ts LIMIT ?4"
+            }
+            // Seconds, not milliseconds, in the denominator: the ratio reducer divides the sums as they
+            // come, so the unit of the result is decided here rather than by a later multiplication
+            // nothing would connect to this statement.
+            //
+            // `generation_ms > 0` excludes more than a division by zero. A response whose first and last
+            // rows share a millisecond has no measurable span, and admitting it would contribute an
+            // enormous rate to the bucket from a request nothing was actually measured about.
+            Self::OutputTokensPerS => {
+                "SELECT ts, output_tokens, generation_ms / 1000.0 FROM session_turns
+                  WHERE machine_id = ?1 AND ts >= ?2 AND ts <= ?3
+                    AND generation_ms IS NOT NULL AND generation_ms > 0
                   ORDER BY ts LIMIT ?4"
             }
             Self::CacheHitRatio => {
@@ -384,6 +431,46 @@ mod tests {
         assert_eq!(
             values(&conn, SessionSeries::CacheHitRatio, 60 * MINUTE),
             vec![0.9]
+        );
+    }
+
+    /// The rate covers only the requests that had a span, and is a ratio of the sums.
+    ///
+    /// The fixture's second turn has no `generation_ms`, which is the ordinary case for a single-row request
+    /// and about 37% of real ones. Including it would mean dividing 200 tokens by nothing.
+    #[test]
+    fn tokens_per_second_uses_only_the_requests_with_a_measured_span() {
+        let conn = fixture();
+        // 100 tokens over 20 seconds. The 200-token turn has no span and contributes to neither side.
+        assert_eq!(
+            values(&conn, SessionSeries::OutputTokensPerS, 60 * MINUTE),
+            vec![5.0]
+        );
+
+        // A second measured request, and the bucket becomes tokens summed over seconds summed rather than
+        // the mean of two rates: 100/20 and 900/10 average to 47.5, while the honest figure is 33.3.
+        conn.execute(
+            "INSERT INTO session_turns (uuid, machine_id, ts, request_id, generation_ms, output_tokens)
+             VALUES ('turn-3', ?1, 8000, 'req-3', 10000, 900)",
+            [MACHINE],
+        )
+        .unwrap();
+        let combined = values(&conn, SessionSeries::OutputTokensPerS, 60 * MINUTE);
+        assert!(
+            (combined[0] - 1000.0 / 30.0).abs() < 1e-9,
+            "a ratio of sums, not a mean of ratios: {combined:?}"
+        );
+    }
+
+    /// A request whose first and last row share a millisecond has no measurable rate.
+    #[test]
+    fn a_span_of_zero_is_excluded_rather_than_producing_an_enormous_rate() {
+        let conn = fixture();
+        conn.execute("UPDATE session_turns SET generation_ms = 0", [])
+            .unwrap();
+        assert!(
+            values(&conn, SessionSeries::OutputTokensPerS, 60 * MINUTE).is_empty(),
+            "nothing was measured, so there is no bucket"
         );
     }
 

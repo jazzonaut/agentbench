@@ -80,14 +80,15 @@ const dom = {
 
 /** Stacked charts, in reading order. Each owns one metric and one y-axis.
  *
- *  A panel with no `format` derives one from the unit the server reports, which is how a probe series
- *  named after a catalogue entry gets a correct axis without the page knowing what it measures. That is
- *  also what lets the probe frame's metric be switched at runtime: see {@link PROBE_METRICS}. Its entry
- *  below opens on the default selection rather than hardcoding a metric of its own.
+ *  No panel names a formatter. Every series reports its unit and the axis is derived from it, which is how a
+ *  probe series named after a catalogue entry gets a correct axis without the page knowing what it measures
+ *  — and, more to the point, what makes a switchable frame safe: a panel that hardcoded `percent` and was
+ *  then pointed at a byte rate would render 1,066 MiB/s as "1066.0%" with nothing on screen looking wrong.
+ *  The probe frame's entry opens on the default selection rather than hardcoding a metric of its own.
  */
 const CHARTS = [
-  { id: 'chart-cpu', metric: 'cpu_percent', format: percent, label: 'system CPU' },
-  { id: 'chart-tools', metric: 'tool_read_ms', format: latency, label: 'median latency' },
+  { id: 'chart-cpu', metric: 'cpu_percent', label: 'system CPU' },
+  { id: 'chart-tools', metric: 'tool_read_ms', label: 'median latency' },
   { id: 'chart-probe', metric: selectedProbe.metric, label: selectedProbe.label },
 ].flatMap((config) => {
   const element = document.getElementById(config.id);
@@ -112,13 +113,9 @@ const CHARTS = [
     // restore, a metric that failed once would keep explaining itself under the next metric selected.
     baseEmpty: empty?.textContent.trim() ?? '',
   };
-  // The closure reads `panel.unit` on every call rather than capturing it, so the first response can
-  // supply the unit without the plot having to be rebuilt.
-  panel.chart = createChart(
-    element,
-    config.format ?? ((value) => unitFormatter(panel.unit)(value)),
-    config.label,
-  );
+  // The closure reads `panel.unit` on every call rather than capturing it, so a response can change the
+  // unit — which switching the metric does — without the plot having to be rebuilt.
+  panel.chart = createChart(element, (value) => unitFormatter(panel.unit)(value), config.label);
   return [panel];
 });
 
@@ -200,7 +197,10 @@ const NOTES = {
     title: 'Last probe',
     text: 'Probes are the controlled measurements: the same small workload every time, which is what makes'
       + ' two days comparable. A contended run is still recorded and still charted, but never counted'
-      + ' towards a verdict — so the tile says which kind the last one was.',
+      + ' towards a verdict — so the tile says which kind the last one was, and which threshold a contended'
+      + ' one crossed. "Busiest" names the machine’s largest CPU consumer, measured over the interval'
+      + ' since the previous probe rather than at the moment this one ran: it says what has been using the'
+      + ' machine, which is not the same claim as what made this run slow.',
   },
   probeAbsent: {
     title: 'Last probe',
@@ -362,11 +362,28 @@ function updateTile(node, item) {
   node.querySelector('.tile-label').textContent = item.label;
 }
 
+/** What the server's word for a contention cause reads as on the tile. */
+const CONTENTION_CAUSE = {
+  agent: 'an agent was working',
+  scanner: 'a scanner was active',
+  disk: 'the disk was busy',
+  machine: 'the machine was busy',
+};
+
 /** The most recent controlled measurement, and whether it was worth anything.
  *
  *  A contended probe is not a bad probe — it is deliberately collected and deliberately excluded later —
  *  so the tile says which it was rather than hiding it. Without that, a reader comparing the chart to the
  *  tile would find numbers that disagree and no explanation.
+ *
+ *  The cause comes from the server. It used to be inferred here from three covariates, which was wrong the
+ *  moment a fourth threshold existed: a run tagged solely because something was writing 60 MiB/s fell
+ *  through to "the machine was busy" at 16% CPU, because this page had no way to know what rate counts as
+ *  busy — and no business knowing it.
+ *
+ *  The largest consumer is appended as attribution, never as the cause. Its figure spans the interval since
+ *  the previous probe, so it says what has been using the machine rather than what made this run slow, and
+ *  the wording has to keep those apart even when they happen to be the same process.
  */
 function probeItem(probe) {
   if (!probe) {
@@ -378,16 +395,23 @@ function probeItem(probe) {
     };
   }
   const age = duration(Date.now() - probe.ts);
+  const largest = probe.top_consumer ? ` · busiest ${probe.top_consumer.name}` : '';
   if (probe.contended) {
-    const because = probe.agent_active
-      ? 'an agent was working'
-      : probe.scanner_at !== null && probe.scanner_at > 0
-        ? 'a scanner was active'
-        : 'the machine was busy';
-    return { key: 'probe', value: age, label: `since the last probe · contended, ${because}` };
+    // Falls back to the bare word rather than to a guess: an unrecognised cause means this page is older
+    // than the daemon serving it, and inventing a reason would be worse than declining to give one.
+    const because = CONTENTION_CAUSE[probe.cause] ?? 'something else was using the machine';
+    return {
+      key: 'probe',
+      value: age,
+      label: `since the last probe · contended, ${because}${largest}`,
+    };
   }
   const power = probe.on_battery === true ? ' · on battery' : '';
-  return { key: 'probe', value: age, label: `since the last probe · uncontended${power}` };
+  return {
+    key: 'probe',
+    value: age,
+    label: `since the last probe · uncontended${power}${largest}`,
+  };
 }
 
 /** The live tiles, in reading order. */
@@ -484,12 +508,19 @@ function verdictNote(comparison, windowDays) {
     ? 'Uncontended probe runs only'
     : 'Every measurement the agent produced';
   const direction = comparison.lower_is_better ? 'Lower is better here.' : 'Higher is better here.';
+  // Only said when there is a conditions line to explain, so a tile without one is not made to carry a
+  // paragraph about a feature it is not using.
+  const conditions = comparison.conditions
+    ? ' The last line names the conditions those same clean runs were taken in, where one of them sits'
+      + ' outside its own band on the same rule as the verdict above. It is an explanation, not a'
+      + ' correction: nothing about the verdict has been adjusted for it.'
+    : '';
   return {
     title: comparison.label,
     text: `${source}, reduced to one number a day, against the median of the previous ${windowDays} days.`
       + ` ${direction} Normal means today landed inside a band three sigma-equivalents either side of that`
       + ' median — derived from how much the days themselves varied, and never narrower than 5% of the'
-      + ' median, so a very steady week cannot turn every small change into a finding.',
+      + ` median, so a very steady week cannot turn every small change into a finding.${conditions}`,
   };
 }
 
@@ -511,9 +542,9 @@ function verdictNode(item) {
   const label = document.createElement('div');
   label.className = 'verdict-label';
   node.append(head, label);
-  // Both lines exist from the start and empty ones are hidden, so a refresh that gains or loses a caveat
-  // does not have to rebuild the tile — and cannot close a note a reader is in the middle of.
-  for (const slot of ['evidence', 'caveat']) {
+  // All three lines exist from the start and empty ones are hidden, so a refresh that gains or loses a
+  // caveat does not have to rebuild the tile — and cannot close a note a reader is in the middle of.
+  for (const slot of ['evidence', 'caveat', 'conditions']) {
     const line = document.createElement('div');
     line.className = 'verdict-note';
     line.dataset.slot = slot;
@@ -548,7 +579,14 @@ function updateVerdict(node, item) {
   const evidence = comparison.baseline === null
     ? ''
     : `${count(comparison.today_observations)} today, ${count(comparison.baseline.observations)} in the baseline`;
-  for (const [slot, text] of [['evidence', evidence], ['caveat', comparison.note ?? '']]) {
+  // Three lines, in the order they become useful: what the finding rests on, what qualifies it, then what
+  // else was different at the same time. The last is an explanation rather than a caveat and is kept
+  // separate for that reason — the server decides when there is one, and only for a verdict it reached.
+  for (const [slot, text] of [
+    ['evidence', evidence],
+    ['caveat', comparison.note ?? ''],
+    ['conditions', comparison.conditions?.summary ?? ''],
+  ]) {
     const line = node.querySelector(`[data-slot="${slot}"]`);
     line.textContent = text;
     line.hidden = text === '';
@@ -802,7 +840,9 @@ async function loadHistory() {
       try {
         const query = `metric=${encodeURIComponent(panel.metric)}&from=${from}&to=${to}${filter}`;
         const series = await api(`/api/series?${query}`);
-        if (series.unit) panel.unit = series.unit;
+        // Assigned unconditionally, including the empty string a bare count reports: a `if (series.unit)`
+        // here would leave the previous selection's unit in place for exactly the series that has none.
+        panel.unit = series.unit ?? '';
         panel.chart.setAnnotations(annotations);
         panel.chart.update(series.points, series.gap_ms);
         panel.empty.hidden = series.points.length > 0;

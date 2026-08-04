@@ -2,8 +2,10 @@
 //!
 //! Layered so the two questions stay apart: [`evidence`] decides what a day's number *is*, and this module
 //! decides what it *means*. [`subjects`] holds the third question — which series are worth an opinion at all
-//! — because that list is a policy decision and reads better as one.
+//! — because that list is a policy decision and reads better as one. [`conditions`] holds the fourth: what
+//! was different about today, which is the half of the question a verdict alone cannot answer.
 
+pub mod conditions;
 pub mod evidence;
 pub mod subjects;
 
@@ -14,6 +16,7 @@ use super::{
 };
 use crate::watch::store::Reader;
 use anyhow::Result;
+use conditions::Conditions;
 use evidence::{Evidence, MIN_OBSERVATIONS_PER_DAY, PowerMix};
 use serde::Serialize;
 use subjects::SUBJECTS;
@@ -39,6 +42,16 @@ pub struct Comparison {
     /// Why there is no verdict, or what qualifies the one there is.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// What was different about the conditions the comparable runs were taken in.
+    ///
+    /// Kept separate from [`note`] deliberately: a qualification and an explanation are different claims. The
+    /// note says why this verdict might not mean what it appears to; this says what else changed at the same
+    /// time. A reader needs to be able to tell those apart, and one field holding whichever happened to fire
+    /// would not let them.
+    ///
+    /// [`note`]: Comparison::note
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conditions: Option<Conditions>,
 }
 
 /// The whole today-versus-baseline payload.
@@ -78,6 +91,7 @@ fn judge(evidence: Evidence, label: &'static str, window_days: usize) -> Compari
         today_value,
         window_days: days,
         power,
+        covariates,
     } = evidence;
 
     let baseline = Baseline::from_days(&days);
@@ -102,6 +116,13 @@ fn judge(evidence: Evidence, label: &'static str, window_days: usize) -> Compari
             power.as_ref(),
             window_days,
         ),
+        // Only for a verdict that was actually reached. "Nobody knows whether today is different, and here is
+        // what was different about it" is two halves of nothing, and the conditions would crowd out the
+        // sentence saying which side of the comparison was missing.
+        conditions: verdict
+            .is_notable()
+            .then(|| conditions::describe(&covariates))
+            .flatten(),
         baseline,
         verdict,
         delta_percent: delta,
@@ -173,7 +194,10 @@ fn note(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::watch::analysis::baseline::DayValue;
+    use crate::watch::{
+        analysis::{baseline::DayValue, comparison::evidence::CovariateDays},
+        store::queries::CondSeries,
+    };
 
     fn band(values: &[f64]) -> Baseline {
         let days: Vec<DayValue> = values
@@ -310,6 +334,7 @@ mod tests {
                 })
                 .collect(),
             power: Some(mix(0, 4, 0, 40)),
+            covariates: Vec::new(),
         };
         let comparison = judge(evidence, "small-file operations", 7);
         assert_eq!(comparison.verdict, Verdict::Worse);
@@ -332,6 +357,7 @@ mod tests {
             today_value: None,
             window_days: Vec::new(),
             power: Some(mix(0, 0, 0, 0)),
+            covariates: Vec::new(),
         };
         let comparison = judge(evidence, "single-core CPU", 7);
         assert_eq!(comparison.verdict, Verdict::Insufficient);
@@ -339,5 +365,135 @@ mod tests {
         assert_eq!(comparison.today, None);
         assert_eq!(comparison.today_observations, 0);
         assert!(comparison.note.is_some());
+    }
+
+    /// A covariate's window of steady days, and today's figure.
+    fn covariate(series: CondSeries, window: &[f64], today: f64) -> CovariateDays {
+        CovariateDays {
+            series,
+            today: Some(DayValue {
+                day_start_ms: 0,
+                value: today,
+                observations: 8,
+            }),
+            window_days: window
+                .iter()
+                .enumerate()
+                .map(|(index, value)| DayValue {
+                    day_start_ms: index as i64 * 86_400_000,
+                    value: *value,
+                    observations: 8,
+                })
+                .collect(),
+        }
+    }
+
+    /// Evidence for a CPU series that dropped, with whatever covariates a test wants to attach.
+    fn slower_cpu(covariates: Vec<CovariateDays>) -> Evidence {
+        Evidence {
+            metric: "probe:cpu.single_mops_s".into(),
+            unit: "Mops/s",
+            lower_is_better: false,
+            today_value: Some(DayValue {
+                day_start_ms: 0,
+                value: 700.0,
+                observations: 8,
+            }),
+            window_days: (0..5)
+                .map(|index| DayValue {
+                    day_start_ms: index * 86_400_000,
+                    value: 1_000.0,
+                    observations: 8,
+                })
+                .collect(),
+            power: Some(mix(0, 8, 0, 40)),
+            covariates,
+        }
+    }
+
+    /// The half of the question a verdict alone cannot answer, carried through to the comparison.
+    #[test]
+    fn a_finding_reports_what_was_different_about_the_conditions() {
+        let throttled = judge(
+            slower_cpu(vec![covariate(CondSeries::ClockPercent, &[136.0; 5], 96.0)]),
+            "single-core CPU",
+            7,
+        );
+        assert_eq!(throttled.verdict, Verdict::Worse);
+        let conditions = throttled.conditions.expect("the clock explains this");
+        assert!(
+            conditions.summary.contains("clock"),
+            "{}",
+            conditions.summary
+        );
+        assert_eq!(conditions.changes[0].metric, "cond:clock_percent");
+
+        // A finding with nothing unusual behind it says nothing rather than padding.
+        let unexplained = judge(
+            slower_cpu(vec![covariate(
+                CondSeries::ClockPercent,
+                &[136.0; 5],
+                136.4,
+            )]),
+            "single-core CPU",
+            7,
+        );
+        assert_eq!(unexplained.verdict, Verdict::Worse);
+        assert!(unexplained.conditions.is_none());
+    }
+
+    /// Conditions qualify a finding, so a series with no finding does not carry them.
+    ///
+    /// "Nobody knows whether today differs, and here is what was different about it" is two halves of
+    /// nothing, and on an ordinary day it would put a third line on every tile.
+    #[test]
+    fn only_a_verdict_that_was_reached_reports_its_conditions() {
+        let moved = vec![covariate(CondSeries::ClockPercent, &[136.0; 5], 96.0)];
+
+        // Today lands inside the band: normal, and the clock is not an explanation for anything.
+        let mut steady = slower_cpu(moved.clone());
+        steady.today_value = Some(DayValue {
+            day_start_ms: 0,
+            value: 1_000.0,
+            observations: 8,
+        });
+        let normal = judge(steady, "single-core CPU", 7);
+        assert_eq!(normal.verdict, Verdict::Normal);
+        assert!(normal.conditions.is_none());
+
+        // No verdict at all: the tile's one line has to be the reason there is none.
+        let mut nothing = slower_cpu(moved);
+        nothing.window_days = Vec::new();
+        let insufficient = judge(nothing, "single-core CPU", 7);
+        assert_eq!(insufficient.verdict, Verdict::Insufficient);
+        assert!(insufficient.conditions.is_none());
+        assert!(insufficient.note.is_some());
+    }
+
+    /// A derived session series has no covariates at all, and must not pretend otherwise.
+    #[test]
+    fn a_session_subject_reports_no_conditions() {
+        let evidence = Evidence {
+            metric: "tool_read_ms".into(),
+            unit: "ms",
+            lower_is_better: true,
+            today_value: Some(DayValue {
+                day_start_ms: 0,
+                value: 40.0,
+                observations: 200,
+            }),
+            window_days: (0..5)
+                .map(|index| DayValue {
+                    day_start_ms: index * 86_400_000,
+                    value: 11.0,
+                    observations: 200,
+                })
+                .collect(),
+            power: None,
+            covariates: Vec::new(),
+        };
+        let comparison = judge(evidence, "agent file-read latency", 7);
+        assert_eq!(comparison.verdict, Verdict::Worse);
+        assert!(comparison.conditions.is_none());
     }
 }

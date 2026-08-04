@@ -191,8 +191,10 @@ mod tests {
             conn.execute(
                 "INSERT INTO samples_1m (machine_id, bucket, samples, cpu_avg, cpu_max,
                      used_memory_avg, used_swap_max, scanner_cpu_max, agent_cpu_max,
-                     process_count_avg, agent_rss_max)
-                 VALUES (?1, ?2, 12, ?3, 90.0, 1073741824, 4096, 0.5, 5.0, 400, 1048576)",
+                     process_count_avg, agent_rss_max, agent_write_bytes_s_max,
+                     scanner_write_bytes_s_max)
+                 VALUES (?1, ?2, 12, ?3, 90.0, 1073741824, 4096, 0.5, 5.0, 400, 1048576,
+                     2097152.0, 0.0)",
                 rusqlite::params![MACHINE, minute * MINUTE, 10.0 + minute as f64],
             )
             .unwrap();
@@ -200,8 +202,10 @@ mod tests {
         for step in 0..5 {
             conn.execute(
                 "INSERT INTO samples (machine_id, ts, cpu_percent, used_memory, total_memory,
-                     used_swap, process_count, scanner_cpu, agent_cpu, agent_rss, agent_processes)
-                 VALUES (?1, ?2, ?3, 2147483648, 17179869184, 8192, 401, 0.7, 6.0, 2097152, 2)",
+                     used_swap, process_count, scanner_cpu, agent_cpu, agent_rss, agent_processes,
+                     agent_write_bytes_s, scanner_write_bytes_s)
+                 VALUES (?1, ?2, ?3, 2147483648, 17179869184, 8192, 401, 0.7, 6.0, 2097152, 2,
+                     4194304.0, 0.0)",
                 rusqlite::params![MACHINE, 10 * MINUTE + step * 5_000, 50.0 + step as f64],
             )
             .unwrap();

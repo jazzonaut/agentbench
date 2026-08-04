@@ -202,6 +202,14 @@ fn seed(data_dir: &Path, records: Vec<agentbench::watch::store::Record>) {
 
 /// One probe run measuring small-file throughput, as the prober would have written it.
 fn seeded_probe(ts: i64, ops: f64) -> agentbench::watch::store::Record {
+    seeded_probe_at_clock(ts, ops, 136.0)
+}
+
+/// The same run, with the clock a caller chooses.
+///
+/// Split out so a test can seed the case the conditions line exists for: a judged series that dropped on a
+/// day the part was running well below its usual clock.
+fn seeded_probe_at_clock(ts: i64, ops: f64, clock: f32) -> agentbench::watch::store::Record {
     use agentbench::watch::store::{Covariates, MetricSource, ProbeMetric, ProbeRun};
     ProbeRun {
         ts,
@@ -212,7 +220,7 @@ fn seeded_probe(ts: i64, ops: f64) -> agentbench::watch::store::Record {
             agent_active: false,
             contended: false,
             on_battery: Some(false),
-            clock_percent: Some(136.0),
+            clock_percent: Some(clock),
             disk_write_bytes_s: Some(64_000.0),
             scratch_free_bytes: Some(110 << 30),
         },
@@ -416,6 +424,63 @@ fn probes_run_are_charted_and_carry_their_covariates() {
         probe["metrics"].as_i64().unwrap_or(0) >= 4,
         "a probe should record several measurements: {live}"
     );
+    // A contended run has to name the threshold it crossed rather than leaving the page to infer one from
+    // three covariates, which is how a run tagged purely by the disk rule came to report "the machine was
+    // busy". Whether *this* run is contended depends on the machine running the suite, so the assertion is
+    // the implication rather than the tag: a cause exactly when there is contention to explain.
+    assert_eq!(
+        probe["contended"].as_bool().expect("a tag either way"),
+        probe["cause"].is_string(),
+        "a cause belongs to a contended run and to no other: {live}"
+    );
+
+    // The conditions family: the covariates of those same runs, reachable as charts.
+    for metric in [
+        "cond:cpu_at",
+        "cond:clock_percent",
+        "cond:scratch_free_bytes",
+    ] {
+        let series: serde_json::Value =
+            serde_json::from_str(&daemon.get(&format!("/api/series?metric={metric}")))
+                .expect("conditions json");
+        assert!(
+            series["unit"].as_str().is_some_and(|unit| !unit.is_empty()),
+            "{metric} must report a unit for the axis to derive from: {series}"
+        );
+        assert!(
+            series["lower_is_better"].is_null(),
+            "a covariate has no direction: {series}"
+        );
+    }
+    // `cpu_at` and `scratch_free_bytes` are the two covariates every platform answers, so they are the two
+    // whose points can be asserted rather than merely their shape.
+    for metric in ["cond:cpu_at", "cond:scratch_free_bytes"] {
+        let series: serde_json::Value =
+            serde_json::from_str(&daemon.get(&format!("/api/series?metric={metric}")))
+                .expect("conditions json");
+        assert!(
+            series["points"]
+                .as_array()
+                .is_some_and(|points| !points.is_empty()),
+            "{metric} should have a point per run: {series}"
+        );
+    }
+    // Every advertised conditions series is one the endpoint answers, so the list in a 400 is usable.
+    let advertised: Vec<String> = status["series"]
+        .as_array()
+        .expect("series list")
+        .iter()
+        .filter_map(|name| name.as_str())
+        .filter(|name| name.starts_with("cond:"))
+        .map(str::to_string)
+        .collect();
+    assert_eq!(advertised.len(), 6, "six covariates: {advertised:?}");
+    for metric in advertised {
+        let series: serde_json::Value =
+            serde_json::from_str(&daemon.get(&format!("/api/series?metric={metric}")))
+                .expect("conditions json");
+        assert_eq!(series["metric"], metric, "{series}");
+    }
 
     // A metric the probe genuinely runs, under the name the benchmark uses for the same workload.
     let series: serde_json::Value =
@@ -639,9 +704,14 @@ fn verdicts_compare_today_against_a_seeded_baseline() {
             ));
         }
     }
-    // Today, at half that. Offsets in seconds so the run stamps stay in the past whatever time it is.
+    // Today, at half that, and with the part running at 96% of nominal instead of its usual 136. Offsets in
+    // seconds so the run stamps stay in the past whatever time it is.
     for offset in 0..4 {
-        records.push(seeded_probe(today.start_ms + offset * 1_000, 2_000.0));
+        records.push(seeded_probe_at_clock(
+            today.start_ms + offset * 1_000,
+            2_000.0,
+            96.0,
+        ));
     }
     seed(data_dir.path(), records);
 
@@ -681,7 +751,43 @@ fn verdicts_compare_today_against_a_seeded_baseline() {
         "{small_files}"
     );
 
-    // A series with no seeded history reaches no verdict rather than reporting that all is well.
+    // The other half of the question: not only that today is worse, but what was different about it. The
+    // clock moved from 136% of nominal to 96%, well outside the band its own five days produce, so it earns
+    // a clause; the disk rate and the free space did not move at all and must not.
+    let conditions = &small_files["conditions"];
+    assert!(
+        conditions["summary"]
+            .as_str()
+            .is_some_and(|line| line.contains("clock") && line.contains("96%")),
+        "the throttled clock is the explanation this feature exists to give: {small_files}"
+    );
+    let changes = conditions["changes"].as_array().expect("changes array");
+    assert_eq!(
+        changes.len(),
+        1,
+        "only the covariate that moved: {conditions}"
+    );
+    assert_eq!(changes[0]["metric"], "cond:clock_percent");
+    assert_eq!(changes[0]["today"].as_f64(), Some(96.0));
+    assert_eq!(changes[0]["baseline"].as_f64(), Some(136.0));
+    // Every clause names a series the reader can go and open, and the endpoint answers it. The range is
+    // given explicitly rather than left to the endpoint's 48-hour default, which would reach two of the six
+    // seeded days: the reader following this clause is asking about the window the verdict used.
+    let charted: serde_json::Value = serde_json::from_str(&daemon.get(&format!(
+        "/api/series?metric=cond:clock_percent&contended=exclude&from={}&to={}",
+        today.start_ms - 7 * 86_400_000,
+        today.start_ms + 86_400_000,
+    )))
+    .expect("conditions json");
+    assert!(
+        charted["points"]
+            .as_array()
+            .is_some_and(|points| points.len() == 24),
+        "five seeded days and today, four runs each: {charted}"
+    );
+
+    // A series with no seeded history reaches no verdict rather than reporting that all is well — and a tile
+    // with no verdict carries no explanation either, because there is nothing yet to explain.
     let cpu = payload["comparisons"]
         .as_array()
         .expect("comparisons")
@@ -689,6 +795,7 @@ fn verdicts_compare_today_against_a_seeded_baseline() {
         .find(|one| one["metric"] == "probe:cpu.single_mops_s")
         .expect("single-core CPU is judged too");
     assert_eq!(cpu["verdict"], "insufficient", "{cpu}");
+    assert!(cpu["conditions"].is_null(), "{cpu}");
 
     // The same numbers reach the command line, from the same analysis.
     let temp = daemon.stop();
@@ -703,6 +810,12 @@ fn verdicts_compare_today_against_a_seeded_baseline() {
     assert!(stdout.contains("small-file operations"), "{stdout}");
     assert!(stdout.contains("worse"), "{stdout}");
     assert!(stdout.contains("(-50.0%)"), "{stdout}");
+    // Including the conditions line. Two display faults have been caught by reading `--status` rather than
+    // by any test, so this surface stays as complete as the page's.
+    assert!(
+        stdout.contains("clean probes: clock 96% today against 136%"),
+        "{stdout}"
+    );
 }
 
 /// Retention, end to end: the worker is spawned, its instruction reaches the writer, and the chart survives.

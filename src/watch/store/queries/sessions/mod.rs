@@ -152,22 +152,39 @@ pub(crate) mod tests {
 
         // Two turns in one session: the first answers a prompt, the second continues from a tool
         // result and so has no response interval.
+        //
+        // Only the first has a `generation_ms`. That is the ordinary case rather than a gap in the fixture:
+        // a single-row request has no span to measure, which was 1,844 of 2,926 real requests, and it is
+        // what the tokens-per-second series has to exclude rather than divide by.
         let turns = [
-            ("turn-1", "req-1", 500, Some(4_000), 100, 100, 900, 10),
-            ("turn-2", "req-2", 30_000, None, 0, 200, 0, 0),
+            (
+                "turn-1",
+                "req-1",
+                500,
+                Some(4_000),
+                Some(20_000),
+                100,
+                100,
+                900,
+                10,
+            ),
+            ("turn-2", "req-2", 30_000, None, None, 0, 200, 0, 0),
         ];
-        for (uuid, request, ts, response, input, output, cache_read, cache_create) in turns {
+        for (uuid, request, ts, response, generation, input, output, cache_read, cache_create) in
+            turns
+        {
             conn.execute(
                 "INSERT INTO session_turns (uuid, machine_id, ts, project, branch, model, effort,
-                     service_tier, first_response_ms, input_tokens, output_tokens, cache_read,
-                     cache_create, session_id, request_id)
+                     service_tier, first_response_ms, generation_ms, input_tokens, output_tokens,
+                     cache_read, cache_create, session_id, request_id)
                  VALUES (?1, ?2, ?3, 'D:\\Work', 'main', 'claude-opus-5', 'high', 'standard',
-                     ?4, ?5, ?6, ?7, ?8, 'session-1', ?9)",
+                     ?4, ?5, ?6, ?7, ?8, ?9, 'session-1', ?10)",
                 rusqlite::params![
                     uuid,
                     MACHINE,
                     ts,
                     response,
+                    generation,
                     input,
                     output,
                     cache_read,

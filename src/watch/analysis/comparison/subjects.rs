@@ -101,6 +101,7 @@ mod tests {
             SessionSeries::ToolSearchMs,
             SessionSeries::FirstResponseMs,
             SessionSeries::OutputTokens,
+            SessionSeries::OutputTokensPerS,
             SessionSeries::CacheHitRatio,
         ] {
             assert!(

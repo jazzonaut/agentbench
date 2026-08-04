@@ -13,7 +13,9 @@ pub mod samples;
 pub mod sessions;
 
 pub use annotations::{Annotation, AnnotationKind};
-pub use probes::{LatestProbe, ProbeSeries, ProbeValue, latest_run, probe_series};
+pub use probes::{
+    CondSeries, LatestProbe, ProbeSeries, ProbeValue, cond_series, latest_run, probe_series,
+};
 pub use samples::{Latest, Reducer, Resolution, SampleSeries, SeriesRows, latest, series};
 pub use sessions::{SessionSeries, Today, session_series};
 
