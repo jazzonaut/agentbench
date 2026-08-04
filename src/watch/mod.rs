@@ -11,6 +11,7 @@ pub mod analysis;
 pub mod clock;
 pub mod collect;
 pub mod config;
+pub mod contention;
 pub mod maintenance;
 pub mod marker;
 pub mod platform;

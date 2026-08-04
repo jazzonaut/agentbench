@@ -14,62 +14,23 @@
 //!
 //! The cost of reading once is real and worth stating: something that starts half a second into a probe
 //! is missed. The tag says "what this measurement began in", and nothing more than that.
+//!
+//! What the reading is *judged* against lives in [`crate::watch::contention`], not here: the store
+//! recomputes the reason a run was tagged for the live tile, so the thresholds have to be somewhere both
+//! layers can name them.
 
 use crate::{
     process_tree, system,
     watch::{
         collect::targets::{self, Targets},
         config::CollectConfig,
+        contention::{self, AGENT_WORKING_CORE_PERCENT},
         platform::{self, Capability},
         store::{Covariates, ProbeProcess},
     },
 };
 use std::{path::Path, process};
 use sysinfo::{CpuRefreshKind, MemoryRefreshKind, RefreshKind, System};
-
-/// Whole-machine CPU above which the machine counts as busy, on a 0–100 scale across every core.
-///
-/// Higher than the sampler's idle threshold on purpose. That one decides how often to look at a quiet
-/// machine, where being wrong costs a sample; this one decides whether a measurement is comparable to
-/// yesterday's, where being wrong costs a false verdict. A probe using one core of eight already reads
-/// around 12%, so the threshold has to sit above the probe's own footprint.
-const BUSY_MACHINE_PERCENT: f32 = 40.0;
-
-/// Scanner CPU above which a filesystem measurement is competing for the machine.
-///
-/// **A different scale from [`BUSY_MACHINE_PERCENT`].** `sysinfo` reports per-process CPU as a percentage
-/// of *one* core, so a process tree's figure runs to 100 × cores and 10.0 means a tenth of one core, not
-/// a tenth of the machine. Confusing the two is not hypothetical: an earlier 2.0 here read as "a couple of
-/// percent of total CPU" and was in fact a fiftieth of one core, which almost anything clears.
-///
-/// This reading is taken before the probe runs, so what it detects is a scanner already busy with
-/// something else — a scheduled scan — rather than one reacting to the probe's own writes. The latter is
-/// part of what the probe measures and must not be filtered out of it.
-const BUSY_SCANNER_CORE_PERCENT: f32 = 10.0;
-
-/// Agent CPU above which a coding agent counts as working rather than merely running.
-///
-/// Also per-core, and also raised from an initial 1.0 for the same reason. On a developer's machine the
-/// configured names match every `node` process there is, most of which are idling in an event loop; at 1%
-/// of one core they all counted as contention and left almost no comparable runs. A fifth of a core is a
-/// process doing something.
-const AGENT_WORKING_CORE_PERCENT: f32 = 20.0;
-
-/// Whole-machine disk throughput above which a filesystem measurement is competing for the disk.
-///
-/// The covariate this threshold reads was the largest hole in the design: `contended` was three CPU
-/// figures, so a probe that ran while an update or a backup wrote gigabytes read slow at 15% CPU and went
-/// into the baseline as clean data — and two of the five judged series are filesystem measurements.
-///
-/// 20 MiB/s, chosen from measurement rather than from taste. On the development machine an idle desktop
-/// with a browser and an editor open wrote 17 KiB/s at the median and peaked at 1.3 MiB/s, while an
-/// all-core `cargo build` ran to 44.9 MiB/s. Anything in between is the ambiguous region and 20 MiB/s sits
-/// in it, well clear of idle noise and comfortably under a real build.
-///
-/// Like every threshold here it cannot be validated by a test that supplies its own inputs, and unlike the
-/// CPU ones it has no history behind it yet. It is read from the machine *before* the workloads run, so
-/// the probe's own 8 MiB of writes are never in it.
-const BUSY_DISK_BYTES_S: f64 = 20.0 * 1024.0 * 1024.0;
 
 /// Largest consumers recorded per probe.
 ///
@@ -208,7 +169,12 @@ impl Observer {
                 scanner_percent: scanner,
                 agent_percent: agent,
                 agent_active,
-                contended: is_contended(cpu, scanner, agent_active, conditions.disk_write_bytes_s),
+                contended: contention::is_contended(
+                    cpu,
+                    scanner,
+                    agent_active,
+                    conditions.disk_write_bytes_s,
+                ),
                 // Asked on every reading rather than cached: plugging a laptop in mid-afternoon is exactly
                 // the event that makes the morning's numbers incomparable to the evening's.
                 on_battery: platform::on_battery(),
@@ -279,31 +245,10 @@ impl Observer {
     }
 }
 
-/// Whether a reading describes a machine that had something else to do.
-///
-/// Split out from [`Observer::read`] so the rule is testable without a live `System`, and so the four
-/// thresholds are visible in one place rather than spread through a constructor. `machine_cpu` is
-/// whole-machine; `scanner_cpu` is per-core, like everything `process_tree` reports; `disk_write_bytes_s`
-/// is whole-machine and absent on a platform that will not say.
-///
-/// An absent disk reading does not make a run contended. That is the same rule the power covariate
-/// follows and for the same reason: a platform that cannot answer must not have every one of its probes
-/// discarded, or the feature dies exactly where it is hardest to replace.
-fn is_contended(
-    machine_cpu: f32,
-    scanner_cpu: Option<f32>,
-    agent_active: bool,
-    disk_write_bytes_s: Option<f64>,
-) -> bool {
-    machine_cpu > BUSY_MACHINE_PERCENT
-        || scanner_cpu.is_some_and(|percent| percent > BUSY_SCANNER_CORE_PERCENT)
-        || agent_active
-        || disk_write_bytes_s.is_some_and(|rate| rate > BUSY_DISK_BYTES_S)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::watch::contention::{BUSY_DISK_BYTES_S, BUSY_MACHINE_PERCENT};
     use std::time::Duration;
 
     fn config() -> CollectConfig {
@@ -320,71 +265,6 @@ mod tests {
             probe_interval: Duration::from_secs(900),
             scratch_dir: None,
         }
-    }
-
-    #[test]
-    fn a_quiet_machine_with_nothing_else_running_is_uncontended() {
-        assert!(!is_contended(3.0, None, false, Some(0.0)));
-    }
-
-    #[test]
-    fn a_saturated_machine_is_contended() {
-        assert!(is_contended(95.0, None, false, None));
-    }
-
-    /// The hole this covariate was added to close: a busy disk at almost no CPU.
-    ///
-    /// A backup, a system update or a cloud sync writing gigabytes costs a filesystem probe most of its
-    /// throughput while barely touching the CPU, so every threshold above it reads "idle" and the run went
-    /// into the baseline as clean data. Two of the five judged series are filesystem measurements.
-    #[test]
-    fn a_busy_disk_is_contention_even_on_an_idle_cpu() {
-        assert!(
-            is_contended(4.0, None, false, Some(45.0 * 1024.0 * 1024.0)),
-            "45 MiB/s is a build or a backup, not a quiet machine"
-        );
-        assert!(
-            !is_contended(4.0, None, false, Some(64.0 * 1024.0)),
-            "64 KiB/s is an idle desktop, which is what the median actually measures"
-        );
-    }
-
-    /// A platform that cannot report throughput must not have all its probes discarded.
-    #[test]
-    fn an_absent_disk_reading_is_not_treated_as_contention() {
-        assert!(!is_contended(3.0, None, false, None));
-    }
-
-    /// A scanner already at work is contention; one merely installed is not.
-    ///
-    /// Both figures are per-core, which is the trap this test exists to pin down: 3.0 here is three
-    /// percent of *one* core, and reading it as three percent of the machine is what made an earlier
-    /// threshold tag almost every run.
-    #[test]
-    fn a_busy_scanner_is_contention_and_an_idle_one_is_not() {
-        assert!(
-            is_contended(5.0, Some(60.0), false, None),
-            "a scanner using most of a core is doing something other than watching us"
-        );
-        assert!(
-            !is_contended(5.0, Some(3.0), false, None),
-            "three percent of one core is a scanner sitting there, not scanning"
-        );
-    }
-
-    #[test]
-    fn a_working_agent_is_contention_even_on_an_otherwise_idle_machine() {
-        assert!(is_contended(4.0, None, true, None));
-    }
-
-    /// A probe using one core of a many-core machine must not tag itself as contended.
-    #[test]
-    fn the_probes_own_footprint_is_below_the_busy_threshold() {
-        let one_core_of_eight = 100.0 / 8.0;
-        assert!(
-            !is_contended(one_core_of_eight, None, false, None),
-            "a probe would otherwise report every one of its own runs as contended"
-        );
     }
 
     #[test]
@@ -405,9 +285,7 @@ mod tests {
             "no agent found is absent too, and it is what agent_active was derived from"
         );
         assert!(
-            covariates
-                .scratch_free_bytes
-                .is_none_or(|bytes| bytes > 0),
+            covariates.scratch_free_bytes.is_none_or(|bytes| bytes > 0),
             "a matched volume with zero bytes free would not have held the temporary directory"
         );
     }
@@ -477,7 +355,10 @@ mod tests {
         assert!(consumers.len() <= TOP_CONSUMERS);
         for (index, consumer) in consumers.iter().enumerate() {
             assert_eq!(consumer.rank as usize, index + 1, "ranks are contiguous");
-            assert!(!consumer.name.is_empty(), "a rank without a name explains nothing");
+            assert!(
+                !consumer.name.is_empty(),
+                "a rank without a name explains nothing"
+            );
             assert!(
                 consumer.cpu_percent > 0.0,
                 "{} was idle and should not have been ranked",
