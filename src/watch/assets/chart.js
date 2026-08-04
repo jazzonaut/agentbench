@@ -193,6 +193,20 @@ export function createChart(element, format, label = 'value') {
       current = toSeries(points, gapMs);
       render();
     },
+    /** Rename the measure the tooltip states.
+     *
+     *  uPlot writes a series label into the legend DOM at construction, so a panel whose metric can
+     *  change has to rebuild rather than mutate — the same path a colour-scheme change already takes.
+     *  Guarded on a real change, so the minute poll reselecting the same metric rebuilds nothing.
+     */
+    setLabel(next) {
+      if (next === label) return;
+      label = next;
+      if (!plot) return;
+      plot.destroy();
+      plot = null;
+      render();
+    },
     /** Replace the marks drawn behind the data. Redraws only if the plot already exists. */
     setAnnotations(next) {
       marks = next ?? [];

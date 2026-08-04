@@ -64,6 +64,26 @@ mod tests {
         }
     }
 
+    /// Every judged probe metric is offered by the dashboard's probe switch.
+    ///
+    /// That switch is authored in JavaScript, which nothing compiles against this list. A metric renamed
+    /// here would leave a button requesting a series the server rejects, and the symptom would be one
+    /// empty frame on a page whose frames are legitimately empty for the first day of collection — so the
+    /// drift would be invisible exactly when it happened. Asserted in this direction only: charting a
+    /// metric no verdict is computed for is a reasonable thing to do.
+    #[test]
+    fn the_dashboard_switch_offers_every_judged_probe_metric() {
+        const APP_JS: &str = include_str!("../../assets/app.js");
+        for (subject, _) in SUBJECTS {
+            if let Subject::Probe(name) = subject {
+                assert!(
+                    APP_JS.contains(&format!("probe:{name}")),
+                    "probe:{name} earns a verdict, so the dashboard must offer a chart of it"
+                );
+            }
+        }
+    }
+
     /// The exclusions are a decision, not an oversight, so they are asserted.
     #[test]
     fn the_confounded_session_series_are_deliberately_not_judged() {

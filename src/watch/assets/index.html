@@ -117,18 +117,34 @@
   }
   /* Stacked charts read as one instrument, so the gap between them is a seam, not a margin. */
   .card + .card { margin-top: 10px; }
-  .card-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+  /* Wraps rather than compressing: a narrow viewport puts the switch under the title it belongs to,
+     instead of stacking four buttons into a column against the right edge. */
+  .card-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 12px;
+  }
   /* One series needs no legend box; the title names it. */
   .card-title { font-size: 13px; font-weight: 600; }
   .card-note { color: var(--ink-muted); font-size: 11px; }
+  /* A note that changes with the selection sits on its own line, so it needs the paragraph's semantics
+     without the paragraph's margins. */
+  .card > .card-note { margin: 2px 0 0; }
 
   .controls { display: flex; align-items: center; flex-wrap: wrap; gap: 14px; margin-bottom: 10px; }
-  .ranges { display: flex; gap: 6px; }
+  /* Two groups of mutually exclusive buttons, styled once: the range of the whole history section, and
+     which measurement one frame draws. Same control, same appearance, same hit target. */
+  .ranges, .metrics { display: flex; flex-wrap: wrap; gap: 6px; }
+  /* The head aligns its text on the baseline, which is right for a title and wrong for a row of
+     buttons taller than the title beside them. */
+  .card-head .metrics { align-self: center; }
   /* A filter that changes what a chart means gets a label, not just a box. */
   .filter { display: flex; align-items: center; gap: 6px; color: var(--ink-secondary); font-size: 12px; }
   .filter input { width: 15px; height: 15px; accent-color: var(--series-1); }
   .filter:focus-within { outline: 2px solid var(--series-1); outline-offset: 3px; border-radius: 4px; }
-  .ranges button {
+  .ranges button, .metrics button {
     font: inherit;
     font-size: 12px;
     /* Comfortable hit target rather than a cramped one. */
@@ -140,12 +156,15 @@
     border-radius: 6px;
     cursor: pointer;
   }
-  .ranges button[aria-pressed="true"] {
+  .ranges button[aria-pressed="true"], .metrics button[aria-pressed="true"] {
     color: var(--ink-primary);
     border-color: var(--axis);
     font-weight: 600;
   }
-  .ranges button:focus-visible { outline: 2px solid var(--series-1); outline-offset: 2px; }
+  .ranges button:focus-visible, .metrics button:focus-visible {
+    outline: 2px solid var(--series-1);
+    outline-offset: 2px;
+  }
 
   .empty { color: var(--ink-muted); font-size: 12px; padding: 28px 4px; }
 
@@ -206,8 +225,13 @@
     <h2 id="history-heading">History</h2>
     <div class="controls">
       <div class="ranges" id="ranges" role="group" aria-label="Time range"></div>
+      <!-- Off by default, which is not the same as saying contention does not matter. A machine with a
+           coding agent on it produces mostly contended probes, so a filter that starts on shows an empty
+           frame on a machine that has been probing all day - and an empty chart reads as a broken tool,
+           not as a filter doing its job. Every run is drawn, and the tile above says whether the last one
+           was contended. Verdicts are unaffected: they use uncontended runs only, with no override. -->
       <label class="filter" for="uncontended">
-        <input type="checkbox" id="uncontended" checked>
+        <input type="checkbox" id="uncontended">
         Uncontended probes only
       </label>
     </div>
@@ -235,14 +259,16 @@
       </p>
     </div>
     <div class="card">
+      <!-- The switch sits in the head, next to the title it completes: one frame, four measurements,
+           and the selected button is the only thing that says which is on screen. The note moves to its
+           own line because the scale is part of the reading and changes with the selection. -->
       <div class="card-head">
-        <span class="card-title">Probe: small-file operations</span>
-        <!-- The scale is stated because these values are not comparable to a bench report's, which
-             runs the same workload over 5,000 files. -->
-        <span class="card-note">controlled workload · 200 files · not comparable to a bench report</span>
+        <span class="card-title">Probe</span>
+        <div class="metrics" id="probe-metrics" role="group" aria-label="Probe metric"></div>
       </div>
-      <div id="chart-probe-fs"></div>
-      <p class="empty" data-empty-for="chart-probe-fs" hidden>
+      <p class="card-note">controlled workload · 200 files · not comparable to a bench report</p>
+      <div id="chart-probe"></div>
+      <p class="empty" data-empty-for="chart-probe" hidden>
         No probes in this range yet. The first one runs once a full probe interval has elapsed.
       </p>
     </div>

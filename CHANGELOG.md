@@ -4,6 +4,26 @@ All notable changes to AgentBench are documented here. The project follows [Sema
 
 ## [Unreleased]
 
+### Added
+
+- **The dashboard's probe frame switches between the four measurements a verdict is computed for.** One
+  frame with a switch in its head rather than four stacked charts: small-file operations, sequential write,
+  SQLite lookup and single-core CPU share nothing but a workload — ops/s, MiB/s, ms and Mops/s — so stacking
+  them would put four y-axes on a page whose charts stack precisely because they can be read down one shared
+  cursor. The set is exactly the judged one, so every verdict tile has a line to check it against, and a
+  test fails if the two ever drift apart. Axis and tooltip both come from the unit the server reports for
+  the series, so a fifth metric is one entry in a list rather than a formatter.
+
+### Changed
+
+- **The dashboard's "uncontended probes only" filter starts off.** It started on, which is right for
+  comparability and wrong as a default. A machine with a coding agent on it produces mostly contended
+  probes, so what a new user actually saw was an empty frame — on a machine that had been probing all day —
+  under a message explaining that the first probe takes fifteen minutes. An empty chart reads as a broken
+  tool rather than as a filter doing its job, and the message compounded it by naming a cause that had
+  already passed. Every run is drawn now, the live tile still says whether the last one was contended, and
+  verdicts are unaffected: they use uncontended runs only, with no override.
+
 ## [0.5.0] - 2026-08-03
 
 ### Added

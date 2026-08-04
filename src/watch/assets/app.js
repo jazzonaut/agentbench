@@ -25,6 +25,44 @@ const RANGES = [
 
 let selectedRange = RANGES.find((range) => range.label === '48h');
 
+/** Probe metrics the one probe frame switches between, and what each measurement actually is.
+ *
+ *  The four the comparison judges, in the order it lists them — see `comparison::subjects::SUBJECTS`.
+ *  Charting exactly the judged set is the point: a verdict tile a reader wants to check has a line to
+ *  check it against, and a line that earns a verdict is never silently absent from the chart.
+ *
+ *  Every entry carries its own note because the working set is part of the reading. 200 files is not
+ *  8 MiB, and a note left over from the previous selection would describe a different workload than the
+ *  line on screen. The unit is not listed: the server reports it per series and the axis derives from
+ *  that, so a name here can never disagree with the catalogue.
+ */
+const PROBE_METRICS = [
+  {
+    label: 'small-file ops',
+    metric: 'probe:filesystem.small_file_ops_s',
+    note: 'controlled workload · 200 files · not comparable to a bench report',
+  },
+  {
+    label: 'sequential write',
+    metric: 'probe:filesystem.sequential_write_mib_s',
+    // The read half is deliberately not collected: at 8 MiB it is served from the page cache, so it
+    // would report memory bandwidth under a name that means disk everywhere else in the tool.
+    note: 'controlled workload · 8 MiB write · write only, a read this size is page cache',
+  },
+  {
+    label: 'SQLite lookup',
+    metric: 'probe:sqlite.lookup_ms',
+    note: 'controlled workload · 2,000 rows · lower is better',
+  },
+  {
+    label: 'single-core CPU',
+    metric: 'probe:cpu.single_mops_s',
+    note: 'controlled workload · one core for 200 ms · never all cores',
+  },
+];
+
+let selectedProbe = PROBE_METRICS[0];
+
 const dom = {
   subtitle: document.getElementById('subtitle'),
   tiles: document.getElementById('tiles'),
@@ -32,6 +70,7 @@ const dom = {
   verdicts: document.getElementById('verdicts'),
   verdictsNote: document.getElementById('verdicts-note'),
   ranges: document.getElementById('ranges'),
+  probeMetrics: document.getElementById('probe-metrics'),
   uncontended: document.getElementById('uncontended'),
   marks: document.getElementById('marks'),
   statusLine: document.getElementById('status-line'),
@@ -41,15 +80,18 @@ const dom = {
 /** Stacked charts, in reading order. Each owns one metric and one y-axis.
  *
  *  A panel with no `format` derives one from the unit the server reports, which is how a probe series
- *  named after a catalogue entry gets a correct axis without the page knowing what it measures.
+ *  named after a catalogue entry gets a correct axis without the page knowing what it measures. That is
+ *  also what lets the probe frame's metric be switched at runtime: see {@link PROBE_METRICS}. Its entry
+ *  below opens on the default selection rather than hardcoding a metric of its own.
  */
 const CHARTS = [
   { id: 'chart-cpu', metric: 'cpu_percent', format: percent, label: 'system CPU' },
   { id: 'chart-tools', metric: 'tool_read_ms', format: latency, label: 'median latency' },
-  { id: 'chart-probe-fs', metric: 'probe:filesystem.small_file_ops_s', label: 'probe throughput' },
+  { id: 'chart-probe', metric: selectedProbe.metric, label: selectedProbe.label },
 ].map((config) => {
   const element = document.getElementById(config.id);
   const note = element.closest('.card')?.querySelector('.card-note') ?? null;
+  const empty = document.querySelector(`[data-empty-for="${config.id}"]`);
   const panel = {
     ...config,
     unit: '',
@@ -57,7 +99,10 @@ const CHARTS = [
     // The note as authored in the markup, so a resolution caveat can be appended and later removed
     // without the original wording being lost after the first poll.
     baseNote: note?.textContent.trim() ?? '',
-    empty: document.querySelector(`[data-empty-for="${config.id}"]`),
+    empty,
+    // Likewise the empty state, which a failed load overwrites with the reason. Without the original to
+    // restore, a metric that failed once would keep explaining itself under the next metric selected.
+    baseEmpty: empty?.textContent.trim() ?? '',
   };
   // The closure reads `panel.unit` on every call rather than capturing it, so the first response can
   // supply the unit without the plot having to be rebuilt.
@@ -68,6 +113,9 @@ const CHARTS = [
   );
   return panel;
 });
+
+/** The frame the probe switch drives, found by id so a renamed panel fails loudly at boot. */
+const probePanel = CHARTS.find((panel) => panel.id === 'chart-probe');
 
 /** Fetch JSON, surfacing the server's error message rather than a bare status code. */
 async function api(path) {
@@ -345,6 +393,39 @@ function renderRanges() {
   }
 }
 
+/** Draw the probe switch and point the probe frame at what it selects.
+ *
+ *  One frame rather than four stacked ones. The four measurements share nothing but a workload — ops/s,
+ *  MiB/s, ms and Mops/s — so stacking them would add three y-axes to a page whose charts stack precisely
+ *  because they can be read down a single shared cursor.
+ *
+ *  The unit is left alone here. It is replaced by the response, and until then the axis still describes
+ *  the data still on screen, which is the previous metric's.
+ */
+function renderProbeMetrics() {
+  dom.probeMetrics.replaceChildren();
+  for (const choice of PROBE_METRICS) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = choice.label;
+    button.setAttribute('aria-pressed', String(choice === selectedProbe));
+    button.addEventListener('click', () => {
+      selectedProbe = choice;
+      renderProbeMetrics();
+      void loadHistory();
+    });
+    dom.probeMetrics.append(button);
+  }
+
+  probePanel.metric = selectedProbe.metric;
+  probePanel.baseNote = selectedProbe.note;
+  probePanel.chart.setLabel(selectedProbe.label);
+  if (probePanel.note) probePanel.note.textContent = selectedProbe.note;
+  // Reset before the fetch rather than after it: an error from the metric being left behind must not
+  // stand as the explanation for the one being selected.
+  if (probePanel.empty) probePanel.empty.textContent = probePanel.baseEmpty;
+}
+
 /** Reported by /api/status, which is polled far less often than the tiles that display it. */
 let uplotVersion = null;
 
@@ -420,6 +501,7 @@ async function loadHistory() {
         panel.chart.setAnnotations(annotations);
         panel.chart.update(series.points, series.gap_ms);
         panel.empty.hidden = series.points.length > 0;
+        panel.empty.textContent = panel.baseEmpty;
         const note = resolutionNote(series);
         if (note && panel.note) panel.note.textContent = `${panel.baseNote} · ${note}`;
         else if (panel.note) panel.note.textContent = panel.baseNote;
@@ -432,6 +514,7 @@ async function loadHistory() {
 }
 
 renderRanges();
+renderProbeMetrics();
 // Toggling what a chart counts must redraw it immediately: waiting a minute for the next poll would
 // read as the filter having done nothing.
 dom.uncontended.addEventListener('change', () => void loadHistory());
