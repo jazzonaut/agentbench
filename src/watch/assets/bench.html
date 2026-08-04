@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Run a benchmark · AgentBench</title>
+<link rel="stylesheet" href="/assets/styles.css">
+</head>
+<body>
+<main>
+  <header>
+    <h1>AgentBench</h1>
+    <span class="subtitle" id="subtitle">a full-scale measurement of this machine</span>
+  </header>
+
+  <nav class="pages" aria-label="Dashboard pages">
+    <a href="/">Machine</a>
+    <a href="/bench" aria-current="page">Run a benchmark</a>
+    <a href="/compare">Compare reports</a>
+  </nav>
+
+  <section aria-labelledby="options-heading">
+    <h2 id="options-heading">What to run</h2>
+
+    <!-- Filled by the server's own refusal when this daemon will not start runs, and otherwise hidden.
+         The form stays visible and disabled rather than disappearing: a page that simply has no button is
+         a page that looks broken. -->
+    <p class="notice bad" id="refusal" hidden></p>
+
+    <div class="card" style="padding: 16px;">
+      <form id="bench-form">
+        <fieldset id="fields">
+          <div class="fields">
+            <label class="field">
+              <span>Preset</span>
+              <select id="preset"></select>
+              <!-- Written from the preset's own published limits, so it cannot describe a run the
+                   benchmark will not perform. -->
+              <span class="field-hint" id="preset-hint"></span>
+            </label>
+
+            <label class="field">
+              <span>Target directory</span>
+              <input type="text" id="target-dir" spellcheck="false" autocomplete="off">
+              <span class="field-hint">
+                The volume the disk numbers describe. Point it at the repository that feels slow.
+              </span>
+            </label>
+
+            <label class="field">
+              <span>Scratch directory <span class="field-hint">optional</span></span>
+              <input type="text" id="scratch-dir" spellcheck="false" autocomplete="off">
+              <span class="field-hint">
+                Where the filesystem workloads write. Leave empty to write inside the target directory,
+                which an IDE indexer or a file-watching test runner will notice.
+              </span>
+            </label>
+
+            <div class="field switch">
+              <input type="checkbox" id="offline">
+              <div>
+                <label for="offline">Skip the network probe</label>
+                <span class="field-hint">Leaves out the standalone HTTPS timing request.</span>
+              </div>
+            </div>
+
+            <div class="field switch">
+              <input type="checkbox" id="live-llm">
+              <div>
+                <label for="live-llm">Include live Claude cases</label>
+                <!-- Stated in the form rather than in a tooltip. This is the only control on any of these
+                     pages that spends money, and the cap is filled in from the server. -->
+                <span class="field-hint" id="live-llm-hint">
+                  Off by default. These calls are billed to whichever API key this daemon runs with.
+                </span>
+              </div>
+            </div>
+
+            <label class="field" id="route-field">
+              <span>Live Claude route</span>
+              <select id="llm-route">
+                <option value="auto">auto — direct, and Headroom if it is listening</option>
+                <option value="direct">direct only</option>
+                <option value="headroom">Headroom only</option>
+                <option value="both">both, and fail if Headroom is absent</option>
+              </select>
+              <span class="field-hint">`auto` pays for every scenario twice when a proxy is up.</span>
+            </label>
+
+            <label class="field" id="model-field">
+              <span>Model</span>
+              <input type="text" id="llm-model" spellcheck="false" autocomplete="off">
+              <span class="field-hint">An alias such as `sonnet`, or a full model identifier.</span>
+            </label>
+
+            <label class="field" id="cap-field">
+              <span>Cost cap</span>
+              <input type="number" id="llm-cost-cap" min="0.01" step="0.01">
+              <span class="field-hint" id="cap-hint">US dollars. The run stops before exceeding it.</span>
+            </label>
+          </div>
+        </fieldset>
+
+        <!-- Outside the fieldset, deliberately. A run in flight disables the fieldset so its options cannot
+             be edited under it, and a `disabled` fieldset disables every control inside it — which put "Stop
+             it" out of reach exactly while it was the only button worth pressing. The two buttons are
+             enabled and disabled individually instead. -->
+        <div class="actions">
+          <button type="submit" class="primary" id="start">Start the benchmark</button>
+          <button type="button" class="secondary" id="cancel" hidden>Stop it</button>
+          <span class="field-hint" id="busy"></span>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <section aria-labelledby="run-heading">
+    <h2 id="run-heading">This run</h2>
+    <p class="notice" id="run-message">Nothing has been started from this page yet.</p>
+    <div class="card" id="run-card" hidden style="padding: 16px;">
+      <div class="phase" id="phase">Starting…</div>
+      <div class="gauge"><div id="gauge-fill"></div></div>
+      <div class="elapsed" id="elapsed"></div>
+      <p class="card-note" id="run-summary" style="margin-top: 10px;"></p>
+    </div>
+    <p class="notice bad" id="run-error" hidden></p>
+    <p class="notice good" id="run-done" hidden></p>
+  </section>
+
+  <footer>
+    <h2>What a run costs this machine</h2>
+    <p class="card-note">
+      A benchmark loads this machine deliberately: it spins the CPU, writes hundreds of megabytes, and
+      exercises memory and the network. The dashboard's own passive series will show a cliff for the
+      duration, which the marked-run band on the machine page explains. Nothing else on the machine is
+      protected from it, so a run is worth starting when you are not in the middle of something.
+    </p>
+    <p class="card-note">
+      Reports are written to <code id="reports-dir">the data directory</code>. A run started here is
+      recorded in the default data directory's database, which is not necessarily the one this dashboard is
+      reading — a daemon started with <code>--data-dir</code> annotates a different file.
+    </p>
+  </footer>
+</main>
+
+<script type="module" src="/assets/bench.js"></script>
+</body>
+</html>

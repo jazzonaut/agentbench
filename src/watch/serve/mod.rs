@@ -10,6 +10,7 @@ pub mod handlers;
 pub mod origin;
 pub mod response;
 pub mod router;
+pub mod runs;
 
 use crate::watch::{
     config::{ServerConfig, WatchConfig},
@@ -28,6 +29,13 @@ use std::{
 
 /// How often the accept loop checks for shutdown while idle.
 const SHUTDOWN_POLL: Duration = Duration::from_millis(250);
+
+/// Largest request body accepted, in bytes.
+///
+/// Sized for the one thing that is uploaded: a pair of JSON reports, each tens of kilobytes with its samples
+/// included. Eight mebibytes leaves room for a stress run's sample series several times over and still
+/// bounds what one request can make this process allocate.
+const MAX_BODY_BYTES: usize = 8 << 20;
 
 /// Consecutive accept failures tolerated before the server stops trying.
 ///
@@ -58,6 +66,19 @@ pub struct Settings {
     /// the file exactly as it was, so the page would otherwise draw a flat line and call it a quiet
     /// machine.
     pub writer: Option<WriterHealth>,
+    /// The daemon's benchmark slot, when this daemon starts benchmarks.
+    ///
+    /// The second runtime handle to cross into this layer, and it crosses for the same reason as
+    /// [`writer`]: it is a fact about the running process that no query can answer. Absent in three
+    /// distinct situations, all of which the handlers treat alike — `watch.toml` turned runs off, the
+    /// caller is `--status` reading somebody else's database, or the caller is a test.
+    ///
+    /// Note what this does *not* do to the read-only guarantee above. Handlers still cannot reach the
+    /// configuration or the writer; what they gain is one object with four methods on it, and the only one
+    /// that acts refuses unless the request cleared the write gate.
+    ///
+    /// [`writer`]: Self::writer
+    pub runs: Option<Arc<runs::Registry>>,
 }
 
 impl From<&WatchConfig> for Settings {
@@ -71,6 +92,7 @@ impl From<&WatchConfig> for Settings {
             baseline_window_days: config.analysis.baseline_window_days,
             idle_interval: config.collect.sample_interval_idle,
             writer: None,
+            runs: None,
         }
     }
 }
@@ -82,6 +104,7 @@ impl Default for Settings {
             baseline_window_days: 7,
             idle_interval: Duration::from_secs(30),
             writer: None,
+            runs: None,
         }
     }
 }
@@ -90,6 +113,14 @@ impl Settings {
     /// Report this writer's liveness alongside the rest of the status payload.
     pub fn watching(mut self, writer: WriterHealth) -> Self {
         self.writer = Some(writer);
+        self
+    }
+
+    /// Let the benchmark endpoints start runs through this registry.
+    ///
+    /// Not calling this is what disables them, and the endpoints then say so rather than disappearing.
+    pub fn with_runs(mut self, runs: Arc<runs::Registry>) -> Self {
+        self.runs = Some(runs);
         self
     }
 }
@@ -170,22 +201,37 @@ impl Server {
                 }
             };
             accept_failures = 0;
-            // Checked before the database is even opened: a rebound request is not a request for this
-            // server, and answering it at all is the whole of the vulnerability.
-            let response = if origin::is_own_host(host_header(&request), port) {
-                match store.reader() {
-                    Ok(reader) => {
-                        let req = Req::parse(request.url())
-                            .with_method(Method::parse(request.method().as_str()));
-                        router::route(&req, &reader, &settings)
-                    }
-                    Err(error) => Resp::error(503, &format!("database unavailable: {error}")),
-                }
-            } else {
+            let mut request = request;
+            let method = Method::parse(request.method().as_str());
+            // Three gates, in widening order of what they cost to check and narrowing order of what they
+            // let through. All of them run before the database is opened.
+            let response = if !origin::is_own_host(host_header(&request), port) {
+                // A rebound request is not a request for this server, and answering it at all is the whole
+                // of the vulnerability.
                 Resp::error(
                     421,
                     "this dashboard answers only to its own loopback address",
                 )
+            } else if method.is_write() && !write_is_permitted(&request, port) {
+                // Correctly addressed and still not ours: see `origin::is_same_origin_write`. A `403`
+                // rather than a `421`, because the address was right and the provenance was not.
+                Resp::error(
+                    403,
+                    "a request that starts work must come from this dashboard's own page",
+                )
+            } else {
+                match read_body(&mut request) {
+                    Err(response) => response,
+                    Ok(body) => match store.reader() {
+                        Ok(reader) => {
+                            let req = Req::parse(request.url())
+                                .with_method(method)
+                                .with_body(body);
+                            router::route(&req, &reader, &settings)
+                        }
+                        Err(error) => Resp::error(503, &format!("database unavailable: {error}")),
+                    },
+                }
             };
             if let Err(error) = respond(request, &response) {
                 sink.log(Level::Warn, "serve", format!("failed to respond: {error}"));
@@ -197,6 +243,54 @@ impl Server {
 /// The request's `Host`, if it sent one.
 fn host_header(request: &tiny_http::Request) -> Option<&str> {
     header_value(request, "Host")
+}
+
+/// Whether a request that could change something proves it came from this dashboard.
+///
+/// The header reading is here and the rule is in [`origin::is_same_origin_write`], so the rule stays
+/// testable without a socket — which is where the interesting cases are.
+fn write_is_permitted(request: &tiny_http::Request, port: u16) -> bool {
+    origin::is_same_origin_write(
+        header_value(request, "Sec-Fetch-Site"),
+        header_value(request, "Origin"),
+        header_value(request, "Content-Type"),
+        port,
+    )
+}
+
+/// Read a request body, or the refusal to send instead of reading it.
+///
+/// Bounded, and bounded before anything is allocated: `Content-Length` is checked first so an enormous body
+/// is refused without being read, and the read itself is capped as well because the header is the client's
+/// claim rather than a fact. A report with its samples is tens of kilobytes, so the limit is generous by two
+/// orders of magnitude and still finite — which is what stops a single request from exhausting the memory of
+/// a daemon that is meant to be the least noticeable thing on the machine.
+fn read_body(request: &mut tiny_http::Request) -> Result<Vec<u8>, Resp> {
+    let declared = request.body_length().unwrap_or(0);
+    if declared > MAX_BODY_BYTES {
+        return Err(Resp::error(
+            413,
+            &format!("a request body may not exceed {MAX_BODY_BYTES} bytes"),
+        ));
+    }
+    if declared == 0 {
+        return Ok(Vec::new());
+    }
+    let mut body = Vec::with_capacity(declared);
+    // One byte past the limit, so a body whose declared length understated it is caught rather than silently
+    // truncated into something that might still parse.
+    let mut limited = std::io::Read::take(request.as_reader(), MAX_BODY_BYTES as u64 + 1);
+    match std::io::Read::read_to_end(&mut limited, &mut body) {
+        Ok(_) if body.len() > MAX_BODY_BYTES => Err(Resp::error(
+            413,
+            &format!("a request body may not exceed {MAX_BODY_BYTES} bytes"),
+        )),
+        Ok(_) => Ok(body),
+        Err(error) => Err(Resp::error(
+            400,
+            &format!("could not read the request body: {error}"),
+        )),
+    }
 }
 
 /// Write a [`Resp`] to a `tiny_http` request.
@@ -229,10 +323,11 @@ fn respond(request: tiny_http::Request, response: &Resp) -> std::io::Result<()> 
         None => ("no-store", false),
     };
     headers.push(header("Cache-Control", cache_control));
-    // A refusal has to say what would have been accepted, and for this server that is the whole read
-    // surface. Keyed off the status because [`Resp::method_not_allowed`] is the only thing that produces it.
-    if response.status == 405 {
-        headers.push(header("Allow", "GET, HEAD"));
+    // A refusal has to say what would have been accepted, and that is per-path now that some paths answer
+    // `POST` and most do not. Carried on the response by [`Resp::method_not_allowed`] rather than guessed
+    // from the status here, which is what used to advertise `GET, HEAD` on every path alike.
+    if let Some(allow) = response.allow {
+        headers.push(header("Allow", allow));
     }
     // A 304 carries no body, and its `Content-Length` must be absent rather than zero — a zero would tell
     // the browser the resource is now empty instead of unchanged.

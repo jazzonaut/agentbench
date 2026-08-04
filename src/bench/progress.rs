@@ -34,6 +34,37 @@ impl Phase {
     pub fn line(&self) -> String {
         format!("[{}/{}] {}", self.number, self.total, self.label)
     }
+
+    /// Recover a phase from a line [`line`] produced.
+    ///
+    /// The dashboard starts a benchmark as a child process and reads its stdout, so the format has a
+    /// reader as well as a writer. Both live here deliberately: this module already exists because the
+    /// destination of an announcement is a parameter rather than an assumption, and a parser kept in the
+    /// HTTP layer would be a second copy of a format whose whole documented hazard is drifting from
+    /// itself. The round-trip test below is what holds them together.
+    ///
+    /// Anything that is not such a line is `None` rather than an error. A child's stdout carries the
+    /// debug-build warning and whatever a workload prints, and a caller scanning for phases wants those
+    /// skipped, not reported.
+    ///
+    /// [`line`]: Self::line
+    pub fn parse(line: &str) -> Option<Self> {
+        let rest = line.trim_start().strip_prefix('[')?;
+        let (counter, label) = rest.split_once(']')?;
+        let (number, total) = counter.split_once('/')?;
+        let phase = Self {
+            number: number.trim().parse().ok()?,
+            total: total.trim().parse().ok()?,
+            label: label.trim().to_string(),
+        };
+        // A phase numbered zero, or past its own total, is not a phase this program announced. Rejected
+        // rather than passed on, because the number drives a gauge and an out-of-range one would draw a
+        // bar past its own end.
+        if phase.number == 0 || phase.total == 0 || phase.number > phase.total {
+            return None;
+        }
+        Some(phase)
+    }
 }
 
 /// Sink for phase announcements.
@@ -86,6 +117,46 @@ mod tests {
             label: "Filesystem benchmark".into(),
         };
         assert_eq!(phase.line(), "[3/8] Filesystem benchmark");
+    }
+
+    /// The format has two sides now, and this is the test that stops them drifting.
+    #[test]
+    fn every_phase_survives_a_round_trip_through_its_own_line() {
+        for number in 1..=PHASE_COUNT {
+            let phase = Phase {
+                number,
+                total: PHASE_COUNT,
+                label: "Filesystem benchmark".into(),
+            };
+            assert_eq!(Phase::parse(&phase.line()).as_ref(), Some(&phase));
+        }
+    }
+
+    /// A child's stdout carries more than phase lines, and the rest is skipped rather than reported.
+    #[test]
+    fn lines_that_are_not_phase_announcements_parse_to_nothing() {
+        for line in [
+            "",
+            "warning: this is a debug build.",
+            "JSON: agentbench-0a1b2c3d.json",
+            "[3/8",
+            "[x/8] nonsense",
+            "[3/y] nonsense",
+            // Out of range in both directions: the number drives a gauge.
+            "[0/8] before the first phase",
+            "[9/8] past the last one",
+            "[3/0] no denominator",
+        ] {
+            assert_eq!(Phase::parse(line), None, "{line:?}");
+        }
+    }
+
+    /// A label containing a bracket must not truncate at the wrong one.
+    #[test]
+    fn a_label_keeps_everything_after_the_counter() {
+        let phase = Phase::parse("[2/8] Memory benchmark [512 MiB]").expect("a phase");
+        assert_eq!(phase.label, "Memory benchmark [512 MiB]");
+        assert_eq!(phase.number, 2);
     }
 
     #[test]

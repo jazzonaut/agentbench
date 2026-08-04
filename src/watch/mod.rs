@@ -82,7 +82,27 @@ pub fn run_with(config: WatchConfig, narrator: &Narrator, shutdown: Arc<AtomicBo
     let sink = store.sink();
 
     let server = if config.server.enabled {
-        Some(serve::Server::bind(&config.server)?)
+        match serve::Server::bind(&config.server) {
+            Ok(server) => Some(server),
+            // Recorded before it propagates, not only returned. The store is open by this line, so an
+            // occupied port is the last startup failure that can still reach the event log — and for the
+            // tray build it is the only one that can reach anything at all, since a windowless process has
+            // no stderr for the returned error to be printed to. Without this, a second daemon on the
+            // configured port exited 1 with nothing written anywhere and an icon that never appeared.
+            //
+            // Returning drops `sink` and then `store`, in that order, because that is the reverse of the
+            // order they were declared in — which closes the channel and lets the writer thread flush this
+            // row before the process leaves. The explicit `drop(sink)` on the shutdown path below exists
+            // because *there* the store is joined by hand while the sink is still in scope.
+            Err(error) => {
+                sink.log(
+                    Level::Error,
+                    "daemon",
+                    format!("could not serve the dashboard: {error:#}"),
+                );
+                return Err(error);
+            }
+        }
     } else {
         None
     };
@@ -183,13 +203,38 @@ pub fn run_with(config: WatchConfig, narrator: &Narrator, shutdown: Arc<AtomicBo
             config.data_dir.display()
         ));
         narrator.say("Press Ctrl+C to stop.");
+        let mut settings = serve::Settings::from(&config).watching(store.writer_health());
+        // The benchmark slot, when this daemon is allowed one. A failure to build it is reported and
+        // survived rather than fatal: it can only fail by not being able to name this program's own
+        // executable, and losing the ability to *start* a benchmark is no reason to stop collecting.
+        let runs = if config.server.allow_runs {
+            match serve::runs::Registry::new(&config.data_dir, sink.clone()) {
+                Ok(registry) => {
+                    settings = settings.with_runs(Arc::clone(&registry));
+                    Some(registry)
+                }
+                Err(error) => {
+                    sink.log(
+                        Level::Warn,
+                        "runs",
+                        format!(
+                            "the dashboard cannot start benchmarks: {error:#}; the rest of the page \
+                             is unaffected"
+                        ),
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
         // Serving occupies this thread; collectors run behind it.
-        server.serve(
-            &store,
-            &sink,
-            shutdown.clone(),
-            serve::Settings::from(&config).watching(store.writer_health()),
-        );
+        server.serve(&store, &sink, shutdown.clone(), settings);
+        // Reached when the page stops being served, which is also when nothing is left to report a run's
+        // progress to. A benchmark outliving that would keep loading the machine unobserved.
+        if let Some(runs) = runs {
+            runs.shutdown();
+        }
     } else {
         narrator.say("AgentBench dashboard: collecting only (server disabled)");
         narrator.say(&format!(
@@ -404,6 +449,47 @@ mod tests {
             "the message must say what to do: {error:#}"
         );
         assert!(database.exists(), "nothing may be removed after a refusal");
+    }
+
+    /// The tray build has no stderr for a returned error to be printed to, so the reason it refused to
+    /// start has to survive somewhere a later reader can find it.
+    #[test]
+    fn an_occupied_port_is_recorded_in_the_event_log_before_it_is_reported() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = config(temp.path());
+        // A real listener rather than a guessed number: port 0 is free by definition, and any constant
+        // would make this test fail on a machine that happens to be using it.
+        let squatter =
+            std::net::TcpListener::bind((config.server.bind, 0)).expect("a free loopback port");
+        config.server.enabled = true;
+        config.server.port = squatter.local_addr().unwrap().port();
+
+        // Pre-set, so that if the bind ever stops failing this test ends rather than collecting forever.
+        let shutdown = Arc::new(AtomicBool::new(true));
+        let error = run_with(config.clone(), &Narrator::Silent, shutdown)
+            .expect_err("the configured port is taken");
+        assert!(
+            format!("{error:#}").contains("could not bind"),
+            "the error must name the failure: {error:#}"
+        );
+
+        let reader = open_for_reading(&config).expect("the store opened before the bind was tried");
+        let status = status(&config, &reader, 20).expect("the event log is readable");
+        let complaint = status
+            .events
+            .iter()
+            .find(|event| event.message.contains("could not serve the dashboard"));
+        let complaint = complaint.unwrap_or_else(|| {
+            panic!(
+                "the refusal must reach the event log, found: {:?}",
+                status.events
+            )
+        });
+        assert_eq!(complaint.level, "error", "{complaint:?}");
+        assert!(
+            complaint.message.contains(&config.server.port.to_string()),
+            "the row must name the port that was taken: {complaint:?}"
+        );
     }
 
     /// The suffix belongs on the file name, not on a stem split at the first dot.

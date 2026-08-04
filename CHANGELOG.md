@@ -2,6 +2,51 @@
 
 All notable changes to AgentBench are documented here. The project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+The dashboard stops being read-only. Two pages join the machine view: one that starts a benchmark from a form
+instead of twelve flags, and one that compares two reports as a page instead of generating a file to open.
+
+### Added
+
+- **A benchmark page at `/bench`.** Preset, target and scratch directories, the network-probe switch and the
+  live-Claude options, submitted to the daemon and run as a **separate process** — the daemon samples at
+  background priority and holds the database writer, so a benchmark measured inside it would report a slower
+  machine than the identical run from a terminal. The page reads that process's `[n/8]` phase lines and draws
+  a gauge from them, names the report it produced, and can stop a run in flight. One at a time: a second
+  request is refused with `409`, because two benchmarks on one machine measure each other.
+- **The form is built from the presets themselves.** *up to 45s · 128 MiB written · 500 small files* comes
+  from `bench::preset::Limits` by way of `GET /api/bench/options`, so the page cannot describe a run the
+  benchmark will not perform.
+- **A comparison page at `/compare`.** Pick two `.json` reports; the browser reads them and posts them to
+  your own daemon, which returns the same deltas `agentbench compare` computes. The environment differences
+  come first, then the metric table with each row's verdict as a word — colour is a second encoding, never
+  the only one. Pairs that cannot mean anything are still refused outright, with the same sentence the
+  command line prints.
+- **`server.allow_runs` in `watch.toml`**, default `true`. Set it to `false` to keep the dashboard for
+  reading and lose no charts. `agentbench bench` is unaffected either way.
+
+### Changed
+
+- **`compare` now computes a `Comparison` value that markdown and the page both render.** The CLI keeps its
+  behaviour and its `--output diff.md`; what changed is that the arithmetic and the direction rules live in
+  one place, so a page displaying the same numbers cannot reach a different verdict than the file beside it.
+- **A `405` names what the requested path accepts** rather than advertising `GET, HEAD` for every path alike,
+  now that some paths answer `POST`. An unknown path is a `404` whatever the method: there is no allowed set
+  to report for a path that does not exist.
+
+### Security
+
+- **Requests that start work must prove they came from this dashboard.** Loopback binding and the `Host`
+  check refuse a request addressed to somebody else's name; neither refuses a correctly addressed `POST` from
+  a page the user happens to have open. A write additionally requires `Sec-Fetch-Site: same-origin`, an
+  `Origin` naming one of this socket's own names, and `application/json` — the last being what forces a
+  browser preflight and what a cross-site HTML form therefore cannot send. Reads are unchanged.
+- **The benchmark page cannot ask for an elevated run**, and live-Claude cases are off by default on it even
+  for presets that enable them on the command line, with the cost cap bounded at $20. Options arrive as a
+  closed set of values placed into a fixed argument template, passed to the operating system as a vector, so
+  nothing a browser sends is parsed by a shell.
+
 ## [0.7.0] - 2026-08-04
 
 The "and what changed?" half of the dashboard's question. A verdict that says *worse* can now also say what

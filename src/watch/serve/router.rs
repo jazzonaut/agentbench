@@ -6,31 +6,58 @@
 use crate::watch::{
     serve::{
         Settings, assets,
-        handlers::{annotations, live, series, status, today, verdicts},
-        response::{Req, Resp},
+        handlers::{annotations, bench, compare, live, series, status, today, verdicts},
+        response::{Method, Req, Resp},
     },
     store::Reader,
 };
 
+/// Methods a read-only path accepts.
+const READ_ONLY: &str = "GET, HEAD";
+
+/// Methods a path that only acts accepts.
+const WRITE_ONLY: &str = "POST";
+
 /// Route a request to its handler.
 ///
-/// The method is checked before the path, and before the database is touched: what a `POST` asks for is not
-/// something any of these endpoints can do, so which one it names does not matter. See
-/// [`Resp::method_not_allowed`].
+/// Dispatch is on the pair, not on the path: most paths here are reads and a few are not, so answering
+/// `POST /api/series` as though it were a `GET` — which dispatching on the path alone did — is a hole that
+/// grows quietly as write endpoints are added. A path that exists but does not answer this method gets a
+/// `405` naming what it does answer, which is a different thing from the `404` an unknown path gets.
+///
+/// The gate that matters for the writes is not here. This decides whether a path *can* act; whether the
+/// request is entitled to make it act is settled before routing, in [`super::origin::is_same_origin_write`].
 pub fn route(req: &Req, reader: &Reader, settings: &Settings) -> Resp {
-    if !req.method.is_read() {
-        return Resp::method_not_allowed();
-    }
+    // Assets are reads and there are many of them, so they are matched first and as a group.
     if let Some(asset) = assets::get(&req.path) {
-        return asset;
+        return if req.method.is_read() {
+            asset
+        } else {
+            Resp::method_not_allowed(READ_ONLY)
+        };
     }
+    let read = req.method.is_read();
+    let post = req.method == Method::Post;
     match req.path.as_str() {
-        "/api/live" => live::handle(req, reader),
-        "/api/today" => today::handle(req, reader),
-        "/api/series" => series::handle(req, reader),
-        "/api/status" => status::handle(req, reader, settings),
-        "/api/verdicts" => verdicts::handle(req, reader, settings.baseline_window_days),
-        "/api/annotations" => annotations::handle(req, reader),
+        "/api/live" if read => live::handle(req, reader),
+        "/api/today" if read => today::handle(req, reader),
+        "/api/series" if read => series::handle(req, reader),
+        "/api/status" if read => status::handle(req, reader, settings),
+        "/api/verdicts" if read => verdicts::handle(req, reader, settings.baseline_window_days),
+        "/api/annotations" if read => annotations::handle(req, reader),
+        "/api/bench/options" if read => bench::options(req, settings),
+        "/api/bench/run" if read => bench::run(req, settings),
+        "/api/bench" if post => bench::start(req, settings),
+        "/api/bench/cancel" if post => bench::cancel(req, settings),
+        "/api/compare" if post => compare::handle(req),
+        // The path exists; the method is what was wrong with the request. Listed separately from the arms
+        // above rather than folded into them, so that adding an endpoint above without adding it here is a
+        // `404` on a path that works — noisy and immediate — rather than a silent method hole.
+        "/api/live" | "/api/today" | "/api/series" | "/api/status" | "/api/verdicts"
+        | "/api/annotations" | "/api/bench/options" | "/api/bench/run" => {
+            Resp::method_not_allowed(READ_ONLY)
+        }
+        "/api/bench" | "/api/bench/cancel" | "/api/compare" => Resp::method_not_allowed(WRITE_ONLY),
         _ => Resp::not_found(),
     }
 }
@@ -89,6 +116,27 @@ mod tests {
 
     fn body(resp: &Resp) -> String {
         String::from_utf8_lossy(&resp.body).into_owned()
+    }
+
+    /// An otherwise-empty benchmark report, for the endpoints that take reports as documents.
+    fn fixture_report(schema_version: u32) -> crate::model::Report {
+        crate::model::Report {
+            schema_version,
+            tool_version: "0.0.0-test".into(),
+            run_id: "0123456789abcdef".into(),
+            created_at: chrono::Utc::now(),
+            kind: crate::model::RunKind::Benchmark,
+            inventory: Default::default(),
+            config: Default::default(),
+            metrics: Vec::new(),
+            samples: Vec::new(),
+            profiles: Vec::new(),
+            llm_runs: Vec::new(),
+            integrations: Vec::new(),
+            findings: Vec::new(),
+            warnings: Vec::new(),
+            unavailable: Vec::new(),
+        }
     }
 
     #[test]
@@ -482,9 +530,15 @@ mod tests {
         );
     }
 
-    /// A write method is refused whatever it names, and the two read methods are not.
+    /// A method a path does not answer is refused, and the refusal names what that path does answer.
+    ///
+    /// This rule replaced a blunter one. While every endpoint was a read, the method could be checked
+    /// before the path and anything but a `GET` or `HEAD` refused with `405` — including on a path that did
+    /// not exist, which advertised `Allow: GET, HEAD` for nothing. Now that some paths answer `POST`, the
+    /// allowed set is a property of the path, and a path that does not exist has no such set to report: it
+    /// is a `404`, as it is for a read.
     #[test]
-    fn anything_that_is_not_a_read_is_refused_before_the_path_is_considered() {
+    fn a_method_a_path_does_not_answer_is_refused_with_the_set_that_path_accepts() {
         let fixture = Fixture::new();
         let reader = fixture.store.reader().unwrap();
         let answer = |method: Method, target: &str| -> Resp {
@@ -492,15 +546,156 @@ mod tests {
             route(&req, &reader, &Settings::default())
         };
 
-        for target in ["/", "/assets/app.js", "/api/live", "/api/nonsense"] {
-            let refused = answer(Method::Other, target);
-            assert_eq!(refused.status, 405, "{target}: {}", body(&refused));
+        // Read-only paths, including the assets: a write is refused and told so.
+        for target in ["/", "/bench", "/assets/app.js", "/api/live", "/api/status"] {
+            for method in [Method::Post, Method::Other] {
+                let refused = answer(method, target);
+                assert_eq!(refused.status, 405, "{target}: {}", body(&refused));
+                assert_eq!(refused.allow, Some("GET, HEAD"), "{target}");
+            }
             assert_ne!(answer(Method::Get, target).status, 405, "{target}");
         }
+
+        // Paths that only act: a read is refused, and told that a POST is what they take.
+        for target in ["/api/bench", "/api/bench/cancel", "/api/compare"] {
+            for method in [Method::Get, Method::Head, Method::Other] {
+                let refused = answer(method, target);
+                assert_eq!(refused.status, 405, "{target}: {}", body(&refused));
+                assert_eq!(refused.allow, Some("POST"), "{target}");
+            }
+        }
+
+        // A path that does not exist has no allowed set to advertise, whatever the method.
+        for method in [Method::Get, Method::Post, Method::Other] {
+            let missing = answer(method, "/api/nonsense");
+            assert_eq!(missing.status, 404, "{}", body(&missing));
+            assert_eq!(missing.allow, None);
+        }
+
         // A HEAD is a GET whose body the transport drops, so the router must answer it in full.
         let head = answer(Method::Head, "/api/live");
         assert_eq!(head.status, 200, "{}", body(&head));
         assert!(!head.body.is_empty(), "the handler ran");
+    }
+
+    /// The endpoints that act say so when this daemon has no registry behind them.
+    ///
+    /// `Settings::default()` has none, which is every test and also a daemon whose `watch.toml` turned runs
+    /// off. The distinction that matters is between "this daemon will not" and "this daemon cannot": a 503
+    /// with a reason is the first, and it is what the page needs in order to explain itself.
+    #[test]
+    fn the_run_endpoints_refuse_with_a_reason_when_no_registry_is_present() {
+        let fixture = Fixture::new();
+        let reader = fixture.store.reader().unwrap();
+        let post = |target: &str, body: &str| -> Resp {
+            route(&Req::post(target, body), &reader, &Settings::default())
+        };
+
+        for target in ["/api/bench", "/api/bench/cancel"] {
+            let refused = post(target, "{}");
+            assert_eq!(refused.status, 503, "{target}: {}", body(&refused));
+            assert!(
+                body(&refused).contains("allow_runs"),
+                "{target} should name the setting: {}",
+                body(&refused)
+            );
+        }
+
+        // The two reads still answer, so the page renders a disabled form rather than failing to load.
+        let options = fixture.json("/api/bench/options");
+        assert_eq!(options["allowed"], false, "{options}");
+        assert!(options["refusal"].as_str().is_some_and(|r| !r.is_empty()));
+        // Every preset is still described, because the form still draws itself.
+        assert_eq!(options["presets"].as_array().map(Vec::len), Some(3));
+
+        let run = fixture.json("/api/bench/run");
+        assert_eq!(run["state"], "idle", "{run}");
+    }
+
+    /// Two reports in, one comparison out — and a refusal that repeats the reason verbatim.
+    #[test]
+    fn the_compare_endpoint_computes_deltas_and_refuses_an_incomparable_pair() {
+        let fixture = Fixture::new();
+        let reader = fixture.store.reader().unwrap();
+        let compare = |baseline: &Value, candidate: &Value| -> Resp {
+            let payload = serde_json::json!({ "baseline": baseline, "candidate": candidate });
+            route(
+                &Req::post("/api/compare", serde_json::to_vec(&payload).unwrap()),
+                &reader,
+                &Settings::default(),
+            )
+        };
+
+        // Serialised from the real types rather than hand-written, so a field added to `Report` cannot leave
+        // this test asserting things about a document the server would reject for a different reason.
+        let report = |preset: &str, value: f64| -> Value {
+            let mut report = fixture_report(crate::SCHEMA_VERSION);
+            report.config.preset = Some(preset.to_string());
+            report.metrics = vec![crate::model::Metric::scalar(
+                "cpu.single_mops_s",
+                value,
+                "Mops/s",
+                false,
+                "cpu",
+            )];
+            serde_json::to_value(&report).expect("a report serialises")
+        };
+
+        let resp = compare(&report("standard", 100.0), &report("standard", 75.0));
+        assert_eq!(resp.status, 200, "{}", body(&resp));
+        let comparison: Value = serde_json::from_slice(&resp.body).unwrap();
+        let delta = &comparison["metrics"][0];
+        assert_eq!(delta["baseline"], 100.0);
+        assert_eq!(delta["candidate"], 75.0);
+        assert_eq!(delta["change_percent"], -25.0);
+        assert_eq!(delta["interpretation"], "regression", "{comparison}");
+        // No path anywhere in the payload: the reports arrived as documents.
+        assert_eq!(comparison["preset"], "standard");
+
+        // The compatibility gate's own sentence is what the page displays.
+        let refused = compare(&report("quick", 1.0), &report("standard", 1.0));
+        assert_eq!(refused.status, 400);
+        assert!(
+            body(&refused).contains("presets differ"),
+            "{}",
+            body(&refused)
+        );
+
+        // A body that is not two reports is a client error naming what was wrong.
+        let malformed = route(
+            &Req::post("/api/compare", "{\"baseline\":1}"),
+            &reader,
+            &Settings::default(),
+        );
+        assert_eq!(malformed.status, 400);
+        assert!(
+            body(&malformed).contains("unreadable report"),
+            "{}",
+            body(&malformed)
+        );
+    }
+
+    /// A report from a schema this binary does not know is refused, and the message says which file.
+    #[test]
+    fn a_report_from_another_schema_is_refused_by_name() {
+        let fixture = Fixture::new();
+        let reader = fixture.store.reader().unwrap();
+        let report = |schema: u32| {
+            serde_json::to_value(fixture_report(schema)).expect("a report serialises")
+        };
+        let payload = serde_json::json!({
+            "baseline": report(crate::SCHEMA_VERSION),
+            "candidate": report(crate::SCHEMA_VERSION + 1),
+        });
+        let resp = route(
+            &Req::post("/api/compare", serde_json::to_vec(&payload).unwrap()),
+            &reader,
+            &Settings::default(),
+        );
+        assert_eq!(resp.status, 400);
+        let text = body(&resp);
+        assert!(text.contains("candidate"), "{text}");
+        assert!(text.contains("unsupported report schema"), "{text}");
     }
 
     #[test]

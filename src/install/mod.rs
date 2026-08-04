@@ -128,13 +128,19 @@ pub fn origin() -> Result<Origin> {
 
 /// A path without the `\\?\` extended-length prefix Windows' `canonicalize` adds.
 ///
-/// The prefix means something only to the file APIs, and everything downstream of [`origin`] is not one:
-/// it is written into a scheduled task, where it survives but is no longer the path anybody typed, and it
-/// is printed on the control centre, where `\\?\C:\Users\...` is something the reader has to decode.
+/// The prefix means something only to the file APIs, and most things downstream of a `canonicalize` are not
+/// one: it is written into a scheduled task, where it survives but is no longer the path anybody typed; it
+/// is printed on the control centre, where `\\?\C:\Users\...` is something the reader has to decode; and it
+/// is handed to the benchmark page, which both displays it and passes it to a child process as
+/// `--target-dir`.
+///
+/// Public for that last caller. The dashboard canonicalises a directory a browser sent, for the same reason
+/// [`origin`] does — to settle what the path actually refers to before anything acts on it — and it has the
+/// same reason to undo the prefix afterwards.
 ///
 /// Not behind `#[cfg(windows)]` — this is string work, so it is checked by CI on every platform, and no
 /// path on the others can begin with the prefix it looks for.
-fn plain(path: PathBuf) -> PathBuf {
+pub fn plain(path: PathBuf) -> PathBuf {
     // A UNC path canonicalises to `\\?\UNC\server\share`, where dropping the prefix alone would leave
     // `UNC\server\share`: a relative path, and a wrong one.
     let stripped = path.to_str().and_then(|text| {

@@ -296,6 +296,62 @@ fn fetch(url: &str) -> Result<String, String> {
     Ok(body)
 }
 
+/// One `POST`, with every header the write gate inspects under the caller's control.
+///
+/// Hand-written for the same reason [`raw_get`] is: the interesting cases are the ones a well-behaved
+/// client cannot produce. A cross-site request's `Sec-Fetch-Site`, its `Origin` and its `Content-Type` are
+/// exactly what distinguishes a page of ours from a page of somebody else's, so a helper that set them
+/// correctly on our behalf would be a helper that could only test the case that already works.
+fn raw_post(
+    authority: &str,
+    path: &str,
+    body: &str,
+    headers: &[(&str, &str)],
+) -> Result<(u16, String, String), String> {
+    let mut stream = TcpStream::connect(authority).map_err(|error| error.to_string())?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .map_err(|error| error.to_string())?;
+    use std::io::Write;
+    let mut request = format!(
+        "POST /{path} HTTP/1.0\r\nHost: {authority}\r\nConnection: close\r\n\
+         Content-Length: {}\r\n",
+        body.len()
+    );
+    for (name, value) in headers {
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    request.push_str("\r\n");
+    request.push_str(body);
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|error| error.to_string())?;
+    let mut raw = Vec::new();
+    stream
+        .read_to_end(&mut raw)
+        .map_err(|error| error.to_string())?;
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    let (head, body) = text
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| format!("malformed response: {text:?}"))?;
+    let status: u16 = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse().ok())
+        .unwrap_or(0);
+    Ok((status, head.to_string(), body.to_string()))
+}
+
+/// The headers this dashboard's own pages send on a request that acts.
+fn same_origin_headers(port: u16) -> Vec<(&'static str, String)> {
+    vec![
+        ("Content-Type", "application/json".to_string()),
+        ("Sec-Fetch-Site", "same-origin".to_string()),
+        ("Origin", format!("http://127.0.0.1:{port}")),
+    ]
+}
+
 /// Binding to loopback stops a network peer; it does not stop a browser.
 ///
 /// A page on any origin can point a name it controls at 127.0.0.1 and then read every endpoint here
@@ -321,6 +377,260 @@ fn a_request_carrying_someone_elses_host_is_refused() {
         let (status, head, _) = raw_get(&authority, "api/status", &host).expect("connect");
         assert_eq!(status, 421, "Host: {host} -> {head}");
     }
+}
+
+/// A correct `Host` is not enough for a request that starts work.
+///
+/// This is the gate the benchmark endpoints exist behind, and the reason it is not the `Host` check above.
+/// A form on `evil.example` submitting to `127.0.0.1:7878` sends exactly the `Host` this server expects —
+/// what it cannot send is a same-origin `Sec-Fetch-Site`, our own `Origin`, and a JSON content type. Each of
+/// the three is removed in turn here, because a gate that only fails when all three are wrong is a gate that
+/// passes the interesting request.
+#[test]
+fn a_write_that_cannot_prove_it_came_from_this_dashboard_is_refused() {
+    let daemon = Daemon::start(&[]);
+    daemon.wait_until_listening();
+    let authority = format!("127.0.0.1:{}", daemon.port);
+    let good = same_origin_headers(daemon.port);
+    let good_pairs: Vec<(&str, &str)> = good
+        .iter()
+        .map(|(name, value)| (*name, value.as_str()))
+        .collect();
+
+    // The shape that is allowed through. `/api/compare` is used rather than `/api/bench` because it proves
+    // the gate opened without starting a benchmark on the machine running the tests: an empty body reaches
+    // the handler and is refused as an unreadable report, which is a 400 and not a 403.
+    let (status, head, _) =
+        raw_post(&authority, "api/compare", "{}", &good_pairs).expect("connect");
+    assert_ne!(
+        status, 403,
+        "a same-origin write must not be refused: {head}"
+    );
+
+    // Each of the three conditions, broken on its own.
+    let cases: Vec<(&str, Vec<(&str, String)>)> = vec![
+        (
+            "a cross-site fetch",
+            vec![
+                ("Content-Type", "application/json".to_string()),
+                ("Sec-Fetch-Site", "cross-site".to_string()),
+                ("Origin", format!("http://127.0.0.1:{}", daemon.port)),
+            ],
+        ),
+        (
+            "somebody else's origin",
+            vec![
+                ("Content-Type", "application/json".to_string()),
+                ("Origin", "http://evil.example".to_string()),
+            ],
+        ),
+        (
+            "a form post, which needs no preflight",
+            vec![
+                (
+                    "Content-Type",
+                    "application/x-www-form-urlencoded".to_string(),
+                ),
+                ("Sec-Fetch-Site", "same-origin".to_string()),
+            ],
+        ),
+        ("no content type at all", vec![]),
+    ];
+    for (what, headers) in cases {
+        let pairs: Vec<(&str, &str)> = headers
+            .iter()
+            .map(|(name, value)| (*name, value.as_str()))
+            .collect();
+        let (status, head, _) = raw_post(&authority, "api/compare", "{}", &pairs).expect("connect");
+        assert_eq!(status, 403, "{what} should be refused: {head}");
+    }
+
+    // And the same for the endpoint that would actually start a benchmark.
+    let (status, head, _) = raw_post(
+        &authority,
+        "api/bench",
+        "{\"preset\":\"quick\"}",
+        &[("Content-Type", "text/plain")],
+    )
+    .expect("connect");
+    assert_eq!(status, 403, "{head}");
+}
+
+/// A benchmark starts as a real child process, announces phases, and stops when told to.
+///
+/// Deliberately stops the run rather than letting it finish. A `quick` preset is forty-five seconds of real
+/// load, which is the whole of this suite's timeout, and what is being tested here is the wiring — that the
+/// child starts, that its `[n/8]` lines are parsed back into phases, that the state machine moves, and that
+/// cancelling reaches the process. A full run is [`a_quick_benchmark_started_from_the_dashboard_writes_a_report`],
+/// which is ignored by default.
+#[test]
+fn a_benchmark_started_from_the_dashboard_reports_its_phases_and_can_be_stopped() {
+    let daemon = Daemon::start(&[]);
+    daemon.wait_until_listening();
+    let authority = format!("127.0.0.1:{}", daemon.port);
+    let headers = same_origin_headers(daemon.port);
+    let pairs: Vec<(&str, &str)> = headers
+        .iter()
+        .map(|(name, value)| (*name, value.as_str()))
+        .collect();
+
+    // The options endpoint describes the form, including every preset's published limits.
+    let options: serde_json::Value =
+        serde_json::from_str(&daemon.get("/api/bench/options")).expect("json");
+    assert_eq!(options["allowed"], true, "{options}");
+    assert_eq!(options["phase_count"], 8, "{options}");
+    let quick = &options["presets"][0];
+    assert_eq!(quick["name"], "quick");
+    assert_eq!(quick["duration_limit_seconds"], 45);
+
+    let body = format!(
+        "{{\"preset\":\"quick\",\"offline\":true,\"live_llm\":false,\"target_dir\":{}}}",
+        serde_json::to_string(&daemon.data_dir().display().to_string()).unwrap()
+    );
+    let (status, head, started) =
+        raw_post(&authority, "api/bench", &body, &pairs).expect("connect");
+    assert_eq!(status, 202, "{head} {started}");
+    let started: serde_json::Value = serde_json::from_str(&started).expect("json");
+    let run_id = started["run_id"].as_str().expect("a run id").to_string();
+
+    // A second request is refused while the first is in flight, because two benchmarks measure each other.
+    let (status, _, busy) = raw_post(&authority, "api/bench", &body, &pairs).expect("connect");
+    assert_eq!(status, 409, "{busy}");
+    assert!(busy.contains("still running"), "{busy}");
+
+    // Poll until the child announces a phase, which proves the pipe is being read and `Phase::parse` agrees
+    // with what `bench` printed.
+    let deadline = Instant::now() + TIMEOUT;
+    let mut last = String::new();
+    let phase = loop {
+        assert!(
+            Instant::now() < deadline,
+            "no phase was ever reported: {last}"
+        );
+        last = daemon.get("/api/bench/run");
+        let state: serde_json::Value = serde_json::from_str(&last).expect("json");
+        assert_eq!(state["state"], "running", "the run ended too early: {last}");
+        assert_eq!(state["run_id"], run_id.as_str());
+        if let Some(number) = state["phase"]["number"].as_i64() {
+            break (
+                number,
+                state["phase"]["label"].as_str().unwrap_or("").to_string(),
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert!(phase.0 >= 1 && phase.0 <= 8, "{phase:?}");
+    assert!(!phase.1.is_empty(), "a phase carries a label: {phase:?}");
+
+    // Stopping it reaches the process, and the run is reported as having produced nothing.
+    let (status, _, cancelled) =
+        raw_post(&authority, "api/bench/cancel", "{}", &pairs).expect("connect");
+    assert_eq!(status, 200, "{cancelled}");
+
+    let deadline = Instant::now() + TIMEOUT;
+    let finished = loop {
+        assert!(Instant::now() < deadline, "the run never finished: {last}");
+        last = daemon.get("/api/bench/run");
+        let state: serde_json::Value = serde_json::from_str(&last).expect("json");
+        if state["state"] == "finished" {
+            break state;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(finished["cancelled"], true, "{finished}");
+    assert_eq!(
+        finished["ok"], false,
+        "a stopped run wrote no report: {finished}"
+    );
+    assert!(finished["report_path"].is_null(), "{finished}");
+    // The request is echoed back, so the page can say what was stopped.
+    assert_eq!(finished["request"]["preset"], "quick");
+    assert_eq!(finished["request"]["live_llm"], false);
+
+    // And the slot is free again.
+    let (status, _, restarted) = raw_post(&authority, "api/bench", &body, &pairs).expect("connect");
+    assert_eq!(status, 202, "{restarted}");
+    let (status, _, _) = raw_post(&authority, "api/bench/cancel", "{}", &pairs).expect("connect");
+    assert_eq!(status, 200);
+}
+
+/// A full `quick` run, end to end, producing a report the compare endpoint accepts.
+///
+/// Ignored by default and not because it is unreliable: it is forty-five seconds of deliberate CPU, disk and
+/// memory load, which on a shared runner would slow every other test in this suite for the benefit of one.
+/// Run it with `cargo test --locked --all-targets -- --ignored` when the run supervisor changes.
+#[test]
+#[ignore = "runs a real 45-second benchmark; run explicitly with --ignored"]
+fn a_quick_benchmark_started_from_the_dashboard_writes_a_report() {
+    let daemon = Daemon::start(&[]);
+    daemon.wait_until_listening();
+    let authority = format!("127.0.0.1:{}", daemon.port);
+    let headers = same_origin_headers(daemon.port);
+    let pairs: Vec<(&str, &str)> = headers
+        .iter()
+        .map(|(name, value)| (*name, value.as_str()))
+        .collect();
+
+    let body = format!(
+        "{{\"preset\":\"quick\",\"offline\":true,\"live_llm\":false,\"target_dir\":{}}}",
+        serde_json::to_string(&daemon.data_dir().display().to_string()).unwrap()
+    );
+    let (status, head, _) = raw_post(&authority, "api/bench", &body, &pairs).expect("connect");
+    assert_eq!(status, 202, "{head}");
+
+    // Its own bound: a quick preset's own duration limit is this suite's whole TIMEOUT.
+    let deadline = Instant::now() + Duration::from_secs(240);
+    let finished = loop {
+        assert!(Instant::now() < deadline, "the benchmark never finished");
+        let state: serde_json::Value =
+            serde_json::from_str(&daemon.get("/api/bench/run")).expect("json");
+        if state["state"] == "finished" {
+            break state;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    assert_eq!(finished["ok"], true, "{finished}");
+    assert_eq!(finished["cancelled"], false, "{finished}");
+    assert_eq!(finished["exit_code"], 0, "{finished}");
+
+    // The report exists, parses, and is the schema this binary compares.
+    let path = finished["report_path"].as_str().expect("a report path");
+    let report = agentbench::report::read_report(Path::new(path)).expect("a readable report");
+    assert_eq!(report.schema_version, schema_version());
+    assert_eq!(report.config.preset.as_deref(), Some("quick"));
+    assert!(!report.metrics.is_empty(), "a benchmark produces metrics");
+    // Written where the daemon said it would be.
+    assert!(
+        Path::new(path).starts_with(daemon.data_dir().join("reports")),
+        "{path}"
+    );
+    assert!(finished["markdown_path"].as_str().is_some(), "{finished}");
+
+    // And it compares with itself, through the endpoint the page uses.
+    let document = std::fs::read_to_string(path).expect("read the report");
+    let payload = format!("{{\"baseline\":{document},\"candidate\":{document}}}");
+    let (status, head, comparison) =
+        raw_post(&authority, "api/compare", &payload, &pairs).expect("connect");
+    assert_eq!(status, 200, "{head} {comparison}");
+    let comparison: serde_json::Value = serde_json::from_str(&comparison).expect("json");
+    assert!(
+        !comparison["metrics"]
+            .as_array()
+            .expect("metrics")
+            .is_empty(),
+        "{comparison}"
+    );
+    // A report compared with itself has changed in nothing.
+    for delta in comparison["metrics"].as_array().unwrap() {
+        assert_eq!(delta["change_percent"], 0.0, "{delta}");
+    }
+    assert!(
+        comparison["environment"]
+            .as_array()
+            .expect("environment")
+            .is_empty(),
+        "{comparison}"
+    );
 }
 
 #[test]

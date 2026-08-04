@@ -9,7 +9,12 @@ use crate::watch::serve::response::Resp;
 pub const UPLOT_VERSION: &str = "1.6.32";
 
 const INDEX_HTML: &str = include_str!("../assets/index.html");
+const BENCH_HTML: &str = include_str!("../assets/bench.html");
+const COMPARE_HTML: &str = include_str!("../assets/compare.html");
+const STYLES_CSS: &[u8] = include_bytes!("../assets/styles.css");
 const APP_JS: &[u8] = include_bytes!("../assets/app.js");
+const BENCH_JS: &[u8] = include_bytes!("../assets/bench.js");
+const COMPARE_JS: &[u8] = include_bytes!("../assets/compare.js");
 const CHART_JS: &[u8] = include_bytes!("../assets/chart.js");
 const FORMAT_JS: &[u8] = include_bytes!("../assets/format.js");
 const SERIES_JS: &[u8] = include_bytes!("../assets/series.js");
@@ -18,17 +23,63 @@ const UPLOT_CSS: &[u8] = include_bytes!("../assets/uplot.min.css");
 const UPLOT_LICENSE: &[u8] = include_bytes!("../assets/uplot.LICENSE");
 
 const JAVASCRIPT: &str = "text/javascript; charset=utf-8";
+const CSS: &str = "text/css; charset=utf-8";
+
+/// Every document this dashboard serves, with the scripts each one loads.
+///
+/// The pairing is the point, and it is checked at `cargo test` rather than in somebody's console: a script
+/// looks up its elements by id, so a document and a script that disagree take the whole page down with
+/// `Cannot read properties of null`. One list, so a new page cannot be added without declaring what runs on
+/// it. `format.js` appears three times because all three pages import it, which is exactly the sharing that
+/// makes checking each page separately necessary.
+#[cfg(test)]
+const PAGES: &[(&str, &str, &[&str])] = &[
+    (
+        "/",
+        INDEX_HTML,
+        &[
+            include_str!("../assets/app.js"),
+            include_str!("../assets/chart.js"),
+            include_str!("../assets/series.js"),
+            include_str!("../assets/format.js"),
+        ],
+    ),
+    (
+        "/bench",
+        BENCH_HTML,
+        &[
+            include_str!("../assets/bench.js"),
+            include_str!("../assets/format.js"),
+        ],
+    ),
+    (
+        "/compare",
+        COMPARE_HTML,
+        &[
+            include_str!("../assets/compare.js"),
+            include_str!("../assets/format.js"),
+        ],
+    ),
+];
 
 /// Resolve a request path to an embedded asset.
+///
+/// The three documents answer both a bare name and an `.html` one, because a person typing the address of a
+/// page they were told about will type either.
 pub fn get(path: &str) -> Option<Resp> {
     Some(match path {
         "/" | "/index.html" => Resp::html(INDEX_HTML),
+        "/bench" | "/bench.html" => Resp::html(BENCH_HTML),
+        "/compare" | "/compare.html" => Resp::html(COMPARE_HTML),
+        "/assets/styles.css" => Resp::asset(CSS, STYLES_CSS),
         "/assets/app.js" => Resp::asset(JAVASCRIPT, APP_JS),
+        "/assets/bench.js" => Resp::asset(JAVASCRIPT, BENCH_JS),
+        "/assets/compare.js" => Resp::asset(JAVASCRIPT, COMPARE_JS),
         "/assets/chart.js" => Resp::asset(JAVASCRIPT, CHART_JS),
         "/assets/format.js" => Resp::asset(JAVASCRIPT, FORMAT_JS),
         "/assets/series.js" => Resp::asset(JAVASCRIPT, SERIES_JS),
         "/assets/uplot.min.js" => Resp::asset(JAVASCRIPT, UPLOT_JS),
-        "/assets/uplot.min.css" => Resp::asset("text/css; charset=utf-8", UPLOT_CSS),
+        "/assets/uplot.min.css" => Resp::asset(CSS, UPLOT_CSS),
         "/assets/uplot.LICENSE" => Resp::asset("text/plain; charset=utf-8", UPLOT_LICENSE),
         _ => return None,
     })
@@ -52,9 +103,12 @@ mod tests {
     fn vendored_assets_are_present_and_non_trivial() {
         for (path, expected_type) in [
             ("/assets/app.js", "text/javascript"),
+            ("/assets/bench.js", "text/javascript"),
+            ("/assets/compare.js", "text/javascript"),
             ("/assets/chart.js", "text/javascript"),
             ("/assets/format.js", "text/javascript"),
             ("/assets/series.js", "text/javascript"),
+            ("/assets/styles.css", "text/css"),
             ("/assets/uplot.min.js", "text/javascript"),
             ("/assets/uplot.min.css", "text/css"),
         ] {
@@ -80,9 +134,12 @@ mod tests {
         let mut tags = std::collections::BTreeSet::new();
         for path in [
             "/assets/app.js",
+            "/assets/bench.js",
+            "/assets/compare.js",
             "/assets/chart.js",
             "/assets/format.js",
             "/assets/series.js",
+            "/assets/styles.css",
             "/assets/uplot.min.js",
             "/assets/uplot.min.css",
         ] {
@@ -91,34 +148,93 @@ mod tests {
         }
     }
 
-    /// Every element the scripts look up by id has to exist in the markup they are loaded beside.
+    /// Every element a script looks up by id has to exist in the document that loads it.
     ///
     /// This is the contract that broke: a panel's id was renamed in both files at once, which is correct,
     /// and a browser holding a cached copy of one file then ran it against the other. The caching is fixed
     /// separately — but the pairing is checkable here, in the only place that sees both files, and a
     /// mismatch is worth catching at `cargo test` rather than in somebody's console. Deliberately literal:
     /// it reads the ids out of the source text, because there is no JavaScript tooling in this project and
-    /// a string search over two embedded assets needs none.
+    /// a string search over embedded assets needs none.
+    ///
+    /// Checked per document, which matters now that there are three. Checking every script against the
+    /// union of the markup would pass while `bench.js` looked up an element that only the machine page
+    /// defines — the exact failure this test exists to catch, silently readmitted by the convenience of one
+    /// combined haystack.
     #[test]
-    fn every_id_the_scripts_look_up_exists_in_the_markup() {
-        let scripts = [
-            include_str!("../assets/app.js"),
-            include_str!("../assets/chart.js"),
-            include_str!("../assets/format.js"),
-            CATALOGUE,
-        ];
+    fn every_id_a_script_looks_up_exists_in_the_document_that_loads_it() {
         let mut checked = 0;
-        for script in scripts {
-            for id in referenced_ids(script) {
-                assert!(
-                    INDEX_HTML.contains(&format!("id=\"{id}\"")),
-                    "the scripts look up #{id}, which the markup does not define"
-                );
-                checked += 1;
+        for (path, document, scripts) in PAGES {
+            for script in *scripts {
+                for id in referenced_ids(script) {
+                    assert!(
+                        document.contains(&format!("id=\"{id}\"")),
+                        "a script loaded by {path} looks up #{id}, which that document does not define"
+                    );
+                    checked += 1;
+                }
             }
         }
+        // The chart catalogue's ids belong to the machine page, whose scripts are listed above.
+        for id in referenced_ids(CATALOGUE) {
+            assert!(
+                INDEX_HTML.contains(&format!("id=\"{id}\"")),
+                "the chart catalogue names #{id}, which the machine page does not define"
+            );
+            checked += 1;
+        }
         // A search that silently matched nothing would pass for ever while checking nothing.
-        assert!(checked >= 10, "only found {checked} ids to check");
+        assert!(checked >= 40, "only found {checked} ids to check");
+    }
+
+    /// Every page is reachable by both spellings, and each carries the nav that reaches the other two.
+    ///
+    /// The nav is duplicated in three documents because this project has no template step. That is a
+    /// defensible cost only while the duplication is complete: a page missing one link is a dead end a
+    /// reader reaches and cannot leave.
+    #[test]
+    fn every_page_is_served_by_both_names_and_links_to_all_three() {
+        for (path, document, _) in PAGES {
+            let bare = get(path).unwrap_or_else(|| panic!("{path} should resolve"));
+            assert_eq!(bare.status, 200, "{path}");
+            assert!(bare.content_type.starts_with("text/html"), "{path}");
+
+            // `/` is spelled `/index.html`; the others take their own name.
+            let named = if *path == "/" {
+                "/index.html".to_string()
+            } else {
+                format!("{path}.html")
+            };
+            let by_name = get(&named).unwrap_or_else(|| panic!("{named} should resolve"));
+            assert_eq!(
+                by_name.body, bare.body,
+                "{named} must serve the same document"
+            );
+
+            for link in ["href=\"/\"", "href=\"/bench\"", "href=\"/compare\""] {
+                assert!(document.contains(link), "{path} does not carry {link}");
+            }
+            assert!(
+                document.contains("aria-current=\"page\""),
+                "{path} does not mark which page it is"
+            );
+            assert!(
+                document.contains("href=\"/assets/styles.css\""),
+                "{path} does not load the shared stylesheet"
+            );
+        }
+    }
+
+    /// A document is never served from cache, for the reason recorded on [`the_index_is_never_cached`].
+    #[test]
+    fn no_document_carries_an_entity_tag() {
+        for (path, _, _) in PAGES {
+            assert_eq!(
+                get(path).unwrap_or_else(|| panic!("{path}")).etag,
+                None,
+                "{path} must not be cacheable: it names which script to load"
+            );
+        }
     }
 
     /// Ids named in `getElementById('x')` calls and in the `{ id: 'x' }` chart definitions.

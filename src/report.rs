@@ -32,13 +32,10 @@ pub fn read_report(path: &Path) -> Result<Report> {
     let bytes = fs::read(path).with_context(|| format!("read report {}", path.display()))?;
     let report: Report = serde_json::from_slice(&bytes)
         .with_context(|| format!("parse report {}", path.display()))?;
-    if report.schema_version != crate::SCHEMA_VERSION {
-        bail!(
-            "unsupported report schema {}; this binary supports {}",
-            report.schema_version,
-            crate::SCHEMA_VERSION
-        );
-    }
+    // The same check the dashboard applies to a report body uploaded over HTTP. Two spellings of "which
+    // schemas does this binary accept" is one spelling too many.
+    crate::compare::compatibility::ensure_supported_schema(report.schema_version)
+        .with_context(|| format!("report {}", path.display()))?;
     Ok(report)
 }
 

@@ -687,6 +687,55 @@ number in it.
   is unchanged, so a reader who touches nothing sees today's three frames plus the conditions the runs
   plotted above them ran in.
 
+### The dashboard gained pages that act, and what that cost
+
+Decision 5 above reads "loopback-only, no auth, plaintext paths in the local DB", justified on the grounds
+that *anything reaching loopback can already read the file*. That argument is sound and it covers reads
+only. Adding a page that starts a benchmark broke its premise, so the premise is restated here rather than
+left to be inferred from the code.
+
+- **The `Host` check was not sufficient and was never meant to be.** `origin::is_own_host` refuses a request
+  addressed to somebody else's name — the DNS-rebinding case. It cannot refuse one addressed correctly to
+  `127.0.0.1:7878` by a page the user happens to have open, because that request carries exactly the `Host`
+  this server expects. Harmless for a read; not harmless for a request that loads the machine for up to
+  fifteen minutes and, with live cases enabled, spends the API credit of whoever the daemon runs as.
+- **So a write must satisfy three conditions, none sufficient alone.** `Sec-Fetch-Site: same-origin` where
+  the header is present, an `Origin` naming one of this socket's own names where that is present, and
+  `Content-Type: application/json` unconditionally. The third is the load-bearing one: a cross-site HTML
+  form can `POST` without a preflight, but only as `x-www-form-urlencoded`, `multipart/form-data` or
+  `text/plain`, so requiring JSON makes every write preflighted and this server answers no preflight. The
+  first two are tolerant of absence because `curl` and the test suite send no fetch metadata; the third is
+  not, because every real client can set it.
+- **The benchmark runs in a child process, not on a daemon thread.** This is a measurement decision. The
+  sampler runs at background CPU and I/O priority and the daemon owns the single database writer; a workload
+  measured inside that process reports a slower machine than the identical workload from a terminal, and the
+  two numbers would be stored under one name. The same reasoning already forbids throttling the prober. The
+  cost is a run supervisor, two reader threads per run, and a phase format that now has a parser as well as
+  a printer — `Phase::parse` beside `Phase::line`, with a round-trip test, in the file whose documented
+  hazard is those two drifting apart.
+- **`install::run_detached` was not reused, despite existing for "launch a benchmark from a UI".** It takes
+  one argument *string*, which is the wrong shape for values that arrived over a socket, and it is
+  Windows-only. `std::process::Command::args` passes a vector to the operating system, so a target directory
+  named `foo & shutdown /s` is a directory name rather than two commands, and there is no quoting to get
+  wrong. `CREATE_NO_WINDOW` covers the one thing `run_detached` was giving us on Windows.
+- **One run at a time, refused with `409` rather than queued.** Two benchmarks on one machine measure each
+  other. A queue would start a stress run twenty minutes after somebody clicked, on a machine whose state
+  nobody was watching by then.
+- **No elevated run from the page, and live cases off by default on it.** Both are departures from what the
+  command line and the control centre offer, and both are deliberate: a UAC prompt raised by a web page is
+  one the user cannot connect to anything they did, and a form whose default spends money on submission has
+  the wrong default. `BenchOptions::for_preset` enables live cases for `standard` and `stress`; the page
+  overrides that to off and bounds the cost cap at $20, where the command line has no ceiling.
+- **`server.allow_runs` exists so the premise can be restored.** A machine whose owner wants the dashboard
+  for reading and nothing else sets it to `false` and keeps every chart. Default `true`, because a feature
+  that shipped switched off would mostly generate questions about why the button does nothing.
+- **The comparison was split into a value and two renderers.** `compare::compare_reports` produces a
+  `Comparison`; markdown and the page are both views of it. What counts as a regression depends on the
+  metric's direction and on whether it is informational at all, and a second implementation of that in
+  JavaScript would eventually disagree with the `.md` file beside it about the same pair of files.
+  `POST /api/compare` takes report *documents* and no paths — an endpoint taking paths would be a loopback
+  service that reads any file on the machine and returns whichever parts of it parse as a report.
+
 ### Questions phase 6 answered
 
 - **Whether subagent activity can be distinguished is now yes, and it was nearly free.** `Row::is_sidechain`

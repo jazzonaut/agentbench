@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Compare reports · AgentBench</title>
+<link rel="stylesheet" href="/assets/styles.css">
+</head>
+<body>
+<main>
+  <header>
+    <h1>AgentBench</h1>
+    <span class="subtitle">two reports, side by side</span>
+  </header>
+
+  <nav class="pages" aria-label="Dashboard pages">
+    <a href="/">Machine</a>
+    <a href="/bench">Run a benchmark</a>
+    <a href="/compare" aria-current="page">Compare reports</a>
+  </nav>
+
+  <section aria-labelledby="pick-heading">
+    <h2 id="pick-heading">The two reports</h2>
+    <div class="card" style="padding: 16px;">
+      <form id="compare-form">
+        <div class="fields">
+          <label class="field">
+            <span>Baseline — the run you are comparing against</span>
+            <input type="file" id="baseline" accept="application/json,.json">
+            <span class="field-hint">The older of the two, usually.</span>
+          </label>
+          <label class="field">
+            <span>Candidate — the run you are asking about</span>
+            <input type="file" id="candidate" accept="application/json,.json">
+            <span class="field-hint">The one you want a verdict on.</span>
+          </label>
+        </div>
+        <div class="actions">
+          <button type="submit" class="primary" id="run-compare" disabled>Compare</button>
+          <span class="field-hint">
+            The files are read in this browser and sent to this daemon; nothing leaves the machine.
+          </span>
+        </div>
+      </form>
+    </div>
+    <p class="notice bad" id="error" hidden></p>
+  </section>
+
+  <section aria-labelledby="result-heading" id="result" hidden>
+    <h2 id="result-heading">What changed</h2>
+    <p class="card-note" id="heading-note"></p>
+
+    <div class="card" style="padding: 16px;">
+      <div class="card-title">Environment</div>
+      <p class="card-note" id="environment-note"></p>
+      <ul class="marks" id="environment" style="margin-top: 8px;"></ul>
+    </div>
+
+    <div class="card" style="padding: 16px;">
+      <div class="card-title">Metric deltas</div>
+      <p class="card-note" id="metrics-note"></p>
+      <div class="scroller">
+        <table class="deltas" id="metrics">
+          <thead>
+            <tr>
+              <th scope="col">Metric</th>
+              <th scope="col" class="number">Baseline</th>
+              <th scope="col" class="number">Candidate</th>
+              <th scope="col" class="number">Change</th>
+              <th scope="col">Reading</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card" id="profiles-card" hidden style="padding: 16px;">
+      <div class="card-title">Profile case means</div>
+      <p class="card-note">Mean wall time per case, over the repetitions each report contains.</p>
+      <div class="scroller">
+        <table class="deltas" id="profiles">
+          <thead>
+            <tr>
+              <th scope="col">Case</th>
+              <th scope="col" class="number">Baseline</th>
+              <th scope="col" class="number">Candidate</th>
+              <th scope="col" class="number">Change</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <h2>What a comparison can and cannot tell you</h2>
+    <p class="card-note">
+      Two matched runs give one observation each, so the threshold for calling a change a regression is
+      deliberately coarse and small differences are reported as similar. Remote model responses and
+      whatever else the machine was doing remain uncontrolled. The machine page compares distributions
+      instead, across days, and reaches its verdicts on different evidence.
+    </p>
+    <p class="card-note">
+      Pairs that cannot mean anything are refused rather than annotated: two different presets, or one run
+      with live Claude cases and one without, produce no table at all.
+    </p>
+  </footer>
+</main>
+
+<script type="module" src="/assets/compare.js"></script>
+</body>
+</html>

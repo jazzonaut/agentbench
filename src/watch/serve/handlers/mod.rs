@@ -8,6 +8,8 @@
 //! [`Reader`]: crate::watch::store::Reader
 
 pub mod annotations;
+pub mod bench;
+pub mod compare;
 pub mod live;
 pub mod series;
 pub mod status;

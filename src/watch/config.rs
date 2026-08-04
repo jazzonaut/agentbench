@@ -90,6 +90,19 @@ pub struct ServerConfig {
     pub enabled: bool,
     pub bind: IpAddr,
     pub port: u16,
+    /// Whether the dashboard may start a benchmark.
+    ///
+    /// Its own switch, separate from [`enabled`], because it is the one thing the page can do that is not a
+    /// read. A benchmark loads this machine for up to a quarter of an hour and — if asked for live-LLM cases
+    /// — spends the API credit of whoever the daemon runs as. Loopback binding and the same-origin write gate
+    /// both stand in front of that, but a machine whose owner wants the dashboard for reading and nothing
+    /// else should not have to argue with either of them.
+    ///
+    /// Defaults to on: the pages exist to be used, and a feature that shipped switched off would mostly
+    /// generate questions about why the button does nothing.
+    ///
+    /// [`enabled`]: ServerConfig::enabled
+    pub allow_runs: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -313,6 +326,10 @@ pub(super) const DEFAULT_CONFIG_TOML: &str = r#"# AgentBench dashboard configura
 # The dashboard is loopback-only by design: it stores real project paths.
 enabled = true
 port = 7878
+# Whether the dashboard's benchmark page may start a run. A benchmark loads this machine for up to a
+# quarter of an hour, and one asked for live-Claude cases spends real API credit. Set to false to keep
+# the dashboard for reading only; `agentbench bench` on the command line is unaffected either way.
+allow_runs = true
 
 [collect]
 sample_interval = "5s"
@@ -377,6 +394,7 @@ struct FileServer {
     enabled: Option<bool>,
     port: Option<u16>,
     bind: Option<String>,
+    allow_runs: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -437,6 +455,7 @@ impl FileConfig {
                 enabled: self.server.enabled.unwrap_or(true),
                 bind,
                 port: self.server.port.unwrap_or(DEFAULT_PORT),
+                allow_runs: self.server.allow_runs.unwrap_or(true),
             },
             collect: CollectConfig {
                 sample_interval,
@@ -597,6 +616,7 @@ mod tests {
         let config = file.resolve(PathBuf::from("/tmp/agentbench")).unwrap();
         assert_eq!(config.server.port, DEFAULT_PORT);
         assert!(config.server.enabled);
+        assert!(config.server.allow_runs);
         assert!(config.server.bind.is_loopback());
         assert_eq!(config.collect.sample_interval, Duration::from_secs(5));
         assert_eq!(config.collect.sample_interval_idle, Duration::from_secs(30));
@@ -710,6 +730,15 @@ mod tests {
         let config = file.resolve(PathBuf::from("/tmp/agentbench")).unwrap();
         assert!(config.collect.probes_enabled);
         assert!(!config.collect.probe_network);
+    }
+
+    /// The write half of the dashboard is switchable without switching off the dashboard.
+    #[test]
+    fn starting_runs_can_be_refused_while_the_dashboard_still_serves() {
+        let file: FileConfig = toml::from_str("[server]\nallow_runs = false\n").unwrap();
+        let config = file.resolve(PathBuf::from("/tmp/agentbench")).unwrap();
+        assert!(config.server.enabled, "the page is still served");
+        assert!(!config.server.allow_runs, "and it will not start anything");
     }
 
     #[test]

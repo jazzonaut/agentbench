@@ -121,6 +121,11 @@ memory, tool versions, config fingerprints - before it shows a single metric, be
 the answer is. From the control centre, "Compare two reports" does the same thing for the two newest reports
 in the working directory and opens the result.
 
+If the daemon is running, the dashboard's **Compare reports** page does the same comparison as a page: pick
+the two `.json` reports and it renders the environment differences and the metric deltas without producing a
+file to open. The deltas are computed by the same code the command line uses, so the two cannot disagree; the
+files are read in the browser and posted to your own daemon, and nothing leaves the machine.
+
 A benchmark includes a live Claude phase by default: interleaved direct and Headroom-proxied cases, `sonnet`,
 capped at $5 of reported cost per run.
 
@@ -376,6 +381,40 @@ is the sneaky one - its only symptom is one empty frame, which looks exactly lik
 
 A reader who touches nothing sees the default selections, which are the same three lines the page opened with
 before, plus the conditions the runs above them ran in.
+
+### Three pages: the machine, a benchmark, a comparison
+
+The dashboard is three pages behind one nav, all of them served by the same daemon on the same loopback port.
+
+| Page | What it is for |
+|---|---|
+| `/` | Everything above: the live tiles, today's activity, the verdicts and the four history frames |
+| `/bench` | Start a benchmark with the options you would otherwise pass as twelve flags, and watch its phases |
+| `/compare` | Upload two reports and read the deltas as a page rather than as a generated `.md` file |
+
+The benchmark page builds its form from the presets themselves, so the sentence under the selector - *up to
+45s · 128 MiB written · 500 small files* - comes from the same limits the run will obey rather than from a
+number typed into a template. The run happens in a **separate process**, which is not an implementation
+detail: the daemon samples at background priority and holds the database writer, so a benchmark measured
+inside it would report a slower machine than the identical run from a terminal. The page reads that process's
+`[n/8]` phase lines and draws a gauge from them, and stopping the run reaches the process itself.
+
+Two things it deliberately will not do. It offers no elevated run - a consent prompt raised by a web page is
+one nobody can connect to something they did just now, so that stays in the control centre. And live Claude
+cases are **off by default here**, unlike on the command line, where `standard` and `stress` enable them:
+a form whose default spends money on submission is the wrong default. When you do ask for them, the cost cap
+is bounded at $20 from the page; the command line, where the intent is unambiguous, has no ceiling.
+
+```toml
+[server]
+# Keep the dashboard for reading only. `agentbench bench` is unaffected either way.
+allow_runs = false
+```
+
+Requests that *start* something are held to more than the loopback binding below. A page on any origin can
+send this daemon a correctly addressed `POST`, so a write must additionally arrive same-origin, from one of
+this socket's own names, as `application/json` - the last of which is what makes a browser preflight it, and
+what a cross-site HTML form therefore cannot produce. Reads are unchanged.
 
 ### Storage, privacy and lifecycle
 
