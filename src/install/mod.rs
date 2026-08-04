@@ -35,6 +35,13 @@ const PROGRAM_DIR: &str = "AgentBench";
 /// Name of the scheduled task that starts collection at login.
 pub const TASK_NAME: &str = "AgentBench dashboard";
 
+/// Suffix on the file name of the windowless build that shows a tray icon.
+///
+/// Shared rather than duplicated because it is read in both directions: [`build_for`] uses it to name the
+/// executable a tray choice means, and the task reader uses it to recognise which one a registered task
+/// starts. Two spellings of this would round-trip wrongly and look like the setting had not been saved.
+pub const TRAY_SUFFIX: &str = "-tray";
+
 /// Default delay between logging in and starting collection.
 ///
 /// Not politeness: probes that fire during the login storm are counted as contended and drop out of the
@@ -102,10 +109,12 @@ pub fn origin() -> Result<Origin> {
     let exe = std::env::current_exe().context("locate the running executable")?;
     // Canonicalised so a path reached through a symlink or a relative invocation compares equal to the
     // install directory. A failure is survivable: the uncanonicalised path is still worth classifying.
-    let exe = exe.canonicalize().unwrap_or(exe);
+    // Both sides are put back into plain form afterwards, and both have to be: the comparison below is
+    // between a path and a parent, and one of them still carrying `\\?\` would never match the other.
+    let exe = plain(exe.canonicalize().unwrap_or(exe));
     let installed = install_dir()
         .ok()
-        .and_then(|dir| dir.canonicalize().ok().or(Some(dir)));
+        .and_then(|dir| dir.canonicalize().ok().map(plain).or(Some(dir)));
     if let Some(installed) = installed
         && exe.parent() == Some(installed.as_path())
     {
@@ -115,6 +124,57 @@ pub fn origin() -> Result<Origin> {
         return Ok(Origin::BuildTree(exe));
     }
     Ok(Origin::Elsewhere(exe))
+}
+
+/// A path without the `\\?\` extended-length prefix Windows' `canonicalize` adds.
+///
+/// The prefix means something only to the file APIs, and everything downstream of [`origin`] is not one:
+/// it is written into a scheduled task, where it survives but is no longer the path anybody typed, and it
+/// is printed on the control centre, where `\\?\C:\Users\...` is something the reader has to decode.
+///
+/// Not behind `#[cfg(windows)]` — this is string work, so it is checked by CI on every platform, and no
+/// path on the others can begin with the prefix it looks for.
+fn plain(path: PathBuf) -> PathBuf {
+    // A UNC path canonicalises to `\\?\UNC\server\share`, where dropping the prefix alone would leave
+    // `UNC\server\share`: a relative path, and a wrong one.
+    let stripped = path.to_str().and_then(|text| {
+        text.strip_prefix(r"\\?\UNC\")
+            .map(|rest| format!(r"\\{rest}"))
+            .or_else(|| text.strip_prefix(r"\\?\").map(str::to_owned))
+    });
+    match stripped {
+        Some(text) => PathBuf::from(text),
+        None => path,
+    }
+}
+
+/// The executable a tray choice means, beside `program`.
+///
+/// The two builds live in the same directory and differ only by [`TRAY_SUFFIX`], so this is a rename rather
+/// than a lookup. It has to be applied both ways round: the control centre may be running from either build,
+/// and the answer depends on what was asked for, not on which one is asking.
+pub fn build_for(program: &Path, tray: bool) -> PathBuf {
+    let Some(stem) = program.file_stem().and_then(OsStr::to_str) else {
+        return program.to_path_buf();
+    };
+    let base = stem.strip_suffix(TRAY_SUFFIX).unwrap_or(stem);
+    let mut name = String::from(base);
+    if tray {
+        name.push_str(TRAY_SUFFIX);
+    }
+    if let Some(extension) = program.extension().and_then(OsStr::to_str) {
+        name.push('.');
+        name.push_str(extension);
+    }
+    program.with_file_name(name)
+}
+
+/// Whether `program` is the windowless build.
+pub fn is_tray_build(program: &Path) -> bool {
+    program
+        .file_stem()
+        .and_then(OsStr::to_str)
+        .is_some_and(|stem| stem.ends_with(TRAY_SUFFIX))
 }
 
 /// Whether `exe` sits under a Cargo build directory.
@@ -153,17 +213,32 @@ pub fn install() -> Result<PathBuf> {
     let directory = install_dir()?;
     std::fs::create_dir_all(&directory)
         .with_context(|| format!("create {}", directory.display()))?;
+    let installed = copy_into(&source, &directory)?;
+    // The other build too, when it is there to copy. "Start in tray" registers a task pointing at
+    // `agentbench-tray.exe`, and installing only the executable that happens to be running would leave that
+    // row able to name a file the install never produced — a task that starts nothing, once per login,
+    // silently. Absent is not an error: a `cargo build` of one target, or a hand-copied executable, is a
+    // reasonable thing to be running from.
+    let counterpart = build_for(&source, !is_tray_build(&source));
+    if counterpart.is_file() {
+        copy_into(&counterpart, &directory)?;
+    }
+    Ok(installed)
+}
+
+/// Copy one executable into `directory`, returning where it landed.
+fn copy_into(source: &Path, directory: &Path) -> Result<PathBuf> {
     let file_name = source
         .file_name()
-        .context("the running executable has no file name")?;
+        .with_context(|| format!("{} has no file name", source.display()))?;
     let destination = directory.join(file_name);
-    if destination == source {
+    if destination == *source {
         return Ok(destination);
     }
     // Written beside the target and renamed over it, so a copy interrupted halfway does not leave a
     // truncated executable that `PATH` now points at.
     let staged = destination.with_extension("new");
-    std::fs::copy(&source, &staged)
+    std::fs::copy(source, &staged)
         .with_context(|| format!("copy {} to {}", source.display(), staged.display()))?;
     std::fs::rename(&staged, &destination)
         .with_context(|| format!("replace {}", destination.display()))?;
@@ -276,9 +351,11 @@ pub fn run_detached(program: &Path, arguments: &str) -> Result<()> {
 
 /// Re-launch a program with an elevation prompt, returning once the prompt is answered.
 ///
-/// This is the only place in the design a UAC prompt appears. It cannot be moved to login — Windows
-/// refuses elevation prompts for `Run`-key and Startup-folder entries — so it happens where the user asked
-/// for the elevated thing, which is what they can connect it to.
+/// Nothing in this design elevates at login — Windows refuses elevation prompts for `Run`-key and
+/// Startup-folder entries, and the logon task deliberately runs at least privilege — so a prompt only ever
+/// appears where the user asked for the thing that needs it, which is what they can connect it to. Two
+/// places do: the elevated benchmark, and removing a logon task left by an elevated session of an older
+/// version, which belongs to Administrators and cannot be deleted any other way.
 pub fn run_elevated(program: &Path, arguments: &str) -> Result<()> {
     imp::run_elevated(program, arguments)
 }
@@ -355,6 +432,75 @@ mod tests {
 
     fn dir(value: &str) -> PathBuf {
         PathBuf::from(value)
+    }
+
+    /// The prefix `canonicalize` adds, which has no business in a task definition or on the screen.
+    #[test]
+    fn the_extended_length_prefix_is_dropped() {
+        assert_eq!(
+            plain(dir(
+                r"\\?\C:\Users\user\AppData\Local\Programs\AgentBench\agentbench.exe"
+            )),
+            dir(r"C:\Users\user\AppData\Local\Programs\AgentBench\agentbench.exe")
+        );
+    }
+
+    /// Dropping the prefix alone would turn a share into a relative path.
+    #[test]
+    fn a_canonicalised_unc_path_keeps_its_two_leading_separators() {
+        assert_eq!(
+            plain(dir(r"\\?\UNC\build\tools\agentbench.exe")),
+            dir(r"\\build\tools\agentbench.exe")
+        );
+    }
+
+    #[test]
+    fn a_path_without_the_prefix_is_left_alone() {
+        for path in [r"C:\Programs\agentbench.exe", "/usr/local/bin/agentbench"] {
+            assert_eq!(plain(dir(path)), dir(path));
+        }
+    }
+
+    #[test]
+    fn the_tray_build_is_named_beside_the_console_one() {
+        let console = dir(r"C:\Programs\AgentBench\agentbench.exe");
+        let tray = dir(r"C:\Programs\AgentBench\agentbench-tray.exe");
+        assert_eq!(build_for(&console, true), tray);
+        assert_eq!(build_for(&tray, false), console);
+    }
+
+    /// Asking for the build you are already running has to be the identity, or installing would copy a file
+    /// onto itself and the task would name something with two suffixes.
+    #[test]
+    fn asking_for_the_build_already_in_hand_changes_nothing() {
+        let console = dir(r"C:\Programs\AgentBench\agentbench.exe");
+        let tray = dir(r"C:\Programs\AgentBench\agentbench-tray.exe");
+        assert_eq!(build_for(&console, false), console);
+        assert_eq!(build_for(&tray, true), tray);
+    }
+
+    /// No extension is the shape on every platform but this feature's own, and it must not gain one.
+    #[test]
+    fn a_program_with_no_extension_keeps_none() {
+        assert_eq!(
+            build_for(&dir("/usr/local/bin/agentbench"), true),
+            dir("/usr/local/bin/agentbench-tray")
+        );
+    }
+
+    #[test]
+    fn the_tray_build_is_recognised_by_its_suffix() {
+        assert!(is_tray_build(&dir(r"C:\Programs\agentbench-tray.exe")));
+        assert!(!is_tray_build(&dir(r"C:\Programs\agentbench.exe")));
+    }
+
+    /// What the writing and reading sides have to agree on: the suffix goes on, and comes back off.
+    #[test]
+    fn the_tray_choice_round_trips_through_the_program_name() {
+        let program = dir(r"C:\Programs\AgentBench\agentbench.exe");
+        for tray in [true, false] {
+            assert_eq!(is_tray_build(&build_for(&program, tray)), tray);
+        }
     }
 
     /// Assemble a path from components rather than writing it as a string, so these run the same on every

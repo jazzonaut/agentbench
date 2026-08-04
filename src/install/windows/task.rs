@@ -4,26 +4,47 @@
 //! four interfaces and a registration call to do what one command line does, and this crate already spawns
 //! `powershell` for Defender status — so `schtasks` is the established shape rather than a new one.
 //!
-//! The task is registered with `/RL LIMITED`: unelevated. Elevation would buy the daemon nothing, since it
-//! collects the same data either way, and would turn any fault in its loopback HTTP server into an
+//! The task runs unelevated, at `LeastPrivilege`. Elevation would buy the daemon nothing, since it collects
+//! the same data either way, and would turn any fault in its loopback HTTP server into an
 //! elevation-of-privilege one. It also means registration needs no administrator rights, so switching this
 //! on never produces a UAC prompt — which matters because Windows refuses to show one at logon anyway.
+//!
+//! Registration goes through `/Create /XML` rather than a `/Create /SC ONLOGON` command line, and that is
+//! the load-bearing detail: `schtasks` cannot scope a logon trigger to a user, so `/SC ONLOGON` registers
+//! one that fires at *any* user's logon — an administrator-only operation that fails unelevated and, when it
+//! does succeed from an elevated session, leaves behind a task the unelevated program can read but not
+//! remove. [`super::super::taskxml::document`] carries the rest of that reasoning.
 
+use super::launch::run_elevated;
 use crate::install::{
     Autostart, AutostartState, Support,
-    taskxml::{delay_argument, element, parse_delay},
+    taskxml::{document, element, parse_delay},
 };
 use anyhow::{Context, Result, bail};
-use std::{path::PathBuf, process::Command, time::Duration};
+use std::{
+    env,
+    io::Write,
+    path::{Path, PathBuf},
+    process::Command,
+    time::{Duration, Instant},
+};
+use tempfile::{Builder, TempPath};
 
 /// Name of the registered task.
 const TASK_NAME: &str = crate::install::TASK_NAME;
 
-/// Suffix identifying the windowless build that shows a tray icon.
-const TRAY_SUFFIX: &str = "-tray";
-
 /// Subcommand the console build is launched with.
 const DASHBOARD_ARGUMENT: &str = "dashboard";
+
+/// How long to watch for an elevated `schtasks` to finish before reporting only what is known.
+///
+/// `ShellExecuteW` returns when the prompt is answered, not when the program it launched has finished, so
+/// the outcome has to be observed. Ten seconds is far longer than a task deletion takes and short enough
+/// that a screen waiting on it has not appeared to hang.
+const ELEVATED_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Gap between checks while waiting for that.
+const ELEVATED_POLL: Duration = Duration::from_millis(250);
 
 pub(crate) fn autostart_support() -> Support {
     Support::Yes
@@ -52,10 +73,11 @@ pub(crate) fn autostart_state() -> Result<AutostartState> {
     let Some(command) = element(exec, "Command") else {
         bail!("the registered task has no Command, so what it starts cannot be determined");
     };
-    let program = PathBuf::from(command.trim());
-    let tray = program
-        .file_stem()
-        .is_some_and(|stem| stem.to_string_lossy().ends_with(TRAY_SUFFIX));
+    // Unquoted: `schtasks` keeps whatever quoting the definition used inside `<Command>`, and a path with
+    // literal quotation marks around it is not a path — it compares unequal to the one on the screen and
+    // `is_file` says it does not exist.
+    let program = PathBuf::from(command.trim().trim_matches('"'));
+    let tray = crate::install::is_tray_build(&program);
     // A task with no `<Delay>` starts immediately, which is a real configuration rather than an error.
     let delay = element(&xml, "LogonTrigger")
         .and_then(|trigger| element(trigger, "Delay"))
@@ -75,31 +97,31 @@ pub(crate) fn enable_autostart(autostart: &Autostart) -> Result<()> {
             autostart.program.display()
         );
     }
-    // Quoted so a path containing spaces survives `schtasks`' own parsing of `/TR`. The console build takes
-    // a subcommand; the tray build is the daemon and takes none.
-    let program = autostart.program.display();
-    let run = if autostart.tray {
-        format!("\"{program}\"")
-    } else {
-        format!("\"{program}\" {DASHBOARD_ARGUMENT}")
-    };
+    // Refused rather than attempted. Registering from an elevated session works, and produces a task whose
+    // security descriptor grants Administrators full control and this account only read access — so the row
+    // would report success and then never be able to switch itself off again. Better to say so now than to
+    // leave behind a task only an administrator can remove.
+    if crate::install::is_elevated() {
+        bail!(
+            "this is running elevated, and a logon task registered from an elevated session can only be \
+             removed from one. Start the control centre without elevation to switch this on — the task \
+             needs no administrator rights."
+        );
+    }
+    // The console build takes a subcommand; the tray build is the daemon and takes none.
+    let arguments = (!autostart.tray).then_some(DASHBOARD_ARGUMENT);
+    let xml = document(
+        &autostart.program.to_string_lossy(),
+        arguments,
+        &current_user()?,
+        autostart.delay,
+    );
+    let definition = write_definition(&xml)?;
     let output = Command::new("schtasks")
-        .args([
-            "/Create",
-            "/TN",
-            TASK_NAME,
-            "/TR",
-            &run,
-            "/SC",
-            "ONLOGON",
-            // Unelevated, on purpose. See the module documentation.
-            "/RL",
-            "LIMITED",
-            "/DELAY",
-            &delay_argument(autostart.delay),
-            // Replace rather than fail, so saving the same screen twice is not an error.
-            "/F",
-        ])
+        .args(["/Create", "/TN", TASK_NAME, "/XML"])
+        .arg(&*definition)
+        // Replace rather than fail, so saving the same screen twice is not an error.
+        .arg("/F")
         .output()
         .context("run schtasks to register the logon task")?;
     if !output.status.success() {
@@ -112,21 +134,109 @@ pub(crate) fn enable_autostart(autostart: &Autostart) -> Result<()> {
 }
 
 pub(crate) fn disable_autostart() -> Result<bool> {
+    let Err(message) = delete() else {
+        return Ok(true);
+    };
+    // Why the task is still there matters more than what `schtasks` printed, and the printed reason is
+    // localised — so the state of the world is asked for instead. A task that is gone was either removed by
+    // this call or never there; one that is still registered after a `/Delete` that failed is one this
+    // account may read but not change, which is what a task registered from an elevated session looks like.
+    match autostart_state() {
+        Ok(AutostartState::Absent) => Ok(false),
+        _ if crate::install::is_elevated() => {
+            bail!("schtasks could not remove the logon task, even elevated: {message}")
+        }
+        _ => {
+            remove_elevated(&message)?;
+            Ok(true)
+        }
+    }
+}
+
+/// Ask `schtasks` to remove the task, reporting its complaint when it will not.
+fn delete() -> Result<(), String> {
     let output = Command::new("schtasks")
         .args(["/Delete", "/TN", TASK_NAME, "/F"])
         .output()
-        .context("run schtasks to remove the logon task")?;
+        .map_err(|error| format!("schtasks could not be run: {error}"))?;
     if output.status.success() {
-        return Ok(true);
+        return Ok(());
     }
-    let message = decode(&output.stderr);
-    if is_missing_task(&message) {
-        return Ok(false);
-    }
-    bail!(
-        "schtasks could not remove the logon task: {}",
-        message.trim()
+    Err(decode(&output.stderr).trim().to_string())
+}
+
+/// Remove a task this account cannot change, with one elevation prompt.
+///
+/// The situation is a leftover: versions of this program before the `/XML` registration used
+/// `/Create /SC ONLOGON`, which needed an elevated session to succeed at all, and the task it left behind
+/// belongs to Administrators. New tasks are registered unelevated and removable without any of this.
+fn remove_elevated(message: &str) -> Result<()> {
+    run_elevated(
+        Path::new("schtasks.exe"),
+        &format!("/Delete /TN \"{TASK_NAME}\" /F"),
     )
+    .with_context(|| {
+        format!(
+            "the logon task belongs to Administrators, so removing it needs elevation ({message})"
+        )
+    })?;
+    let deadline = Instant::now() + ELEVATED_TIMEOUT;
+    loop {
+        if matches!(autostart_state(), Ok(AutostartState::Absent)) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "an elevated schtasks was asked to remove the logon task and it is still registered; \
+                 reopen this screen to see whether it went"
+            );
+        }
+        std::thread::sleep(ELEVATED_POLL);
+    }
+}
+
+/// Write a task definition where `schtasks /Create /XML` can read it.
+///
+/// UTF-16LE with a byte-order mark, which is not a preference: `/XML` rejects a UTF-8 document outright, and
+/// reports doing so as `The system cannot find the file specified` — about a file it has just opened. The
+/// exact inverse of [`decode`], which exists because `/Query /XML` prints the same encoding.
+///
+/// Returns a path rather than the open file, and that is deliberate. `schtasks` opens the definition for
+/// exclusive access and refuses one this process still holds open — "the process cannot access the file
+/// because it is being used by another process", which reads as a busy disk rather than as our own handle.
+/// [`TempPath`] keeps the file on disk with nothing open on it, and removes it when the caller is done.
+fn write_definition(xml: &str) -> Result<TempPath> {
+    let mut bytes = vec![0xFF, 0xFE];
+    for unit in xml.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    // The `.xml` suffix is for whoever finds one of these after a crash; `schtasks` does not care.
+    let mut file = Builder::new()
+        .prefix("agentbench-task-")
+        .suffix(".xml")
+        .tempfile()
+        .context("create a temporary file for the task definition")?;
+    file.write_all(&bytes)
+        .and_then(|()| file.flush())
+        .context("write the task definition")?;
+    Ok(file.into_temp_path())
+}
+
+/// The account the logon trigger belongs to, as `DOMAIN\user`.
+///
+/// From the environment rather than `GetUserNameExW`, because Windows sets both of these in every
+/// interactive session and this screen is only reachable from one. A name that does not resolve is not a
+/// silent failure either: `schtasks` refuses the registration and the user is told, rather than being given
+/// a task that belongs to nobody.
+fn current_user() -> Result<String> {
+    let name = env::var("USERNAME")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .context("USERNAME is not set, so the account to register the task for cannot be named")?;
+    match env::var("USERDOMAIN") {
+        Ok(domain) if !domain.trim().is_empty() => Ok(format!("{domain}\\{name}")),
+        _ => Ok(name),
+    }
 }
 
 /// Whether a `schtasks` failure means "no such task" rather than something worth reporting.
@@ -180,6 +290,43 @@ mod tests {
         decode(&[0xFF, 0xFE, 0x3C]);
     }
 
+    /// `/Create /XML` rejects a UTF-8 document, so what is written has to be what `decode` reads.
+    #[test]
+    fn a_written_definition_is_utf16_with_a_byte_order_mark() {
+        let xml = "<Task><Command>C:\\x.exe</Command></Task>";
+        let definition = write_definition(xml).expect("a temporary file");
+        let bytes = std::fs::read(&definition).expect("read it back");
+        assert_eq!(&bytes[..2], &[0xFF, 0xFE], "no byte-order mark");
+        assert_eq!(decode(&bytes), xml);
+    }
+
+    /// The account name has to be one Task Scheduler can resolve, which is the interactive session's own.
+    #[test]
+    fn the_current_user_is_named_as_domain_and_account() {
+        let user = current_user().expect("an interactive session names its user");
+        assert!(!user.trim().is_empty());
+        // Whatever the shape, it has to be the name this session logs on under, so the scheduler resolves it.
+        let expected = match (env::var("USERDOMAIN"), env::var("USERNAME")) {
+            (Ok(domain), Ok(name)) if !domain.trim().is_empty() => format!("{domain}\\{name}"),
+            (_, Ok(name)) => name,
+            _ => unreachable!("current_user succeeded, so USERNAME is set"),
+        };
+        assert_eq!(user, expected);
+    }
+
+    /// A quoted `<Command>` is what earlier versions registered, and the path inside it is the answer.
+    #[test]
+    fn a_quoted_command_reads_as_a_bare_path() {
+        let xml = r#"<Exec><Command>"C:\Programs\AgentBench\agentbench-tray.exe"</Command></Exec>"#;
+        let command = element(xml, "Command").expect("a Command");
+        let program = PathBuf::from(command.trim().trim_matches('"'));
+        assert_eq!(
+            program,
+            PathBuf::from(r"C:\Programs\AgentBench\agentbench-tray.exe")
+        );
+        assert!(crate::install::is_tray_build(&program));
+    }
+
     #[test]
     fn a_missing_task_is_recognised_by_code_not_by_wording() {
         assert!(is_missing_task(
@@ -199,6 +346,51 @@ mod tests {
         assert!(
             !matches!(state, AutostartState::Unsupported(_)),
             "Windows supports this, so it must not report otherwise"
+        );
+    }
+
+    /// The regression this module was rewritten for, checked against the real Task Scheduler.
+    ///
+    /// A `/Create /SC ONLOGON` command line fails here with "Access is denied", because the trigger it writes
+    /// fires at any user's logon. The generated definition names a user and so registers with no elevation at
+    /// all — and the account that registered it can remove it again, which the elevated form does not allow.
+    ///
+    /// Registered under its own name and removed in the same test, so it never collides with the real task
+    /// and never survives the run. Skipped when elevated, where the denial being guarded against cannot
+    /// happen and the task would come out owned by Administrators.
+    #[test]
+    fn a_generated_definition_registers_and_removes_without_elevation() {
+        if crate::install::is_elevated() {
+            return;
+        }
+        const PROBE: &str = "AgentBench dashboard (self test)";
+        let program = std::env::current_exe().expect("the test binary has a path");
+        let xml = document(
+            &program.to_string_lossy(),
+            Some(DASHBOARD_ARGUMENT),
+            &current_user().expect("an interactive session"),
+            Duration::from_secs(120),
+        );
+        let definition = write_definition(&xml).expect("a temporary definition");
+        let created = Command::new("schtasks")
+            .args(["/Create", "/TN", PROBE, "/XML"])
+            .arg(&*definition)
+            .arg("/F")
+            .output()
+            .expect("run schtasks");
+        let removed = Command::new("schtasks")
+            .args(["/Delete", "/TN", PROBE, "/F"])
+            .output()
+            .expect("run schtasks");
+        assert!(
+            created.status.success(),
+            "registering unelevated failed: {}\n{xml}",
+            decode(&created.stderr).trim()
+        );
+        assert!(
+            removed.status.success(),
+            "the account that registered the task could not remove it: {}",
+            decode(&removed.stderr).trim()
         );
     }
 

@@ -457,9 +457,13 @@ impl State {
     }
 
     /// The task that would be registered for the current choices.
+    ///
+    /// The tray choice picks the executable, not just a flag on the command line. The two builds are separate
+    /// binaries — the windowless one is the daemon and takes no subcommand — so a task that recorded "tray"
+    /// while still pointing at the console build would launch the console build with no subcommand at all.
     pub fn desired_autostart(&self) -> Option<Autostart> {
         Some(Autostart {
-            program: self.durable_program()?,
+            program: install::build_for(&self.durable_program()?, self.start_in_tray),
             tray: self.start_in_tray,
             delay: self.login_delay,
         })

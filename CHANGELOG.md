@@ -22,6 +22,31 @@ All notable changes to AgentBench are documented here. The project follows [Sema
   reached by keyboard, does not exist on a touch screen, and advertises nothing; it opens on hover, on
   click and on focus, and closes on Escape.
 
+### Fixed
+
+- **"Run at login" registers the task without administrator rights, and can switch itself back off.** It
+  never could: the task was registered with `schtasks /Create /SC ONLOGON`, and `schtasks` has no way to
+  scope a logon trigger to a user, so it wrote one that fires at *any* user's logon — an operation only an
+  administrator may perform. Unelevated the row failed with `Access is denied`. From an elevated session it
+  appeared to work, and left behind a task whose security descriptor grants Administrators full control and
+  the user only read access: the row then read "on", and switching it off failed with `schtasks could not
+  remove the logon task: ERROR: Access is denied`, permanently. The definition is now written as XML with
+  the trigger scoped to the account that registered it, which needs no elevation and produces a task that
+  account can remove. Registering while elevated is refused with the reason rather than producing another
+  one of these, and a leftover task from an older version is removed after a single elevation prompt.
+- **A logon task is no longer killed after three days, or when a laptop is unplugged.** `schtasks` defaults
+  a task to a three-day execution limit, to refusing to start on battery, and to stopping when the power is
+  disconnected — three ways for a daemon whose entire purpose is a long unbroken baseline to stop
+  collecting without saying so. All three are now set explicitly.
+- **"Start in tray" points the task at the windowless build.** It set a flag and left the task pointing at
+  the console executable while dropping the subcommand that executable needs, so the registered task
+  launched `agentbench.exe` with no arguments at every login. It also never read back — the setting is
+  recovered from the name of the program the task starts, so a task recording "tray" reported it as off on
+  the next visit. Installing now copies both builds, so the one the task names is the one that is there.
+- **Installed paths no longer carry a `\\?\` prefix.** The running executable is canonicalised to compare
+  it against the install directory, which on Windows returns the extended-length form. That form was then
+  written verbatim into the logon task and printed on the control centre.
+
 ### Changed
 
 - **The live tiles are updated in place rather than rebuilt on every poll.** A section is only rebuilt

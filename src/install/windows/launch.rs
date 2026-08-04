@@ -26,9 +26,10 @@ pub(crate) fn run_detached(program: &Path, arguments: &str) -> Result<()> {
 
 /// Re-launch a program with an elevation prompt.
 ///
-/// The `runas` verb is the only way a desktop application can ask for elevation, and the prompt appears
-/// synchronously — the user either accepts it or the call fails with `ERROR_CANCELLED`, which is reported
-/// as an ordinary refusal rather than a fault.
+/// The `runas` verb is the only way a desktop application can ask for elevation. The *prompt* is synchronous
+/// — the user either accepts it or the call fails with `ERROR_CANCELLED`, reported as an ordinary refusal
+/// rather than a fault — but the program behind it is not: this returns as soon as the prompt is answered,
+/// with the elevated process still starting. A caller that needs the result has to observe it.
 pub(crate) fn run_elevated(program: &Path, arguments: &str) -> Result<()> {
     execute(Some("runas"), &program.to_string_lossy(), Some(arguments))
 }
