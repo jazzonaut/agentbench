@@ -19,6 +19,16 @@ All notable changes to AgentBench are documented here. The project follows [Sema
   container is reported to the console and its chart skipped, and the probe metric switch is left undrawn
   rather than throwing from inside its own renderer. A test asserts that every element id the scripts look
   up exists in the markup they are served beside, which is the drift that caused this.
+- **The startup rows on the control centre show what they just did, and "Start in tray" is no longer
+  discarded.** Toggling "Run at login" registered or removed the task and then went on displaying the
+  reading taken when the screen opened, so the row still said "off" until the screen was reloaded with `r`.
+  The row reading stale was the smaller half of it: "Start in tray" and "Delay after login" only re-register
+  a task that exists, they asked that same stale reading whether one did, and so a tray choice made straight
+  after switching autostart on was written nowhere and gone by the next time the screen opened — while the
+  message line said the login task would start in the tray. Every change to the task now re-reads it, and
+  the delay and tray choice follow that reading, so a registration that was refused leaves the rows
+  describing the task that is still there rather than the change that did not happen. Both rows also say
+  which of the two things happened: applied to the task, or recorded for when autostart is switched on.
 
 ## [0.6.0] - 2026-08-04
 

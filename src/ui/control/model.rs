@@ -263,13 +263,8 @@ impl State {
         let on_path = install_dir
             .as_ref()
             .and_then(|dir| install::on_path(dir).ok());
-        // The delay and tray choice are read back from the registered task when there is one, so the screen
-        // reflects what will actually happen rather than a preference stored somewhere else that may have
-        // drifted from it.
-        let (login_delay, start_in_tray) = match &autostart {
-            Ok(AutostartState::Present(autostart)) => (autostart.delay, autostart.tray),
-            _ => (install::DEFAULT_DELAY, false),
-        };
+        let (login_delay, start_in_tray) =
+            recorded_choices(&autostart).unwrap_or((install::DEFAULT_DELAY, false));
         Self {
             daemon_running: crate::watch::is_running(&config),
             database_bytes: std::fs::metadata(config.database_path())
@@ -286,6 +281,42 @@ impl State {
             start_in_tray,
             elevated: install::is_elevated(),
         }
+    }
+
+    /// Read the login task again and adopt what it says.
+    ///
+    /// Called after every change to the task, and after every attempt at one. A screen that changed the task
+    /// and then went on describing the previous reading is wrong twice over: the row reports the old answer,
+    /// and the rows that only describe the task — the tray choice and the delay — re-register nothing,
+    /// because they believe there is no task to re-register.
+    pub fn reread_autostart(&mut self) {
+        self.adopt_autostart(install::autostart_state().map_err(|error| format!("{error:#}")));
+    }
+
+    /// Take a reading of the login task as the new truth.
+    ///
+    /// A reading that finds a task carries the delay and tray choice with it, for the reason
+    /// [`Self::read`] takes them from one: the screen should describe what will happen at login rather than a
+    /// preference kept beside the task that may have drifted from it. That also undoes an optimistic change
+    /// whose registration was refused, since the reading is of the task that is still there.
+    ///
+    /// A reading that finds no task leaves both alone, so a choice made while autostart is off survives
+    /// until it is switched on.
+    fn adopt_autostart(&mut self, read: Result<AutostartState, String>) {
+        if let Some((delay, tray)) = recorded_choices(&read) {
+            self.login_delay = delay;
+            self.start_in_tray = tray;
+        }
+        self.autostart = read;
+    }
+
+    /// Whether a login task is registered.
+    ///
+    /// False when the task could not be read at all, which is the safe way round for the callers: the rows
+    /// that would act on a task are already disabled with that reason, and treating "cannot tell" as "on"
+    /// would have them replace a task nobody has seen.
+    pub fn autostart_enabled(&self) -> bool {
+        matches!(&self.autostart, Ok(state) if state.is_enabled())
     }
 
     /// The value shown on the right of a row.
@@ -492,6 +523,17 @@ impl State {
     }
 }
 
+/// The delay and tray choice a reading of the login task implies, when it implies any.
+///
+/// The single place that derivation lives, so the first read when the screen opens and every re-read after a
+/// change cannot disagree about where these two settings come from.
+fn recorded_choices(read: &Result<AutostartState, String>) -> Option<(Duration, bool)> {
+    match read {
+        Ok(AutostartState::Present(task)) => Some((task.delay, task.tray)),
+        _ => None,
+    }
+}
+
 fn on_off(value: bool) -> String {
     if value { "on" } else { "off" }.to_string()
 }
@@ -541,6 +583,70 @@ fn file_label(path: &std::path::Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
+
+    /// A state against an empty data directory, as a first run has.
+    fn state() -> State {
+        let temp = tempdir().expect("a temporary data directory");
+        let config =
+            WatchConfig::load(Some(temp.path().to_path_buf())).expect("defaults should load");
+        State::read(config)
+    }
+
+    fn task(tray: bool, delay: Duration) -> AutostartState {
+        AutostartState::Present(Autostart {
+            program: install::build_for(
+                &PathBuf::from(r"C:\Programs\AgentBench\agentbench.exe"),
+                tray,
+            ),
+            tray,
+            delay,
+        })
+    }
+
+    /// The regression the re-read exists for: a change to the task used to leave every startup row showing
+    /// the reading taken when the screen opened, so switching autostart on looked like it had done nothing.
+    #[test]
+    fn a_reading_of_a_registered_task_becomes_what_the_rows_show() {
+        let mut state = state();
+        state.autostart = Ok(AutostartState::Absent);
+        state.start_in_tray = false;
+        state.login_delay = Duration::from_secs(1);
+
+        state.adopt_autostart(Ok(task(true, Duration::from_secs(120))));
+
+        assert!(state.autostart_enabled());
+        assert_eq!(state.value(Field::RunAtLogin), "on");
+        assert_eq!(state.value(Field::StartInTray), "on");
+        assert_eq!(state.login_delay, Duration::from_secs(120));
+    }
+
+    /// A choice made while autostart is off lives nowhere but here, so a reading that finds no task must
+    /// leave it alone rather than reset it to the defaults.
+    #[test]
+    fn a_reading_that_finds_no_task_keeps_the_recorded_choice() {
+        let mut state = state();
+        state.start_in_tray = true;
+        state.login_delay = Duration::from_secs(300);
+
+        state.adopt_autostart(Ok(AutostartState::Absent));
+
+        assert!(!state.autostart_enabled());
+        assert_eq!(state.value(Field::RunAtLogin), "off");
+        assert_eq!(state.value(Field::StartInTray), "on");
+        assert_eq!(state.login_delay, Duration::from_secs(300));
+    }
+
+    /// "Cannot tell" is not "on": the rows that would replace a task are disabled with the reason instead.
+    #[test]
+    fn an_unreadable_task_does_not_count_as_registered() {
+        let mut state = state();
+        state.adopt_autostart(Err("schtasks could not read the logon task".into()));
+
+        assert!(!state.autostart_enabled());
+        assert_eq!(state.value(Field::RunAtLogin), "unknown");
+        assert!(state.unavailable(Field::StartInTray).is_some());
+    }
 
     #[test]
     fn every_field_belongs_to_a_section_and_has_a_kind() {

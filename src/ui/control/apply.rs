@@ -23,22 +23,21 @@ pub fn toggle(state: &mut State, field: Field) -> Result<String> {
     }
     match field {
         Field::RunAtLogin => {
-            let enabled = state
-                .autostart
-                .as_ref()
-                .map(|current| current.is_enabled())
-                .unwrap_or(false);
-            if enabled {
-                install::disable_autostart()?;
+            if state.autostart_enabled() {
+                let outcome = install::disable_autostart();
+                state.reread_autostart();
+                outcome?;
                 Ok("collection will no longer start at login".into())
             } else {
                 let desired = state
                     .desired_autostart()
                     .context("there is no durable executable to point the task at")?;
-                install::enable_autostart(&desired)?;
+                let outcome = install::enable_autostart(&desired);
+                state.reread_autostart();
+                outcome?;
                 Ok(format!(
                     "collection will start {} after login",
-                    config::duration_text(desired.delay)
+                    config::duration_text(state.login_delay)
                 ))
             }
         }
@@ -46,14 +45,15 @@ pub fn toggle(state: &mut State, field: Field) -> Result<String> {
         // Changing them while autostart is off just records the choice for when it is switched on.
         Field::StartInTray => {
             state.start_in_tray = !state.start_in_tray;
-            reregister(
-                state,
+            let applied = reregister(state)?;
+            Ok(recorded(
+                applied,
                 if state.start_in_tray {
                     "the login task will start in the tray with no console window"
                 } else {
                     "the login task will start with a console window"
                 },
-            )
+            ))
         }
         Field::OnPath => {
             let directory = state
@@ -114,10 +114,14 @@ pub fn commit(state: &mut State, field: Field, text: &str) -> Result<String> {
     match field {
         Field::LoginDelay => {
             state.login_delay = config::parse_duration(text)?;
-            reregister(
-                state,
-                "the login delay was recorded for the next time autostart is switched on",
-            )
+            let applied = reregister(state)?;
+            Ok(recorded(
+                applied,
+                &format!(
+                    "collection will start {} after login",
+                    config::duration_text(state.login_delay)
+                ),
+            ))
         }
         Field::SampleInterval => {
             state.draft.sample_interval = config::parse_duration(text)?;
@@ -299,21 +303,33 @@ fn describe_differences(requested: &Draft, written: &Draft) -> String {
 }
 
 /// Re-register the login task if one exists, so a changed delay or tray choice takes effect.
-fn reregister(state: &mut State, message: &str) -> Result<String> {
-    let enabled = state
-        .autostart
-        .as_ref()
-        .map(|current| current.is_enabled())
-        .unwrap_or(false);
-    if !enabled {
-        return Ok(message.to_string());
+///
+/// Returns whether a task was re-registered, which is what the caller's sentence turns on: with no task
+/// registered the choice is kept for the next time autostart is switched on, and saying the login task had
+/// changed would be describing a task that does not exist.
+fn reregister(state: &mut State) -> Result<bool> {
+    if !state.autostart_enabled() {
+        return Ok(false);
     }
-    let desired = state
+    let outcome = state
         .desired_autostart()
-        .context("there is no durable executable to point the task at")?;
-    install::enable_autostart(&desired)?;
-    state.autostart = install::autostart_state().map_err(|error| format!("{error:#}"));
-    Ok(message.to_string())
+        .context("there is no durable executable to point the task at")
+        .and_then(|desired| install::enable_autostart(&desired));
+    // Re-read whether or not that worked. On success the task is the record of both settings, so the rows
+    // should show what it now says; on failure the previous task is still registered, and re-reading is what
+    // puts the row that was flipped optimistically back to describing it.
+    state.reread_autostart();
+    outcome?;
+    Ok(true)
+}
+
+/// Report a change to the login task, saying plainly when there is no task to change yet.
+fn recorded(applied: bool, message: &str) -> String {
+    if applied {
+        message.to_string()
+    } else {
+        format!("recorded for when autostart is on: {message}")
+    }
 }
 
 /// A whole number of days, with or without a trailing `d`.
@@ -384,6 +400,18 @@ mod tests {
         assert_eq!(
             describe_differences(&requested, &written),
             "sample interval 1s"
+        );
+    }
+
+    /// The two startup rows that only describe the task must not claim to have changed one that is not
+    /// registered — which is exactly what the tray row used to say while writing nothing at all.
+    #[test]
+    fn a_choice_with_no_task_to_apply_it_to_is_reported_as_recorded() {
+        const MESSAGE: &str = "the login task will start in the tray with no console window";
+        assert_eq!(recorded(true, MESSAGE), MESSAGE);
+        assert_eq!(
+            recorded(false, MESSAGE),
+            format!("recorded for when autostart is on: {MESSAGE}")
         );
     }
 
