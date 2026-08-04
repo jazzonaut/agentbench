@@ -377,6 +377,36 @@ mod tests {
         assert_eq!(samples, 0, "the row itself is genuinely lost");
     }
 
+    /// The operational log does not stay on the machine that wrote it, so the account name must not
+    /// travel with it. Asserted here rather than at a call site because [`inserts::event`] is what
+    /// makes the guarantee hold for call sites that do not exist yet.
+    #[test]
+    fn an_event_message_is_stored_with_the_home_directory_redacted() {
+        let home = std::env::var(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+            .expect("a home directory");
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("watch.db");
+        let conn = database(&path);
+        let (sender, receiver) = mpsc::sync_channel(16);
+        let sink = Sink::new(sender);
+        let handle = thread::spawn(move || run(conn, "machine", receiver, WriterHealth::running()));
+
+        // The shape of the real message this exists for: the importer naming a transcript it skipped.
+        sink.log(Level::Warn, "test", format!("skipped {home}/a/b.jsonl: io"));
+        drop(sink);
+        handle.join().unwrap().expect("a clean shutdown");
+
+        let reader = Reader::open(&path, "machine".into()).unwrap();
+        let message = queries::recent_events(reader.conn(), 50)
+            .unwrap()
+            .into_iter()
+            .map(|event| event.message)
+            .find(|message| message.contains("a/b.jsonl"))
+            .expect("the message that was logged");
+        assert!(message.starts_with("skipped <home>"), "{message}");
+        assert!(!message.contains(&home), "{message}");
+    }
+
     /// A writer that has stopped for any reason says so, which is what `/api/status` reads.
     #[test]
     fn health_reports_the_writer_stopping() {

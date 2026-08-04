@@ -178,7 +178,8 @@ fn escape(text: &str) -> String {
 mod tests {
     use super::*;
 
-    /// Trimmed from what `schtasks /Query /TN "AgentBench dashboard" /XML ONE` actually prints.
+    /// Trimmed from what `schtasks /Query /TN "AgentBench dashboard" /XML ONE` actually prints, with the
+    /// account and install path replaced by placeholders.
     const TASK_XML: &str = r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>

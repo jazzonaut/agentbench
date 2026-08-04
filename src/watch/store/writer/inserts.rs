@@ -3,8 +3,12 @@
 //! Every function here runs inside the writer's transaction and is the only place a given table is
 //! written, so a table's conflict policy is stated once.
 
-use crate::watch::store::records::{
-    Event, ForgetWatermarks, ProbeRun, RunMarker, Sample, ToolCall, ToolVersion, Turn, Watermark,
+use crate::{
+    system,
+    watch::store::records::{
+        Event, ForgetWatermarks, ProbeRun, RunMarker, Sample, ToolCall, ToolVersion, Turn,
+        Watermark,
+    },
 };
 use anyhow::{Context, Result};
 use rusqlite::{Transaction, params};
@@ -114,13 +118,24 @@ pub fn run_marker(tx: &Transaction<'_>, machine_id: &str, marker: &RunMarker) ->
     Ok(())
 }
 
+/// Write one operational event, with the home directory taken out of its message.
+///
+/// The redaction is here rather than at the call sites because this is the only place the table is
+/// written, so it is the only place that can *guarantee* the property. Event messages name paths
+/// freely and should keep doing so — a transcript the importer skipped is useless to diagnose without
+/// saying which one — but those paths run through the user's home directory, and this log does not stay
+/// on the machine that wrote it: it is read back by `--status`, served from `/api/status`, and rendered
+/// on the dashboard, all of which end up pasted into bug reports and screenshots. `<home>` keeps every
+/// message as diagnostic as it was to the person who owns that home directory, and stops the account
+/// name travelling with it. Doing this at the four call sites that name paths today would leave the
+/// fifth one someone adds next year unredacted.
 pub fn event(tx: &Transaction<'_>, event: &Event) -> Result<()> {
     tx.prepare_cached("INSERT INTO events (ts, level, source, message) VALUES (?1,?2,?3,?4)")?
         .execute(params![
             event.ts,
             event.level.as_str(),
             event.source,
-            event.message
+            system::redact_text(&event.message)
         ])
         .context("insert event")?;
     Ok(())
