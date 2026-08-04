@@ -142,7 +142,11 @@ mod tests {
             ("scanner_write_bytes_s", "scanner_write_bytes_s_max"),
         ] {
             assert_eq!(column("samples", raw), 1, "samples.{raw} missing");
-            assert_eq!(column("samples_1m", rolled), 1, "samples_1m.{rolled} missing");
+            assert_eq!(
+                column("samples_1m", rolled),
+                1,
+                "samples_1m.{rolled} missing"
+            );
         }
     }
 

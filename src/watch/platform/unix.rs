@@ -315,7 +315,8 @@ fn clock_percent() -> Option<f32> {
                 .parse::<f64>()
                 .ok()
         };
-        let (Some(current), Some(max)) = (read("scaling_cur_freq"), read("cpuinfo_max_freq")) else {
+        let (Some(current), Some(max)) = (read("scaling_cur_freq"), read("cpuinfo_max_freq"))
+        else {
             continue;
         };
         if max > 0.0 {
