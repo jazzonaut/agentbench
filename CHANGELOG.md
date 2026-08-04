@@ -2,11 +2,11 @@
 
 All notable changes to AgentBench are documented here. The project follows [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.7.0] - 2026-08-04
 
-Collection for the "and what changed?" half of the dashboard's question. Nothing here is on screen yet:
-the analysis, API and dashboard work that surfaces it is still to come, so the values are being recorded
-and are readable only from the database.
+The "and what changed?" half of the dashboard's question. A verdict that says *worse* can now also say what
+was different about the day it is describing, and every series the daemon collects is reachable from the page
+— enforced by a test that fails the build when one is not.
 
 ### Added
 
@@ -32,6 +32,26 @@ and are readable only from the database.
   for longer. The second was already being parsed and discarded, and matters more than expected: 38% of the
   transcripts on the development machine are subagent transcripts whose work was blended into the parent
   project's numbers.
+- **A verdict now says what was different about today.** A tile reading `worse -8.0%` gains a third line —
+  `clean probes: clock 128% today against 136%` — in its own slot beside the existing evidence and power
+  caveat, because an explanation and a qualification are different claims. `--status` prints the same line. A covariate is reported only when today's median falls outside its *own* baseline
+  band, computed the same way the verdict's band is — one sensitivity rule for the whole tool rather than a
+  hand-picked threshold per covariate. It reads `clean probes:` and not `today` because every figure in it is
+  a median over the uncontended subset, which is the population the verdict itself used.
+- **A fourth chart frame: the conditions each probe ran in.** Clock, whole-machine disk writes, free space and
+  the three CPU figures behind the contention tag, sharing a cursor with the probe frame above it so a dip in
+  one can be read against the other. Two of the six are charted but never quoted in a verdict: over
+  uncontended runs the scanner and agent figures are capped by their own thresholds at a tenth and a fifth of
+  one core, so a large relative move there explains nothing about a throughput drop.
+- **Every series the daemon collects now has a button on the page**, where twelve of them were collected and
+  unreachable. The System and Agent frames gained switches like the probe frame's — nine choices and eight —
+  and each of the twenty-seven choices across the four frames carries a caption and a note saying what stops
+  the number being misread: per-core versus whole-machine scales, absent-is-not-zero, and what the covariate
+  window can and cannot see. Two guard tests keep it that way: one fails the build when a collected series has
+  no button, the other when a button names a series the server would refuse.
+- **Response speed, as tokens per second of generation** (`output_tokens_per_s`), which divides out the thing
+  that makes a raw wait unjudgeable. It covers multi-row responses only: about 37% of turns are a single row
+  and have no measurable span, and those are excluded rather than counted as instantaneous.
 
 ### Changed
 
@@ -40,6 +60,21 @@ and are readable only from the database.
   readings spanning 8% to 98% CPU. The live reading comes from a performance counter instead and moved from
   136% of nominal at idle to 129% with every core loaded. This needs one additional feature on a dependency
   the project already had, and no new crate.
+- **The live probe tile states what a run was competing with instead of inferring it from three fields.** The
+  thresholds that define contention now live in one module that the writer, the analysis and the tile all read,
+  so the tile gained the disk arm it had no way to know about: a probe tagged while gigabytes were being written
+  at 13% CPU used to be described as "the machine was busy". The alternative was hardcoding 20 MiB/s in the
+  page — a second authority for a number this project's ADR says will be revised.
+- **A chart's axis and tooltip follow the unit of the series being displayed, which the server reports.** Three
+  of the four frames change metric at runtime, so a panel that kept the formatter it was built with was a
+  wrong number waiting for its first switch — byte rates would have rendered as `1,048,576 B/s`. Bytes and byte
+  rates now scale like the latency formatter already did, staying precise at the quiet end where 977 KiB/s and
+  1.1 MiB/s have to share an axis.
+- **Card titles name the frame's subject — "System", "Agent" — rather than one measurement.** "System CPU" was
+  a title that named one of nine choices and was wrong for the other eight. What is being measured is named by
+  the pressed button, the caption beneath it and the tooltip, all of which change with the selection. The page
+  is one card taller as a result; the default reading is unchanged, so a reader who touches nothing sees the
+  three frames they saw before plus the conditions the runs above them ran in.
 - **The schema was reset to a single migration.** Migrations v2–v5 corrected the development line and were
   never carried by a release, so they described an upgrade from a database that exists nowhere. **A database
   written by 0.6.x cannot be read by this build and has to be moved aside**, which the error message says.
@@ -598,6 +633,8 @@ and are readable only from the database.
 - Privacy-safe JSON and Markdown reports with offline machine comparison.
 - Evidence-ranked diagnoses for system, network, security-scanner, and proxy bottlenecks.
 - Tag-driven Windows, Linux, macOS Intel, and macOS Apple Silicon GitHub releases.
+
+[0.7.0]: https://github.com/jazzonaut/agentbench/releases/tag/v0.7.0
 
 [0.6.1]: https://github.com/jazzonaut/agentbench/releases/tag/v0.6.1
 

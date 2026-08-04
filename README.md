@@ -176,13 +176,20 @@ faster setting is not silently defeated when the machine goes quiet.
 ### What it collects
 
 - **Passive samples.** CPU, memory, swap, process count, security-scanner CPU, and CPU, RSS and process
-  count attributed to your agent's process tree. Refreshes are narrowed to the counters actually read and
+  count attributed to your agent's process tree. Disk write rates for the agent's tree and for the scanners
+  are recorded beside them - attributable, unlike the whole-machine figure below, and blind to anything owned
+  by SYSTEM, which the platform limitations explain. Refreshes are narrowed to the counters actually read and
   to discovered process ids rather than walking the whole process table; the sampler runs at background CPU
   and I/O priority where the OS supports it; the cadence backs off when the machine is idle.
 - **Capability probes.** Micro-scale reruns of the same workloads `bench` uses, under the same metric names,
   so a threshold written once applies to both. Never a paid API call.
+- **The conditions each probe ran in.** The CPU clock as a percentage of its nominal speed, whole-machine disk
+  write throughput, free space on the volume being probed, the CPU figures behind the contention tag, and the
+  three largest consumers on the machine by name. This is the difference between "small-file operations dropped
+  at 14:00" and "...and `MsMpEng` was at 180% of a core".
 - **Real session metrics.** Tool latency, response intervals and token accounting derived from your own
-  Claude Code transcripts, so the charts show measured usage rather than a proxy for it.
+  Claude Code transcripts, so the charts show measured usage rather than a proxy for it. Each turn also
+  records how long its response took to arrive and whether a subagent produced it.
 - **Run markers.** The start and end of every `bench`, `profile` and `experiment`, so the cliff a
   three-minute benchmark puts in the passive series is labelled rather than read as a machine degrading.
 
@@ -213,13 +220,26 @@ not probed, because saturating every core four times an hour is not a background
 
 **Probes are not skipped when the machine is busy.** Waiting for an idle moment collects nothing on exactly
 the days you care about. Instead each probe is stamped with what it was competing with - CPU, scanner CPU,
-whether an agent was working, whether you are on battery - read once, immediately before the measurement.
-The tag claims only "what this measurement began in", and the limit is real: something starting half a
-second into a probe is missed. Reading again afterwards was tried and abandoned, because the closing CPU
-delta spans the probe and reports the probe's own footprint as contention; on an idle sixteen-core machine
-it tagged 17 of 24 runs as contended. The dashboard's **uncontended probes only** filter is where the tag
-gets used, and `--status` reports how many of your runs were clean, because a verdict computed from four
-points is worth knowing about.
+whether an agent was working, **whole-machine disk write throughput**, whether you are on battery - read once,
+immediately before the measurement. A machine writing more than 20 MiB/s counts as contended on its own,
+because two of the five judged series are filesystem measurements and an update, a backup or a cloud sync
+writing gigabytes reads slow at 15% CPU: those probes used to enter the baseline as clean data. For scale, an
+idle desktop with a browser and an editor open wrote 17 KiB/s at the median, and an all-core build 44.9 MiB/s.
+
+The tag claims only "what this measurement began in", and the limit is real and worth putting a number on: the
+readings span roughly the 200 ms before the workloads start, so sustained background load is caught and a
+burst is caught only if the window lands inside it. Measured both ways: a copy loop that wrote at 2 GB/s for
+about a second at a time and idled between read 0.0 MiB/s on two consecutive probes, while four continuous
+writers were tagged on three consecutive probes at 3.1-3.5 GiB/s. A scanner busy for ten minutes is the case
+this covariate is for; one busy for a second is not. Reading again afterwards was
+tried and abandoned, because the closing CPU delta spans the probe and reports the probe's own footprint as
+contention; on an idle sixteen-core machine it tagged 17 of 24 runs as contended. The ranked consumers are the
+one exception to the window: they come from the process walk the probe already does, and the OS reports each
+process's CPU as an average since it was last seen, so they answer "what has been using this machine since the
+last probe" rather than "what is using it now".
+
+The dashboard's **uncontended probes only** filter is where the tag gets used, and `--status` reports how many
+of your runs were clean, because a verdict computed from four points is worth knowing about.
 
 Probe values and `bench` values are stored side by side under different sources and are **never averaged
 together**: the same workload over 200 files and over 5,000 answers the same question two orders of
@@ -252,6 +272,7 @@ sharply in how directly they measure the machine, and are charted accordingly:
 | `tool_bash_ms` | Median `Bash` latency | Dominated by how long the command legitimately took, and by waiting for permission |
 | `first_response_ms` | Prompt to the first assistant message | **Not** a time to first token: it contains the whole thinking block, and a prompt typed while the agent was working waits in a queue first. Medians of seven to eight seconds are normal and say nothing about your network |
 | `output_tokens` | Tokens produced per bucket | Measures how much you asked for, not how fast anything was |
+| `output_tokens_per_s` | Tokens produced divided by the span of the response that produced them | Covers multi-row responses only. About 37% of turns arrive in a single row, have no measurable span, and are excluded rather than counted as instantaneous |
 | `cache_hit_ratio` | Prompt tokens served from cache | None, once deduplicated by request |
 
 **One tool per series, because the mix is not a property of your machine.** These used to be pooled into a
@@ -267,7 +288,11 @@ early or spent its time waiting for a person, so including them would make a bad
 machine. They are 3.3% of calls on real data.
 
 Reading is incremental and free of load. Transcripts are already on disk, each is read from where the last
-pass stopped, an unchanged one is not opened at all, and subagent transcripts count too.
+pass stopped, an unchanged one is not opened at all, and subagent transcripts count too. Every turn and tool
+call records whether a subagent produced it, which matters more than it sounds: 38% of the transcripts on the
+development machine are subagent work that was previously blended into the parent project's numbers with
+nothing able to separate the two. No series filters on the flag yet, so `tool_read_ms` is still a blend of
+both.
 
 ### Today against the days before it
 
@@ -306,6 +331,16 @@ Three things every verdict discloses, because a number without them is not a fin
   unplugged still has a trend worth watching. But if today ran mostly on battery and the baseline mostly on
   mains, the verdict says so in words.
 
+And where the conditions themselves moved, the verdict gains a third line that says what changed:
+`clean probes: clock 128% today against 136%`, beneath `worse -8.0%` and the counts it rests on. `--status`
+prints the same line. A covariate earns a clause only when today's median falls outside its own baseline band,
+computed exactly the way the verdict's band is - so there is one
+sensitivity rule for the whole tool rather than a hand-picked threshold per covariate, and conditions stay
+silent for the same first four days that verdicts do. The line reads *clean probes* rather than *today*
+because every figure in it is a median over the uncontended runs, which is the population the verdict used.
+That also caps what it can report: a disk figure drawn from uncontended runs cannot exceed the threshold that
+defines contention, because every run that did was excluded by definition.
+
 ### What changed, drawn on the charts
 
 Every chart carries marks for the things that explain a step in a line, listed underneath so the frames stay
@@ -316,6 +351,31 @@ readable:
   transcripts, so it works retroactively over your whole history.
 - **Foreground runs**, as a shaded band. A run that was interrupted, or is still going, is drawn
   open-ended rather than waiting for an end that is not coming.
+
+### Four frames, and nothing collected that you cannot reach
+
+The history strip is four stacked frames, each with a switch over what it plots, sharing one cursor so a dip
+in one line can be read against the others at the same instant:
+
+| Frame | What its switch offers |
+|---|---|
+| **System** | CPU, memory, swap, processes, scanner CPU, and the agent tree's CPU, memory and write rate |
+| **Agent** | `Read`, `Edit`, search and `Bash` latency, first response, output tokens, tokens/s, cache hits |
+| **Probe** | The four judged workloads |
+| **Conditions at each probe** | Clock, disk writes, free space, and the machine, scanner and agent CPU each probe began in |
+
+Twenty-seven choices between them, and every one carries a caption saying what is part of the reading - per
+core or per machine, what a gap means, what the workload was - and an info mark for why the number is the way
+it is. The catalogue is a single file, `src/watch/assets/series.js`, so the prose can be read end to end
+rather than found.
+
+**Nothing is collected that the page cannot show.** Twelve series used to be collected and unreachable,
+which is cost without benefit, so two tests now guard it: the build fails if a collected series has no button
+anywhere, and it fails the other way if a button names a series the server would refuse. The second failure
+is the sneaky one - its only symptom is one empty frame, which looks exactly like the first day of collection.
+
+A reader who touches nothing sees the default selections, which are the same three lines the page opened with
+before, plus the conditions the runs above them ran in.
 
 ### Storage, privacy and lifecycle
 
@@ -474,7 +534,9 @@ case. Run it against a directory you are willing to show a model, or pass `--no-
 Report schema version 1 is the public Serde types in `src/model.rs`. The dashboard's SQLite schema is
 versioned separately through `PRAGMA user_version` and migrated forward automatically; a database written by
 a newer build is refused rather than downgraded, so history that cannot be regenerated is never silently
-rewritten.
+rewritten. A database written by 0.6.x is refused for the same reason and says so: the schema was collapsed to
+a single migration for 0.7.0, because no release had carried the intermediate ones. Move `watch.db` aside - a
+transcript backfill regenerates the session half of it, and the sample and probe half starts again.
 
 ### Platform limitations
 
@@ -498,6 +560,33 @@ probe on that thread read slow and report a machine degrading while nothing had 
 
 Power source is read natively on Windows, Linux and macOS and recorded as *unknown* everywhere else, never
 as "on mains", because a laptop on battery runs measurably slower for a reason that is not degradation.
+
+**Disk I/O cannot be attributed to another user's processes without privileges this daemon does not take.** An
+unelevated reader sees a SYSTEM-owned process's CPU and exactly zero of its bytes: over 36 seconds of
+measurement, Defender, Windows Update, the search indexer, `System` and `Registry` all reported 0 bytes read
+and 0 written while `svchost` reported 1.5% CPU, and 346 processes had an unreadable executable path. So the
+per-process write rates in the passive stream cover *your* processes only, and the figure that catches the
+backups, updates and scans is the whole-machine one, which is unattributed by construction. The two answer
+different questions and neither substitutes for the other. `scanner_write_bytes_s` is therefore a flat zero on
+a Windows machine whose scanner is Defender - configuration, not a broken counter - and the chart says so
+where the line is, because a flat line otherwise reads as a quiet scanner.
+
+**The clock is recorded as a percentage of nominal speed, not in MHz.** The MHz figure available to an ordinary
+process on Windows is a value the registry holds from boot: `sysinfo` and WMI both reported exactly 3801 MHz
+across thirty-six readings spanning 8% to 98% CPU, on a part whose nominal speed is 3801 MHz. What is live is
+a performance counter that is natively a ratio - above 100% while the part boosts, below while it throttles -
+and that is what gets stored. Charting the MHz number would have put a permanently flat line under a judged
+CPU series, which is worse than having no covariate at all. On Linux the same ratio comes from
+`scaling_cur_freq` against `cpuinfo_max_freq`, absent where cpufreq is not built in; on macOS and any other
+platform the covariate is absent rather than guessed, like every other capability here.
+
+**A probe's conditions describe roughly the 200 ms before it, not its whole duration.** The clock and disk
+readings span the priming window between the two readings the probe needs anyway, which keeps them out of the
+measurement they describe. Sustained background load is what that window sees; the chance of catching a burst
+is about its duration divided by the probe interval, so a writer that runs for one second in ten is mostly
+invisible to it while a scanner busy for ten minutes is not. Widening it by reading again after the workloads
+was tried and is worse: the closing reading includes the probe's own footprint and tags an idle machine as
+contended.
 
 Per-process CPU needs three refreshes before it is a measurement rather than a zero, which is one more than
 the platform documents. Every reader warms up first; the first probe of a daemon session takes an extra
@@ -529,6 +618,10 @@ Three metrics changed meaning and their history should not be read across the ch
 - `tool_read_ms` is the latency of `Read` alone, where it previously pooled `Read`, `Grep`, `Glob` and
   `Edit`. **Not comparable across the change**, and the old series was measuring the model's choice of tool
   as much as the machine.
+- `contended`, and therefore every verdict's *uncontended* subset, counts a busy disk from v0.7.0. Probes that
+  ran while something wrote more than 20 MiB/s used to be filed as clean data. The change makes the subset
+  smaller and its members more alike, which is the point, and the covariate the tag is derived from is stored
+  beside it so a revised threshold can be applied to history rather than only to what comes after it.
 
 ## Design decisions
 

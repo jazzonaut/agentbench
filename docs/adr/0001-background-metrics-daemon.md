@@ -185,7 +185,7 @@ machine look faster the more went wrong. On real data they are 3.3% of calls.
 | 3 | Probes: micro workloads, covariates, run markers | **done** |
 | 4 | Analysis: baseline, verdicts, annotations, rollup and retention | **done** |
 | 5 | Ship: README/CHANGELOG polish, autostart docs, 0.4.0 | **done** |
-| 6 | Conditions: what was different today, and making every collected series reachable | **collection done; analysis, API and dashboard outstanding** |
+| 6 | Conditions: what was different today, and making every collected series reachable | **done** |
 
 ### Phase 6: why
 
@@ -196,9 +196,10 @@ gigabytes read slow at 15% CPU and entered the baseline as clean data. `cpu.sing
 nothing recorded that could say the part was throttled. Neither filesystem series had a free-space
 covariate, so the slow monotonic drift the tool exists to detect was the one thing it could not explain.
 
-The display half is the same problem seen from the other end: `/api/series` advertises thirteen series
-nobody can reach — six passive and six session, against the two that are charted. Collection that cannot
-be read is cost without benefit.
+The display half is the same problem seen from the other end: `/api/series` advertises twelve series
+nobody can reach — six passive and six session, against the two that are charted. (This was written as
+thirteen; the enums say seven and seven, of which `cpu_percent` and `tool_read_ms` were charted.) Collection
+that cannot be read is cost without benefit.
 
 ### Deviations from the plan as executed
 
@@ -588,6 +589,103 @@ number in it.
   probe history, so every probe verdict reads `insufficient` until four days have accumulated, and the open
   question about whether the 5% band floor survives a real week restarts from zero. Sessions are unaffected:
   a full transcript backfill regenerates them, which is also how the new session columns reach history.
+
+### Phase 6 analysis and API decisions
+
+- **"Differs materially" reuses the verdict band rather than a threshold per covariate.** Each covariate
+  gets its own `Baseline::from_days` over the same window the verdict used, and a clause appears in the
+  conditions line only when today's median falls outside that covariate's own band. The alternative was a
+  hand-picked sensitivity per covariate — some percentage of clock, some number of MiB/s — which is one more
+  constant per covariate that nothing in this project could validate. Reusing the band gives one sensitivity rule for the
+  whole tool, and `MIN_DAYS` and the 5% floor come with it free. The cost is symmetrical and worth stating:
+  conditions lines stay silent for exactly the same first four days that verdicts do, so a fresh database
+  explains nothing until it can also judge nothing.
+- **`cond:*` honours the page's uncontended filter, and the page has to admit what that does.** The
+  Conditions frame shares a cursor with the Probe frame above it, and correlating a covariate against a
+  measurement requires both to be drawn from one population. The consequence is not obvious and would
+  otherwise read as a defect: with the filter on, `cond:disk_write_bytes_s` cannot exceed the 20 MiB/s
+  contention threshold, because every run that did was excluded by definition. The same holds for the
+  conditions *line*, every figure in which is a median over the uncontended subset — which is why it reads
+  `clean probes:` rather than `today`. Naming the population is the whole difference between a capped figure
+  and a wrong one.
+- **Every series reports its own unit, and the page hardcodes no formatter.** A closed vocabulary — `%`,
+  `B`, `B/s`, `ms`, `ratio`, `tokens`, `tokens/s`, and `""` for a bare count — travels with each series from
+  the server, and `unitFormatter` grew a case per unit. Three of the four frames change metric at runtime, so
+  a panel that kept the formatter it was constructed with was a live fault waiting for its first switch:
+  a byte rate rendered through the latency formatter is not a formatting blemish, it is a wrong number.
+  Per-core versus whole-machine is deliberately *not* a unit but a note, because two series measured in
+  percent do not become comparable by sharing an axis label.
+- **The contention thresholds moved to `src/watch/contention.rs`, and `is_contended` became
+  `cause(..).is_some()`.** Three layers need those numbers now — the writer that tags a run, the analysis
+  that explains one, and the live tile that names what a probe was competing with — and the tile had been
+  inferring the cause from the covariates by hand, which is why it had no disk arm at all and would have
+  reported "the machine was busy" for a probe tagged by 3 GiB/s of writes at 13% CPU. Without the extraction
+  the fix meant hardcoding 20 MiB/s in `app.js`: a second authority for a number this document says will be
+  revised.
+- **`CondSeries::EXPLANATORY` is four of the six charted covariates.** `scanner_at` and `agent_at` are
+  charted but never appear in a conditions line, because that line is computed over uncontended runs where
+  both are bounded above by their own contention thresholds, at a tenth and a fifth of one core. A move from
+  a fiftieth of a core to a twelfth is a large *relative* change that explains nothing about an 8% throughput
+  drop, and it would push the useful clauses off the tile. `cpu_at` survives the same objection because its
+  bound is 40% of the whole machine, which on this machine is six cores of somebody else's work. Both
+  excluded series stay on the chart, where the reader supplies the judgement the tile cannot.
+- **The covariate window under-samples bursts, and the size of the effect is calculable.** Proving the disk
+  arm end to end took four concurrent sustained writers: three consecutive probes read 3,095–3,487 MiB/s and
+  came back `contended=true, cause=disk` at 12.9% whole-machine CPU. Two earlier attempts with a `dd` loop
+  read 0.0 MiB/s and were **not** a defect — `typeperf` on the same counter showed 2.0 GB/s for about one
+  second per pass and near-zero between, so the ~200 ms window kept landing in the gaps. The chance of
+  catching a burst is roughly its duration divided by the probe interval; sustained load is what the covariate
+  sees, which is what it is documented to claim and also the load that actually explains a slow day.
+- **`scanner_write_bytes_s` ships knowing it is a flat zero on Windows.** Forty-nine consecutive live samples
+  read exactly zero, reproducing A1's finding precisely: the scanner's CPU is visible to an unelevated reader
+  and its I/O is not. This is the same trap that killed the MHz covariate — a flat line reads as a machine
+  behaving — except the column already existed and the guard test below forces it onto the page. It is
+  charted with a note saying that a flat line here is a reader without privileges, not a quiet scanner. The
+  distinction that makes it shippable is that the zero is *configuration*-dependent rather than structural:
+  a user-owned scanner would report bytes.
+- **`output_tokens_per_s` excludes the turns that have no denominator.** `generation_ms` is `NULL` for a
+  single-row request, which is about 37% of them, and a zero span is arithmetically worse than a missing one.
+  Both are excluded rather than treated as instantaneous, and the note says the series covers multi-row
+  responses only. A rate averaged over turns that had no measurable duration would read fastest exactly when
+  the least was happening.
+
+### Phase 6 dashboard decisions
+
+- **The series catalogue is its own asset, `src/watch/assets/series.js`.** Twenty-seven choices each carrying
+  a caption and a note is about 370 lines of prose, and `app.js` would have gone past 1,100 lines holding it.
+  The cost is a fifth embedded asset with its own ETag and a row in three tests that enumerate assets. The
+  benefit beyond size is that the guard tests read *that* file, so what they check is a catalogue rather than
+  a whole application, and a caption can be rewritten without touching rendering code.
+- **The guard tests live in `serve::assets::tests`, not beside the enums or in `subjects.rs`.** That module
+  already owns the markup↔script contract and is the only place that sees both the assets and the server's own
+  `known_series()`, so one test covers all three closed enums and its converse covers the probe and `bench:`
+  names too. `subjects.rs` keeps its narrower assertion about the judged four, which is a different claim:
+  that every *judged* metric is offered, not that every *collected* one is reachable.
+- **Both directions are asserted, because the two failures look nothing alike.** A collected series with no
+  button is the failure this phase exists to prevent — cost without benefit, and invisible by construction.
+  A button naming a series the server would reject is the cheaper fault, but its symptom is a single empty
+  frame, which is indistinguishable from the first day of collection and would therefore survive review. The
+  second test costs four lines. Both were proven by breaking them: `used_swap` mistyped as `used_swapp` fails
+  in both directions with messages that name the fault, because a test that has never failed is a test that
+  has never been checked.
+- **Chart frames gained an info mark anchored inline at the end of the caption**, rather than reusing the
+  tile pattern unchanged. A card's top-right corner is taken by the switch, and a note hung from the card
+  would open below the plot — a frame's height away from the pointer that revealed it. A `.note-anchor` span
+  sits after the caption text and the note hangs from that. The mark is created once and its wording
+  rewritten on each selection, exactly as a verdict tile's is, so changing metric cannot close a note the
+  reader has open.
+- **The caption is written from the catalogue and never authored in the markup.** The markup holds an empty
+  paragraph. A caption maintained in two places is precisely how a frame comes to describe the previous
+  selection's scale, and three of the four frames now change selection at runtime.
+- **Card titles became the frame's subject — "System", "Agent" — not the measurement.** "System CPU" was a
+  title that named one of nine choices, and would have been wrong for eight of them. What is being measured
+  is named by the pressed button and by the tooltip label, both of which change with the selection; the title
+  names what the frame is *about*, which does not.
+- **Page height grew by one card, against the plan's own mitigation.** The plan claimed height would not
+  grow while its own table listed four frames where three had been, which was wrong when it was written.
+  What the mitigation was actually protecting is intact and is the part that matters: the *default* reading
+  is unchanged, so a reader who touches nothing sees today's three frames plus the conditions the runs
+  plotted above them ran in.
 
 ### Questions phase 6 answered
 
