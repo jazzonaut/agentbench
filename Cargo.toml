@@ -31,9 +31,23 @@ readme = "README.md"
 rust-version = "1.95"
 keywords = ["benchmark", "diagnostics", "llm", "claude", "performance"]
 categories = ["command-line-utilities", "development-tools", "hardware-support"]
+# Nothing outside this list reaches crates.io, and Cargo special-cases almost nothing: `build.rs` is not
+# included automatically just because it is the build script, and neither is anything it or an
+# `include_bytes!` reads. The icon is named here because both of those are true of it — `build.rs` links it
+# into the Windows executables and `watch::serve::assets` embeds it as the dashboard favicon — so leaving it
+# out would produce a published crate that does not compile. `cargo package --locked`, which CI runs on
+# every push, is the check.
+#
+# The rest of `branding/` is excluded on purpose: `source.png`, `make-icon.py` and the 512px master
+# regenerate the icon but are not needed to build it, and the source artwork alone is most of a megabyte.
+# `branding/README.md` ships anyway — Cargo includes a README from any packaged directory whether or not the
+# list names it — which is a fine outcome and is recorded here so nobody adds it and wonders why nothing
+# changed.
 include = [
     "src/**",
     "examples/**",
+    "branding/agentbench.ico",
+    "build.rs",
     "Cargo.toml",
     "Cargo.lock",
     "README.md",
@@ -114,6 +128,16 @@ windows-sys = { version = "0.61", features = [
     # the user logging out. Also the tray icon's window and menu.
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+# Links `branding/agentbench.ico` and a version block into the two Windows executables. See `build.rs`,
+# which downgrades a failure here to a warning.
+#
+# Keyed on the host rather than the target, because that is what Cargo does with a `[target]`
+# build-dependency: build scripts run on the machine doing the building. That matches the tool this pulls
+# in — `rc.exe` from the Windows SDK is a host tool — and it means cross-building a Windows binary from
+# Linux quietly produces one without an icon rather than failing to resolve a dependency.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1.31"
 
 [dev-dependencies]
 assert_cmd = "2.0"

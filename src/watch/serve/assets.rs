@@ -22,8 +22,19 @@ const UPLOT_JS: &[u8] = include_bytes!("../assets/uplot.min.js");
 const UPLOT_CSS: &[u8] = include_bytes!("../assets/uplot.min.css");
 const UPLOT_LICENSE: &[u8] = include_bytes!("../assets/uplot.LICENSE");
 
+/// The application icon, which is the same file the Windows executables carry as a resource.
+///
+/// Reached from the repository root rather than from the `../assets/` the rest of this file uses, and the
+/// two are genuinely different directories: `src/watch/assets/` is the dashboard, `branding/` is the mark.
+/// One file, so the tab icon and the executable icon cannot drift apart. It is named in the manifest's
+/// `include` list for this reason as well as for `build.rs`.
+const FAVICON_ICO: &[u8] = include_bytes!("../../../branding/agentbench.ico");
+
 const JAVASCRIPT: &str = "text/javascript; charset=utf-8";
 const CSS: &str = "text/css; charset=utf-8";
+/// `image/x-icon` rather than the registered `image/vnd.microsoft.icon`, which is the one case in this file
+/// where the unofficial spelling is the better answer: every browser accepts it, and some only accept it.
+const ICON: &str = "image/x-icon";
 
 /// Every document this dashboard serves, with the scripts each one loads.
 ///
@@ -81,6 +92,9 @@ pub fn get(path: &str) -> Option<Resp> {
         "/assets/uplot.min.js" => Resp::asset(JAVASCRIPT, UPLOT_JS),
         "/assets/uplot.min.css" => Resp::asset(CSS, UPLOT_CSS),
         "/assets/uplot.LICENSE" => Resp::asset("text/plain; charset=utf-8", UPLOT_LICENSE),
+        // At the root, not under `/assets/`, because that is where a browser looks for it without being
+        // told. The documents link it as well, which is what a bookmark reads.
+        "/favicon.ico" => Resp::asset(ICON, FAVICON_ICO),
         _ => return None,
     })
 }
@@ -111,6 +125,7 @@ mod tests {
             ("/assets/styles.css", "text/css"),
             ("/assets/uplot.min.js", "text/javascript"),
             ("/assets/uplot.min.css", "text/css"),
+            ("/favicon.ico", "image/"),
         ] {
             let resp = get(path).expect(path);
             assert!(resp.content_type.starts_with(expected_type), "{path}");
@@ -142,6 +157,7 @@ mod tests {
             "/assets/styles.css",
             "/assets/uplot.min.js",
             "/assets/uplot.min.css",
+            "/favicon.ico",
         ] {
             let tag = get(path).expect(path).etag.expect(path);
             assert!(tags.insert(tag), "{path} shares a tag with another asset");
@@ -221,6 +237,13 @@ mod tests {
             assert!(
                 document.contains("href=\"/assets/styles.css\""),
                 "{path} does not load the shared stylesheet"
+            );
+            // A browser asks for `/favicon.ico` whether or not a document mentions it, so this is not what
+            // makes the tab icon appear. It is what a bookmark and a pinned tab read, and it is the only
+            // part of the arrangement a page can get wrong on its own.
+            assert!(
+                document.contains("href=\"/favicon.ico\""),
+                "{path} does not link the icon"
             );
         }
     }
@@ -334,6 +357,51 @@ mod tests {
             rest = &rest[end..];
         }
         metrics
+    }
+
+    /// The icon is a real multi-frame `.ico`, with the sizes the shell actually asks for.
+    ///
+    /// The only cross-platform check on that file, and the reason it lives here rather than beside the code
+    /// that uses it: `build.rs` links the same bytes into the Windows executables, but a build script cannot
+    /// be tested and does not run on the Linux and macOS jobs at all. Embedding it for the favicon is what
+    /// puts it in reach of `cargo test` on every platform.
+    ///
+    /// Deliberately parses the container rather than checking a length. The failures worth catching are a
+    /// truncated or half-written file, a `branding/` path that resolved to something else, and — the one
+    /// that would be silent — a regeneration that quietly dropped the small frames, leaving Windows to
+    /// shrink the 256 one and the notification area to show a smudge.
+    #[test]
+    fn the_icon_carries_the_frames_the_shell_asks_for() {
+        let ico = FAVICON_ICO;
+        let word = |at: usize| u16::from_le_bytes([ico[at], ico[at + 1]]);
+        let long = |at: usize| u32::from_le_bytes([ico[at], ico[at + 1], ico[at + 2], ico[at + 3]]);
+
+        // ICONDIR: reserved, then type 1 for an icon (2 would be a cursor), then the frame count.
+        assert_eq!(word(0), 0, "not an icon: reserved field is set");
+        assert_eq!(word(2), 1, "not an icon: wrong resource type");
+        let count = usize::from(word(4));
+        assert!(count >= 4, "only {count} frames");
+
+        let mut sizes = Vec::new();
+        for index in 0..count {
+            let entry = 6 + index * 16;
+            // A zero width or height byte means 256: the field is one byte and 256 does not fit.
+            let width = match ico[entry] {
+                0 => 256,
+                other => u32::from(other),
+            };
+            let length = long(entry + 8) as usize;
+            let offset = long(entry + 12) as usize;
+            assert!(
+                offset + length <= ico.len(),
+                "frame {width} runs past the end of the file"
+            );
+            assert!(length > 0, "frame {width} is empty");
+            sizes.push(width);
+        }
+        for wanted in [16, 32, 256] {
+            assert!(sizes.contains(&wanted), "no {wanted}px frame in {sizes:?}");
+        }
     }
 
     /// Vendored third-party code must ship its licence, and it must be the expected one.

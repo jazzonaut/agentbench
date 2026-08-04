@@ -38,12 +38,13 @@ use windows_sys::Win32::{
             NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW,
         },
         WindowsAndMessaging::{
-            AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
-            DestroyWindow, DispatchMessageW, GetCursorPos, IDI_APPLICATION, LoadIconW, MF_STRING,
-            MSG, PM_REMOVE, PeekMessageW, RegisterClassW, RegisterWindowMessageW,
-            SetForegroundWindow, TPM_RETURNCMD, TPM_RIGHTALIGN, TrackPopupMenu, TranslateMessage,
-            WM_APP, WM_DESTROY, WM_LBUTTONDBLCLK, WM_QUIT, WM_RBUTTONUP, WNDCLASSW,
-            WS_EX_TOOLWINDOW, WS_OVERLAPPED,
+            AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon,
+            DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos, GetSystemMetrics, HICON,
+            IDI_APPLICATION, IMAGE_ICON, LR_DEFAULTCOLOR, LoadIconW, LoadImageW, MF_STRING, MSG,
+            PM_REMOVE, PeekMessageW, RegisterClassW, RegisterWindowMessageW, SM_CXSMICON,
+            SM_CYSMICON, SetForegroundWindow, TPM_RETURNCMD, TPM_RIGHTALIGN, TrackPopupMenu,
+            TranslateMessage, WM_APP, WM_DESTROY, WM_LBUTTONDBLCLK, WM_QUIT, WM_RBUTTONUP,
+            WNDCLASSW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
         },
     },
 };
@@ -53,6 +54,13 @@ const TRAY_MESSAGE: u32 = WM_APP + 1;
 
 /// Identifier of our icon within this window. Only one, so a constant.
 const ICON_ID: u32 = 1;
+
+/// Resource identifier of the application icon inside this executable.
+///
+/// Set by `build.rs`, which links `branding/agentbench.ico` in under this number. The two have to agree, and
+/// the number is also what makes the shell use this icon for the executable itself: it shows the
+/// lowest-numbered icon resource it finds.
+const ICON_RESOURCE_ID: usize = 1;
 
 /// How often the loop wakes to look at the shutdown flag and the atomics below.
 ///
@@ -202,11 +210,25 @@ impl Drop for Window {
 /// notification area as a dead entry until the user hovers over it.
 struct Icon {
     window: HWND,
+    /// The image the shell shows, loaded once and reused.
+    ///
+    /// Loaded once rather than per [`Icon::data`] call because `data` runs again on every Explorer restart,
+    /// and that is the one code path written specifically to be repeated — loading there would leak a handle
+    /// per restart, in the loop least likely to be watched.
+    ///
+    /// `None` means the icon resource is not in this executable, which happens when `build.rs` could not
+    /// find `rc.exe` and said so as a warning rather than failing. The stock application icon stands in, and
+    /// because that handle belongs to the system, the distinction is also what [`Drop`] needs in order to
+    /// destroy only what this process owns.
+    image: Option<HICON>,
 }
 
 impl Icon {
     fn add(window: HWND, tooltip: &str) -> Result<Self> {
-        let icon = Self { window };
+        let icon = Self {
+            window,
+            image: load_image(),
+        };
         icon.add_again(tooltip)
             .context("add the icon to the notification area")?;
         Ok(icon)
@@ -231,12 +253,12 @@ impl Icon {
             uCallbackMessage: TRAY_MESSAGE,
             ..Default::default()
         };
-        // The stock application icon. A bundled `.ico` would look better and would also have to be added to
-        // the `include` list in the manifest or it would silently not ship in a published crate; the stock
-        // one is correct on every machine and costs nothing.
-        // SAFETY: a null instance handle with a predefined icon identifier is the documented way to load a
-        // system icon, and the returned handle is owned by the system rather than by this process.
-        data.hIcon = unsafe { LoadIconW(ptr::null_mut(), IDI_APPLICATION) };
+        data.hIcon = match self.image {
+            Some(image) => image,
+            // SAFETY: a null instance handle with a predefined icon identifier is the documented way to load
+            // a system icon, and the returned handle is owned by the system rather than by this process.
+            None => unsafe { LoadIconW(ptr::null_mut(), IDI_APPLICATION) },
+        };
         // Truncated to the field's capacity, terminator included. The caller already shortened it; this is
         // the guarantee that a longer one cannot overrun the buffer.
         let encoded = wide(tooltip);
@@ -260,7 +282,51 @@ impl Drop for Icon {
         unsafe {
             Shell_NotifyIconW(NIM_DELETE, &raw mut data);
         }
+        if let Some(image) = self.image {
+            // After the removal above, not before: the shell is still drawing the icon until `NIM_DELETE`
+            // returns, and destroying the image out from under it is what leaves a blank square behind.
+            // SAFETY: `image` came from `LoadImageW` without `LR_SHARED`, so this process owns it and is the
+            // one required to destroy it. The stock icon takes the other arm and is never passed here.
+            unsafe {
+                DestroyIcon(image);
+            }
+        }
     }
+}
+
+/// This executable's own icon, at the size the notification area is currently using.
+///
+/// Three things here are deliberate:
+///
+/// - **`LoadImageW`, not `LoadIconW`.** `LoadIconW` always returns the 32x32 frame and leaves the shell to
+///   shrink it, which throws away the hand-sized 16, 20 and 24 pixel frames that are most of the reason for
+///   shipping a multi-frame `.ico` at all. Asking for `SM_CXSMICON` gets the frame that matches the current
+///   scaling instead.
+/// - **Resource identifier 1.** Set by `build.rs`; changing it there changes it here.
+/// - **`None` rather than an error.** A build without `rc.exe` has no icon resource, which `build.rs`
+///   reports as a warning because artwork is not worth failing a build over. Refusing to start a daemon over
+///   it would be worse still, so the caller falls back to the stock icon.
+fn load_image() -> Option<HICON> {
+    // SAFETY: a null module name asks for a handle to the running executable, which always exists.
+    let instance = unsafe { GetModuleHandleW(ptr::null()) };
+    // SAFETY: `GetSystemMetrics` reads a system-wide value and has no failure mode worth branching on — an
+    // unrecognised index returns zero, and the two used here are documented constants.
+    let (width, height) = unsafe { (GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON)) };
+    // SAFETY: the name is an integer resource identifier rather than a pointer into memory, which is what
+    // `MAKEINTRESOURCEW` expresses in C; `without_provenance` is the honest spelling of that in Rust, and
+    // avoids claiming a provenance the value does not have. `LoadImageW` reads it as a number because the
+    // high word is zero.
+    let image = unsafe {
+        LoadImageW(
+            instance,
+            ptr::without_provenance(ICON_RESOURCE_ID),
+            IMAGE_ICON,
+            width,
+            height,
+            LR_DEFAULTCOLOR,
+        )
+    };
+    (!image.is_null()).then_some(image)
 }
 
 /// Show the context menu at the cursor and return what was chosen.
@@ -368,12 +434,32 @@ mod tests {
         assert_ne!(register_taskbar_created(), 0);
     }
 
+    /// Whichever way the icon was obtained, the shell must never be handed a null image.
+    ///
+    /// `NIF_ICON` tells the shell to draw `hIcon`, and a null one draws a blank square in the notification
+    /// area — an outcome indistinguishable, at a glance, from the daemon having failed to start. This pins
+    /// the fallback: a build with no icon resource shows the stock icon, not nothing.
+    #[test]
+    fn the_shell_is_never_handed_a_null_image() {
+        let icon = Icon {
+            window: ptr::null_mut(),
+            image: load_image(),
+        };
+        let data = icon.data("AgentBench");
+        assert!(!data.hIcon.is_null());
+        assert_ne!(data.uFlags & NIF_ICON, 0, "the image would not be drawn");
+        std::mem::forget(icon);
+    }
+
     /// A tooltip longer than the field must be truncated rather than overrun it. Exercised through the
     /// structure the shell is actually handed.
     #[test]
     fn an_overlong_tooltip_is_truncated_and_terminated() {
         let icon = Icon {
             window: ptr::null_mut(),
+            // The stock-icon arm. A test binary is not one of the `bins` the resource is linked into, so
+            // this is also what `load_image` would return here.
+            image: None,
         };
         let data = icon.data(&"x".repeat(500));
         assert_eq!(data.szTip[data.szTip.len() - 1], 0);
@@ -389,6 +475,9 @@ mod tests {
     fn a_short_tooltip_is_copied_intact() {
         let icon = Icon {
             window: ptr::null_mut(),
+            // The stock-icon arm. A test binary is not one of the `bins` the resource is linked into, so
+            // this is also what `load_image` would return here.
+            image: None,
         };
         let data = icon.data("AgentBench — collecting");
         let end = data

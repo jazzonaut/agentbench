@@ -76,6 +76,9 @@ jobs:
           # have, and the logon task it registers would silently start nothing.
           Copy-Item "target/${{ matrix.target }}/release/agentbench-tray.exe" $root
           Copy-Item README.md, CHANGELOG.md, CONTRIBUTING.md, SECURITY.md, LICENSE $root
+          # README.md links into docs/ for the measurement methodology and the per-platform limits. Without
+          # the directory the shipped archive is a README full of dead links.
+          Copy-Item -Recurse docs $root
           Compress-Archive -Path $root -DestinationPath "dist/$package.zip"
           Remove-Item -Recurse -Force -LiteralPath $root
       - name: Package Unix archive
@@ -86,6 +89,8 @@ jobs:
           mkdir -p "dist/$package"
           cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "dist/$package/"
           cp README.md CHANGELOG.md CONTRIBUTING.md SECURITY.md LICENSE "dist/$package/"
+          # See the Windows step: README.md links into docs/, so the directory ships with it.
+          cp -r docs "dist/$package/"
           chmod +x "dist/$package/${{ matrix.binary }}"
           tar -C dist -czf "dist/$package.tar.gz" "$package"
           rm -rf "dist/$package"

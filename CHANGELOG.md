@@ -25,6 +25,13 @@ instead of twelve flags, and one that compares two reports as a page instead of 
   command line prints.
 - **`server.allow_runs` in `watch.toml`**, default `true`. Set it to `false` to keep the dashboard for
   reading and lose no charts. `agentbench bench` is unaffected either way.
+- **An application icon**, in the three places there was not one: both Windows executables now carry it as a
+  resource, so Explorer, the taskbar and Alt+Tab show the mark rather than the generic one; the
+  notification-area icon is it at the size the shell asks for rather than the stock application icon; and
+  the dashboard serves it at `/favicon.ico`, which is the one part of this that is not Windows-only. One
+  file, `branding/agentbench.ico`, feeds all three. Embedding the Windows resource needs `rc.exe` from the
+  Windows SDK, and a build without it **warns and carries on** rather than failing — the executables and the
+  tray then fall back to the stock icon, so `cargo install agentbench` never breaks over artwork.
 
 ### Changed
 
@@ -34,6 +41,17 @@ instead of twelve flags, and one that compares two reports as a page instead of 
 - **A `405` names what the requested path accepts** rather than advertising `GET, HEAD` for every path alike,
   now that some paths answer `POST`. An unknown path is a `404` whatever the method: there is no allowed set
   to report for a path that does not exist.
+- **The machine page opens on a day of history rather than two.** The wider ranges keep their place in the
+  list; what changed is which one is selected before anyone clicks. Two days compressed a working day's
+  detail into half the frame and spent the other half on history nobody had asked for.
+- **Daemon events are collapsed to the ten most recent, with the rest behind a disclosure.** The page asks
+  `/api/status` for a hundred and shows ten, so expanding costs no request — that endpoint runs six
+  aggregates over the fact tables to answer, and a click is not a reason to pay for them twice. Fifty rows of
+  routine startup chatter was a screenful of scrolling to reach nothing.
+- **The verdict tiles fill the width of the row they wrap onto.** There are five verdicts and five is prime,
+  so no column count divides them and every layout has a short last row; a grid left that row as a hole,
+  four tiles across and the fifth alone beside three columns of empty page. A flex line grows its tiles
+  instead, and the basis chooses the split: three and two at full width, both rows flush.
 
 ### Security
 

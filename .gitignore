@@ -6,3 +6,6 @@
 .claude
 # Local verification harnesses, named so they sort last. Not release material.
 tests/zz_*.rs
+# Left behind by importing branding/make-icon.py as a module, which is how its knockout gets reused when
+# checking a frame by eye.
+__pycache__/

@@ -27,7 +27,30 @@ const RANGES = [
   { label: '7d', ms: 604800000 },
 ];
 
-let selectedRange = RANGES.find((range) => range.label === '48h');
+/** A day, because that is the question the page is usually opened to answer.
+ *
+ *  Two days was the first choice and it reads as the wrong one on a machine that is actually used: a working
+ *  day's worth of detail gets compressed into half the frame, and the yesterday half is history the reader
+ *  did not ask for. The wider ranges are one click away and keep their place in the list.
+ */
+let selectedRange = RANGES.find((range) => range.label === '24h');
+
+/** Events shown while the table is collapsed, and the most it will ever hold.
+ *
+ *  The expanded count is what `/api/status` is asked for, so expanding costs no request: that endpoint runs
+ *  six aggregates over the fact tables to answer, and a click is not a good reason to pay for them again.
+ *  Ninety extra rows is a few kilobytes on a payload that already carries every series name.
+ */
+const EVENTS_COLLAPSED = 10;
+const EVENTS_EXPANDED = 100;
+
+/** Whether the reader has opened the table, and the rows last fetched to redraw it from.
+ *
+ *  Held outside the render so a poll landing while the table is open does not close it — the health payload
+ *  refreshes every minute, and a list that collapsed under the reader would be worse than no disclosure.
+ */
+let eventsExpanded = false;
+let latestEvents = [];
 
 const dom = {
   subtitle: document.getElementById('subtitle'),
@@ -44,6 +67,7 @@ const dom = {
   marks: document.getElementById('marks'),
   statusLine: document.getElementById('status-line'),
   events: document.querySelector('#events tbody'),
+  eventsMore: document.getElementById('events-more'),
 };
 
 /** Stacked frames, in reading order: what the machine did, what the agent experienced, the controlled
@@ -651,17 +675,29 @@ function renderStatus(status) {
     dom.statusLine.append(node);
   }
 
+  renderEvents(status.events);
+}
+
+/** The events table and its disclosure, redrawn from whatever was last fetched.
+ *
+ *  Separate from {@link renderStatus} because the button calls it too: a click changes how many of the same
+ *  rows are on screen and nothing else, so it must not need a payload to do it.
+ */
+function renderEvents(events) {
+  latestEvents = events;
   dom.events.replaceChildren();
-  if (status.events.length === 0) {
+  if (events.length === 0) {
     const row = document.createElement('tr');
     const cell = document.createElement('td');
     cell.colSpan = 3;
     cell.textContent = 'Nothing to report.';
     row.append(cell);
     dom.events.append(row);
+    dom.eventsMore.hidden = true;
     return;
   }
-  for (const event of status.events) {
+  const shown = eventsExpanded ? events : events.slice(0, EVENTS_COLLAPSED);
+  for (const event of shown) {
     const row = document.createElement('tr');
     const when = document.createElement('td');
     when.textContent = dateTime(event.ts);
@@ -674,6 +710,14 @@ function renderStatus(status) {
     row.append(when, source, message);
     dom.events.append(row);
   }
+  // Nothing behind it means no button: a disclosure that opens onto the same ten rows is a control that
+  // reports the daemon is quiet by doing nothing when pressed.
+  dom.eventsMore.hidden = events.length <= EVENTS_COLLAPSED;
+  // The count is on the button rather than in prose beside it, so the label says what pressing it will do.
+  dom.eventsMore.textContent = eventsExpanded
+    ? `Show ${EVENTS_COLLAPSED} most recent`
+    : `Show ${events.length - shown.length} more`;
+  dom.eventsMore.setAttribute('aria-expanded', String(eventsExpanded));
 }
 
 function renderRanges() {
@@ -781,7 +825,7 @@ async function loadLive() {
 async function loadHealth() {
   try {
     const [status, verdicts, today] = await Promise.all([
-      api('/api/status'), api('/api/verdicts'), api('/api/today'),
+      api(`/api/status?events=${EVENTS_EXPANDED}`), api('/api/verdicts'), api('/api/today'),
     ]);
     uplotVersion = status.uplot_version;
     todayActivity = today.today;
@@ -880,6 +924,12 @@ for (const panel of CHARTS) {
 // Toggling what a chart counts must redraw it immediately: waiting a minute for the next poll would
 // read as the filter having done nothing.
 dom.uncontended.addEventListener('change', () => void loadHistory());
+// Redrawn from the rows already held, for the reason on renderEvents: revealing what has been fetched is
+// not a reason to refetch it.
+dom.eventsMore.addEventListener('click', () => {
+  eventsExpanded = !eventsExpanded;
+  renderEvents(latestEvents);
+});
 // A note opened by click stays open until it is dismissed, so both the usual dismissals are wired here
 // rather than left to the poll that used to clear the tiles for us.
 document.addEventListener('click', (event) => {

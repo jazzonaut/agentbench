@@ -82,8 +82,15 @@
   .tile-value.absent { color: var(--ink-muted); font-weight: 400; font-size: 15px; }
 
   /* A verdict tile carries a value, a word, a baseline, its evidence and sometimes a caveat, so it needs
-     more room than a tile showing one number. Narrower and the word wraps under the value it qualifies. */
-  #verdicts { grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+     more room than a tile showing one number. Narrower and the word wraps under the value it qualifies.
+
+     Flex rather than the grid the other sections use, for one reason: there are five verdicts and five is
+     prime, so no column count divides them evenly and every layout has a short last row. A grid leaves that
+     row as a hole — four tiles across and the fifth sitting alone beside three columns of empty page — while
+     a flex line grows its items to fill the width instead. The basis is what chooses the split: 300px puts
+     three on the first line and two on the second at the page's full width, both lines flush. */
+  #verdicts { display: flex; flex-wrap: wrap; }
+  #verdicts > * { flex: 1 1 300px; }
 
   /* A verdict tile is a tile with a judgement on it. The word carries the meaning; the rule down the
      leading edge is a second, redundant encoding of the same thing, never the only one. */
@@ -232,7 +239,9 @@
   .filter { display: flex; align-items: center; gap: 6px; color: var(--ink-secondary); font-size: 12px; }
   .filter input { width: 15px; height: 15px; accent-color: var(--series-1); }
   .filter:focus-within { outline: 2px solid var(--series-1); outline-offset: 3px; border-radius: 4px; }
-  .ranges button, .metrics button {
+  /* The disclosure under the events table joins these: one button shape across the page, so a control that
+     reveals rows does not read as a different kind of thing from one that changes a range. */
+  .ranges button, .metrics button, .show-more {
     font: inherit;
     font-size: 12px;
     /* Comfortable hit target rather than a cramped one. */
@@ -249,7 +258,7 @@
     border-color: var(--axis);
     font-weight: 600;
   }
-  .ranges button:focus-visible, .metrics button:focus-visible {
+  .ranges button:focus-visible, .metrics button:focus-visible, .show-more:focus-visible {
     outline: 2px solid var(--series-1);
     outline-offset: 2px;
   }
@@ -282,6 +291,9 @@
   th { color: var(--ink-muted); font-weight: 600; }
   td.level-error { color: var(--warn); }
   td.level-warn { color: var(--warn); }
+  /* Under the last row rather than beside the caption: it is the end of the list, and that is where a
+     reader who has run out of rows is looking. */
+  .show-more { margin-top: 8px; }
 
   .uplot { font-family: inherit; }
 
