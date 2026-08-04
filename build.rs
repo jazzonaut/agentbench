@@ -14,13 +14,6 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=branding/agentbench.ico");
 
-    // `CARGO_CFG_TARGET_OS` rather than `cfg!(windows)`. A build script is compiled for the host and its
-    // own `cfg` describes the machine running it, which is the wrong question: what matters is whether the
-    // executable being produced is a Windows one.
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
-        return;
-    }
-
     #[cfg(windows)]
     embed();
 }
@@ -28,10 +21,22 @@ fn main() {
 /// Attach the icon and version block, or say why it could not be attached.
 ///
 /// Only compiled on a Windows host, because that is where the `winresource` build-dependency is resolved
-/// from — a `[target.'cfg(windows)']` build-dependency is keyed on the host, not the target. Cross-building
-/// a Windows binary from elsewhere therefore lands in the early return above rather than here.
+/// from — a `[target.'cfg(windows)']` build-dependency is keyed on the host, not the target.
+///
+/// The target check lives here rather than in `main`, and that is not arbitrary. Written there it was the last
+/// statement of the function on every platform where the `embed()` call below it is compiled out, which is a
+/// bare trailing `return` — `clippy::needless_return`, and therefore a failed `-D warnings` build on Linux and
+/// macOS that no amount of running clippy on Windows can reveal, because on Windows the `return` has code
+/// after it and the lint is correct not to fire.
 #[cfg(windows)]
 fn embed() {
+    // `CARGO_CFG_TARGET_OS` rather than `cfg!(windows)`. A build script is compiled for the host and its own
+    // `cfg` describes the machine running it, which is the wrong question: what matters is whether the
+    // executable being produced is a Windows one. Cross-building a Linux binary from Windows stops here.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+
     let mut resource = winresource::WindowsResource::new();
     // Identifier 1 is load-bearing twice over. The shell shows an executable's lowest-numbered icon
     // resource, and `src/tray/windows.rs` asks for this one by number when it loads the icon at the size
