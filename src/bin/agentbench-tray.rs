@@ -26,7 +26,18 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+/// The one argument this binary reads, before it decides it is a daemon.
+///
+/// Named the same as the console build's hidden subcommand, and answered the same way: by doing nothing
+/// and exiting successfully. Nothing here should ever be asked for it — the process workload resolves the
+/// console build precisely so it is not — but "start a daemon" is the wrong answer to a request to launch
+/// and exit, and getting it wrong cost a notification-area icon per launch and a failed phase per probe.
+const NOOP_ARGUMENT: &str = "internal-noop";
+
 fn main() -> Result<()> {
+    if std::env::args_os().any(|argument| argument == NOOP_ARGUMENT) {
+        return Ok(());
+    }
     let config = WatchConfig::load(None)?;
     if !tray::is_supported() {
         // Falling back to running the daemon rather than refusing. On a platform with no notification area

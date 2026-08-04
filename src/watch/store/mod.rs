@@ -362,11 +362,15 @@ mod tests {
             duration_ms: 11,
             ok: true,
         }));
-        assert!(sink.send(records::ToolVersion {
-            ts: 1_700_000_000_000,
-            tool: "claude-code".into(),
-            version: "2.1.187".into(),
-        }));
+        // The same version again, later: what the importer emits on every pass that reads new bytes, and
+        // what used to leave a row per poll in a table nothing prunes.
+        for ts in [1_700_000_000_000, 1_700_000_030_000, 1_699_999_900_000] {
+            assert!(sink.send(records::ToolVersion {
+                ts,
+                tool: "claude-code".into(),
+                version: "2.1.187".into(),
+            }));
+        }
         assert!(sink.send(records::Watermark {
             path: "D:\\one.jsonl".into(),
             size: 4096,
@@ -424,11 +428,20 @@ mod tests {
         assert_eq!(rows_ok, 50, "row tallies accumulate across passes");
         assert_eq!(rows_error, 1);
 
-        let versions: i64 = reader
+        let (versions, first_seen): (i64, i64) = reader
             .conn()
-            .query_row("SELECT count(*) FROM tool_versions", [], |row| row.get(0))
+            .query_row("SELECT count(*), min(ts) FROM tool_versions", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
             .unwrap();
-        assert_eq!(versions, 1);
+        assert_eq!(
+            versions, 1,
+            "one version is one row, however often it is seen"
+        );
+        assert_eq!(
+            first_seen, 1_699_999_900_000,
+            "a pass that read older bytes moves the first sighting back"
+        );
     }
 
     #[test]

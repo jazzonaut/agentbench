@@ -43,13 +43,13 @@ pub fn discover(system: &mut System, agent_names: &[String], scanner_names: &[St
 
     let mut agents = HashSet::new();
     for name in agent_names {
-        for root in matching_roots(system, name) {
+        for root in named(system, name) {
             agents.extend(process_tree::descendants(system, root));
         }
     }
     let scanners = scanner_names
         .iter()
-        .flat_map(|name| matching_roots(system, name))
+        .flat_map(|name| containing(system, name))
         .collect();
 
     Targets { agents, scanners }
@@ -75,11 +75,45 @@ pub fn refresh_watched(system: &mut System, targets: &Targets) -> usize {
         .count()
 }
 
-/// Every process whose name contains `needle`, case-insensitively.
+/// Every process whose name *is* `needle`, case-insensitively, with or without a file extension.
+///
+/// Exact rather than substring, which [`containing`] is, and the asymmetry is deliberate. An agent match is
+/// expanded to its whole descendant tree and that tree's CPU is *summed*, so a name matching more broadly
+/// than the user meant does not merely add a process: it adds everything that process ever started, and
+/// enough idle helpers at one percent of a core each clear the "an agent is working" threshold between
+/// them. Every probe is then tagged contended, the comparable subset empties, and every verdict reads
+/// `insufficient` indefinitely. `claude` matching `claude-monitor.exe` is the shape of that fault.
+///
+/// The extension is optional so that a configured `"claude"` matches `claude.exe` on Windows and `claude`
+/// everywhere else, and so writing the full file name is still an accepted way to name a process.
 ///
 /// Unlike [`process_tree::select`] this returns all matches rather than the longest-running one:
 /// several agent sessions can legitimately run at once and all of them count.
-fn matching_roots(system: &System, needle: &str) -> Vec<Pid> {
+fn named(system: &System, needle: &str) -> Vec<Pid> {
+    let needle = needle.to_ascii_lowercase();
+    system
+        .processes()
+        .iter()
+        .filter(|(_, process)| {
+            let name = process.name().to_string_lossy().to_ascii_lowercase();
+            let stem = name
+                .rsplit_once('.')
+                .map_or(name.as_str(), |(stem, _)| stem);
+            name == needle || stem == needle
+        })
+        .map(|(pid, _)| *pid)
+        .collect()
+}
+
+/// Every process whose name contains `needle`, case-insensitively.
+///
+/// Substring, and deliberately: the scanner list is fragments of real names — `msmpeng` for `MsMpEng.exe`,
+/// `sophos` for `SophosFS.exe` — which no exact match would find. A scanner is also recorded as the single
+/// matched process rather than expanded to a tree, so a loose match costs one process's CPU rather than a
+/// subtree's, and the threshold it is read against is per-process.
+///
+/// Returns all matches, for the same reason [`named`] does: a machine can be running several.
+fn containing(system: &System, needle: &str) -> Vec<Pid> {
     let needle = needle.to_ascii_lowercase();
     system
         .processes()
@@ -130,5 +164,44 @@ mod tests {
         let targets = discover(&mut system, &["\u{0}nothing\u{0}".into()], &[]);
         assert!(targets.is_empty());
         assert_eq!(refresh_watched(&mut system, &targets), 0);
+    }
+
+    /// An agent name has to name a process, not appear inside one.
+    ///
+    /// The whole cost of a loose agent match is downstream: the match is expanded to a descendant tree and
+    /// the tree's CPU is summed against a threshold meaning "an agent is working".
+    #[test]
+    fn an_agent_name_matches_a_whole_process_name_and_not_a_fragment_of_one() {
+        let mut system = System::new();
+        let own = Pid::from_u32(std::process::id());
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[own]),
+            false,
+            process_refresh_kind(),
+        );
+        let full = system
+            .process(own)
+            .map(|process| process.name().to_string_lossy().into_owned())
+            .expect("own process is visible");
+        let stem = full
+            .rsplit_once('.')
+            .map_or(full.as_str(), |(stem, _)| stem);
+
+        // Both spellings of this process's own name are accepted.
+        for spelling in [full.as_str(), stem, &full.to_ascii_uppercase()] {
+            assert_eq!(
+                named(&system, spelling),
+                vec![own],
+                "{spelling:?} should name this process"
+            );
+        }
+        // A fragment of it is not, however suggestive.
+        let fragment = &stem[..stem.len().saturating_sub(1)];
+        assert!(
+            named(&system, fragment).is_empty(),
+            "{fragment:?} is a fragment, not a name"
+        );
+        // A scanner fragment still matches, because that list is written as fragments.
+        assert_eq!(containing(&system, fragment), vec![own]);
     }
 }

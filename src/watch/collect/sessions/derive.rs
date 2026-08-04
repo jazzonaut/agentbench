@@ -93,17 +93,26 @@ impl Deriver {
         }
     }
 
-    /// The earliest row still awaiting its other half.
+    /// The earliest row still awaiting its other half, ignoring any that began before `floor`.
     ///
     /// This is what makes an incremental import exact rather than approximate. Stopping at the last
     /// byte read would lose every measurement whose two rows straddle the boundary; stopping some
     /// fixed distance earlier would re-read whole files to catch them. Stopping here re-reads the few
     /// rows that are genuinely still open, and nothing else.
-    pub fn resume_offset(&self) -> Option<i64> {
+    ///
+    /// `floor` is how a caller caps that re-read, and it is a parameter rather than a clamp the caller
+    /// applies afterwards because the two are not the same answer. Every offset returned here is the start
+    /// of a row, so it is a line boundary — which is the invariant the whole resume scheme rests on.
+    /// Clamping the result to `end - budget` instead yields an arbitrary byte position, and a watermark
+    /// recorded mid-line makes the next pass read a fragment, fail to parse it, and count an import error
+    /// it then repeats every poll for ever. Filtering the candidates keeps the answer a line start by
+    /// construction; a row older than the floor is abandoned, which is what a budget means.
+    pub fn resume_offset(&self, floor: i64) -> Option<i64> {
         self.tools
             .values()
             .map(|pending| pending.offset)
             .chain(self.prompt.as_ref().map(|prompt| prompt.offset))
+            .filter(|offset| *offset >= floor)
             .min()
     }
 
@@ -322,7 +331,7 @@ mod tests {
             deriver.push(offset, &row, &mut out);
             offset += line.len() as i64 + 1;
         }
-        (out, deriver.resume_offset())
+        (out, deriver.resume_offset(0))
     }
 
     fn turns(records: &[Record]) -> Vec<Turn> {
@@ -582,6 +591,42 @@ mod tests {
         assert_eq!(versions[0].version, "2.1.187");
         assert_eq!(versions[0].tool, CLAUDE_CODE);
         assert_eq!(versions[1].version, "2.2.0");
+    }
+
+    /// A row older than the caller's budget is abandoned, and the answer stays a line start.
+    #[test]
+    fn a_pending_row_before_the_floor_is_dropped_rather_than_clamped_to_it() {
+        let request = assistant(
+            "a1",
+            "p1",
+            "req_1",
+            "2026-06-27T00:00:10.000Z",
+            r#"{"type":"tool_use","id":"t1","name":"Read"}"#,
+        );
+        let later = assistant(
+            "a2",
+            "p2",
+            "req_2",
+            "2026-06-27T00:00:20.000Z",
+            r#"{"type":"tool_use","id":"t2","name":"Grep"}"#,
+        );
+        let mut deriver = Deriver::default();
+        let mut out = Vec::new();
+        for (offset, line) in [(0_i64, &request), (5_000, &later)] {
+            let row: Row = serde_json::from_str(line).expect(line);
+            deriver.push(offset, &row, &mut out);
+        }
+        assert_eq!(deriver.resume_offset(0), Some(0), "both are still open");
+        assert_eq!(
+            deriver.resume_offset(1),
+            Some(5_000),
+            "the next open row's own offset, not the floor"
+        );
+        assert_eq!(
+            deriver.resume_offset(5_001),
+            None,
+            "nothing within budget is open, so there is nothing to resume from"
+        );
     }
 
     /// Where the next pass has to start, and therefore how much gets re-read.

@@ -93,11 +93,12 @@ impl Baseline {
     /// on a quiet machine has to be larger before it is called one. The counts travel with the band for
     /// exactly this reason: see [`Baseline::observations`].
     pub fn from_days(days: &[DayValue]) -> Option<Self> {
-        let values: Vec<f64> = days
-            .iter()
-            .map(|day| day.value)
-            .filter(|value| value.is_finite())
-            .collect();
+        // Filtered as days rather than as values, so the measurement count below is drawn from the same set
+        // the band is. Summing over the unfiltered slice let a day dropped for a non-finite value still
+        // contribute its measurements, which overstated the very disclosure this type exists to make.
+        let contributing: Vec<&DayValue> =
+            days.iter().filter(|day| day.value.is_finite()).collect();
+        let values: Vec<f64> = contributing.iter().map(|day| day.value).collect();
         if values.len() < MIN_DAYS {
             return None;
         }
@@ -114,7 +115,7 @@ impl Baseline {
             low: median - half_width,
             high: median + half_width,
             days: values.len(),
-            observations: days.iter().map(|day| day.observations).sum(),
+            observations: contributing.iter().map(|day| day.observations).sum(),
             // `>=`, not `>`: on a tie the floor is what set the width, and the degenerate tie — identical
             // days around a median of zero, so both are zero — is the case the disclosure exists for.
             width_is_floor: floor >= spread,
@@ -230,6 +231,10 @@ mod tests {
         window[2].value = f64::NAN;
         let baseline = Baseline::from_days(&window).expect("four real days remain");
         assert_eq!(baseline.days, 4);
+        assert_eq!(
+            baseline.observations, 32,
+            "a dropped day must not contribute its measurements either"
+        );
         assert!(baseline.median.is_finite());
 
         let mut mostly_broken = days(&[4000.0, 4100.0, 3900.0, 4050.0]);

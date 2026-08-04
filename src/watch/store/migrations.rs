@@ -29,6 +29,10 @@ const MIGRATIONS: &[Migration] = &[
         version: 4,
         sql: super::schema::ALTER_V4,
     },
+    Migration {
+        version: 5,
+        sql: super::schema::ALTER_V5,
+    },
 ];
 
 /// Version this build expects after migrating.
@@ -223,6 +227,72 @@ mod tests {
         assert!(
             plan.contains("idx_samples_ts"),
             "retention must not full-scan: {plan}"
+        );
+    }
+
+    /// Real databases hold a row per sighting, so v5 has to collapse them without losing the first one.
+    #[test]
+    fn a_v4_database_collapses_its_tool_version_history_to_one_row_per_version() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        // As the writer opens it. This migration drops and renames a table whose rows reference
+        // `machines`, and enforcement being on is the difference between an upgrade and a failure to start.
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        for sql in [
+            crate::watch::store::schema::CREATE_V1,
+            crate::watch::store::schema::ALTER_V2,
+            crate::watch::store::schema::ALTER_V3,
+            crate::watch::store::schema::ALTER_V4,
+        ] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 4).unwrap();
+        conn.execute(
+            "INSERT INTO machines (id, hostname_hash, os, os_version, architecture, cpu,
+                 logical_cores, memory_bytes, first_seen, last_seen)
+             VALUES ('m', 'm', 'os', '1', 'x86_64', 'cpu', 1, 0, 0, 0)",
+            [],
+        )
+        .unwrap();
+        // What a fortnight of polling actually left behind: the same version, over and over.
+        for ts in [5_000, 6_000, 7_000, 8_000] {
+            conn.execute(
+                "INSERT INTO tool_versions (machine_id, ts, tool, version)
+                 VALUES ('m', ?1, 'claude-code', '2.1.187')",
+                [ts],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO tool_versions (machine_id, ts, tool, version)
+             VALUES ('m', 9_000, 'claude-code', '2.2.0')",
+            [],
+        )
+        .unwrap();
+
+        migrate(&mut conn).unwrap();
+
+        let rows: Vec<(String, i64)> = conn
+            .prepare("SELECT version, ts FROM tool_versions ORDER BY ts")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![("2.1.187".to_string(), 5_000), ("2.2.0".to_string(), 9_000)],
+            "five sightings of two versions must become two rows at their first sightings"
+        );
+
+        // The new key is what stops the table growing again, so the write has to be refused without it.
+        let duplicate = conn.execute(
+            "INSERT INTO tool_versions (machine_id, ts, tool, version)
+             VALUES ('m', 10_000, 'claude-code', '2.1.187')",
+            [],
+        );
+        assert!(
+            duplicate.is_err(),
+            "the version, not the instant, has to be the key"
         );
     }
 

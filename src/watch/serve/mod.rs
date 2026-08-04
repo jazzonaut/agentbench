@@ -12,7 +12,7 @@ pub mod response;
 pub mod router;
 
 use crate::watch::{
-    config::{AnalysisConfig, ServerConfig},
+    config::{ServerConfig, WatchConfig},
     store::{Level, Sink, Store, WriterHealth},
 };
 use anyhow::{Context, Result};
@@ -45,6 +45,13 @@ const ACCEPT_FAILURE_LIMIT: u32 = 5;
 pub struct Settings {
     /// Trailing window the verdicts compare today against, in whole local days.
     pub baseline_window_days: u32,
+    /// Slowest cadence at which samples are expected to arrive.
+    ///
+    /// Carried for one reason: a handler deciding whether collection has stalled has to know how long a
+    /// healthy gap can be, and that is configuration. A fixed threshold made a claim about the
+    /// configuration instead — at an idle cadence of six minutes, which `sample_interval_idle` permits, a
+    /// perfectly healthy daemon between two idle samples was reported as stalled with a warning dot.
+    pub idle_interval: Duration,
     /// Liveness of the writer, when the caller is the daemon that owns it.
     ///
     /// The one runtime fact a handler cannot read out of the database: a writer that has stopped leaves
@@ -53,20 +60,27 @@ pub struct Settings {
     pub writer: Option<WriterHealth>,
 }
 
-impl From<&AnalysisConfig> for Settings {
-    fn from(config: &AnalysisConfig) -> Self {
+impl From<&WatchConfig> for Settings {
+    /// Extract the little a handler needs, rather than handing it the configuration.
+    ///
+    /// Takes the whole [`WatchConfig`] because the two fields come from two of its sections and a caller
+    /// assembling them by hand is a caller that can forget one. What crosses into the read-only layer is
+    /// still only these two values.
+    fn from(config: &WatchConfig) -> Self {
         Self {
-            baseline_window_days: config.baseline_window_days,
+            baseline_window_days: config.analysis.baseline_window_days,
+            idle_interval: config.collect.sample_interval_idle,
             writer: None,
         }
     }
 }
 
 impl Default for Settings {
-    /// The shipped window, for tests and for anything that has no configuration to hand.
+    /// The shipped window and cadence, for tests and for anything that has no configuration to hand.
     fn default() -> Self {
         Self {
             baseline_window_days: 7,
+            idle_interval: Duration::from_secs(30),
             writer: None,
         }
     }

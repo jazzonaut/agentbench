@@ -28,6 +28,13 @@ use std::{
 /// Only reached when a row is never answered — an interrupted prompt, a tool call abandoned when the
 /// session ended. Without the cap such a row would hold the watermark still and every later pass would
 /// re-read a growing tail of the file to chase a measurement that is never going to arrive.
+///
+/// Spent as a *floor on which rows still count as open*, not as a clamp on the resulting offset. The
+/// distinction is the whole of this module's second invariant: a row's offset is a line boundary, and
+/// `end - MAX_REREAD_BYTES` is an arbitrary byte position. Clamping to it recorded a watermark inside a
+/// line, so the next pass read a fragment, `serde_json` rejected it, and one abandoned tool call became a
+/// fresh import error and a megabyte of re-read *every poll* — a number `--status` and the dashboard both
+/// show prominently. See [`Deriver::resume_offset`].
 const MAX_REREAD_BYTES: i64 = 1024 * 1024;
 
 /// Read buffer. Lines are large: one can carry an entire file's contents.
@@ -130,11 +137,10 @@ fn read_from(file: &mut File, start: u64) -> Result<Imported> {
 
     let end = start + consumed;
     imported.bytes_read = consumed;
-    imported.offset = deriver
-        .resume_offset()
-        .unwrap_or(end)
-        .clamp(end - MAX_REREAD_BYTES, end)
-        .max(0);
+    // The earliest row still open that is also within the re-read budget, or else the end of the last whole
+    // line. Both are line boundaries, which is what the watermark has to be; nothing is clamped to a byte
+    // count. A row older than the budget is genuinely abandoned — it was never going to be answered.
+    imported.offset = deriver.resume_offset(end - MAX_REREAD_BYTES).unwrap_or(end);
     Ok(imported)
 }
 
@@ -318,6 +324,63 @@ mod tests {
             "the re-read stretch rebuilds the pending call"
         );
         assert_eq!(calls[0].duration_ms, 66);
+    }
+
+    /// The budget used to be spent as a byte clamp, which is not a line boundary.
+    ///
+    /// An unanswered tool call — an interrupted call, an Escape, a session that crashed — followed by more
+    /// than a megabyte of further conversation put the watermark at `end - 1 MiB`, mid-line. Every
+    /// subsequent pass then seeked there, read a fragment, failed to parse it and counted an import error,
+    /// for ever: ~2,880 fabricated errors and ~2.8 GiB of re-reads a day at the poll floor.
+    #[test]
+    fn a_pending_row_older_than_the_budget_leaves_the_watermark_on_a_line_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let unanswered = r#"{"type":"assistant","uuid":"a0","parentUuid":"p0","requestId":"req_0","timestamp":"2026-06-27T00:00:01.000Z","sessionId":"s1","version":"2.1.187","message":{"model":"claude-opus-5","usage":{"input_tokens":1,"output_tokens":2},"content":[{"type":"tool_use","id":"t0","name":"Read"}]}}
+"#;
+        let text = format!("{unanswered}{}", tagged_transcript("bulk-", 2_000));
+        assert!(
+            text.len() as i64 > MAX_REREAD_BYTES,
+            "the fixture has to exceed the budget to exercise it: {} bytes",
+            text.len()
+        );
+        let path = write(temp.path(), "session.jsonl", &text);
+
+        let (imported, mark) = import(&path, 0, 1).unwrap();
+        assert_eq!(imported.rows_error, 0);
+        assert!(
+            text.len() as i64 - mark.size <= MAX_REREAD_BYTES,
+            "the budget must still cap the re-read: {} bytes behind the end",
+            text.len() as i64 - mark.size
+        );
+        assert_eq!(
+            mark.size as usize,
+            text.len(),
+            "the abandoned call is out of budget, so nothing needs re-reading"
+        );
+
+        // The invariant: whatever was recorded is the start of a line, so the next pass parses every row it
+        // reads rather than counting a phantom error against the file.
+        let (second, _) = import(&path, mark.size, 2).unwrap();
+        assert_eq!(
+            second.rows_error, 0,
+            "the watermark landed inside a line, so the next pass read a fragment"
+        );
+    }
+
+    /// A row still open *within* the budget is what the re-read is for, and it is not abandoned.
+    #[test]
+    fn a_pending_row_within_the_budget_still_holds_the_watermark_back() {
+        let temp = tempfile::tempdir().unwrap();
+        let head = tagged_transcript("head-", 3);
+        let unanswered = r#"{"type":"assistant","uuid":"a9","parentUuid":"p9","requestId":"req_9","timestamp":"2026-06-27T00:01:01.000Z","sessionId":"s1","version":"2.1.187","message":{"model":"claude-opus-5","usage":{"input_tokens":1,"output_tokens":2},"content":[{"type":"tool_use","id":"t9","name":"Grep"}]}}
+"#;
+        let path = write(temp.path(), "session.jsonl", &format!("{head}{unanswered}"));
+        let (_, mark) = import(&path, 0, 1).unwrap();
+        assert_eq!(
+            mark.size as usize,
+            head.len(),
+            "the pass has to resume at the row that is still waiting"
+        );
     }
 
     #[test]

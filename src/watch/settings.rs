@@ -59,10 +59,15 @@ impl Draft {
         }
     }
 
-    /// Apply every floor and cross-field rule the loader and the CLI apply.
+    /// Apply every floor and cross-field rule the loader applies.
     ///
     /// Called by [`save`] rather than trusted to the caller: the point of having one of these is that a
     /// screen cannot write a value the loader would quietly override.
+    ///
+    /// Note which rule is *not* applied. The CLI scales an untouched idle cadence down when a flag asks for
+    /// faster active sampling, because there a flag was given and the file's idle value was not. Here both
+    /// cadences are on screen and both were chosen, so rewriting the one the user can see would be the
+    /// screen disagreeing with itself.
     ///
     /// [`save`]: Draft::save
     pub fn normalise(&mut self) {
@@ -284,9 +289,9 @@ mod tests {
         assert_eq!(Draft::from_config(&loaded), written);
     }
 
-    /// Asking for faster sampling has to actually produce it, idle cadence included.
+    /// Both cadences are on screen, so the one the user can see is written as chosen.
     #[test]
-    fn a_faster_active_interval_pulls_the_idle_one_down_with_it() {
+    fn a_faster_active_interval_leaves_a_chosen_idle_cadence_alone() {
         let mut fast = draft();
         fast.sample_interval = Duration::from_secs(1);
         fast.sample_interval_idle = Duration::from_secs(30);
@@ -294,8 +299,34 @@ mod tests {
         assert_eq!(fast.sample_interval, Duration::from_secs(1));
         assert_eq!(
             fast.sample_interval_idle,
-            Duration::from_secs(u64::from(config::IDLE_INTERVAL_RATIO))
+            Duration::from_secs(30),
+            "the screen showed 30s and 30s is what it must save"
         );
+    }
+
+    /// The cross-field rule that does apply: an idle cadence faster than the active one is not one.
+    #[test]
+    fn an_idle_cadence_faster_than_the_active_one_is_raised_to_it() {
+        let mut slow = draft();
+        slow.sample_interval = Duration::from_secs(60);
+        slow.sample_interval_idle = Duration::from_secs(30);
+        slow.normalise();
+        assert_eq!(slow.sample_interval_idle, Duration::from_secs(60));
+    }
+
+    /// What a saved pair has to survive: the loader applying the same rule to it and changing nothing.
+    #[test]
+    fn a_slow_idle_cadence_round_trips_through_the_loader_unscaled() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join(CONFIG_FILE), DEFAULT_CONFIG_TOML).unwrap();
+        let mut patient = draft();
+        patient.sample_interval = Duration::from_secs(5);
+        patient.sample_interval_idle = Duration::from_secs(300);
+        let written = patient.save(temp.path()).unwrap();
+        assert_eq!(written.sample_interval_idle, Duration::from_secs(300));
+
+        let loaded = WatchConfig::load(Some(temp.path().to_path_buf())).unwrap();
+        assert_eq!(Draft::from_config(&loaded), written);
     }
 
     #[test]

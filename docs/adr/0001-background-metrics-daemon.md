@@ -356,6 +356,14 @@ machine look faster the more went wrong. On real data they are 3.3% of calls.
   transcript row it reads and a mark per sighting would paint the axis solid. Run marks are returned for runs
   *overlapping* the range rather than starting inside it: a stress run that began before the window is the
   explanation for everything in it, and a mark drawn only at its start would be off-screen when it matters.
+- **Only the first sighting is stored, not only displayed** (corrected in 0.6.1, migration v5). Taking the
+  first sighting at query time was correct and left the write side recording one row per *sighting*, keyed on
+  `(machine_id, tool, ts)`. The deriver's state is per-pass, so it emits a version record for the first row
+  of every pass that read new bytes: roughly one row per poll while a session is live, ~2,880 a day, in a
+  table nothing prunes and that the annotations query grouped over in full every sixty seconds. The key is
+  now `(machine_id, tool, version)` with `ts` kept at the minimum, so the write is idempotent in intent as
+  well as effect and a version's first sighting is a lookup. Nothing visible changed, which is exactly why
+  this would have gone unnoticed until the query got slow.
 - **Retention runs on the writer thread, as an instruction rather than a row.** The single-writer rule is
   what makes this database intelligible, and a bulk summarise-and-delete issued from a second connection is
   precisely the race it exists to prevent. `Record::Maintenance` therefore travels the same channel as
@@ -522,3 +530,12 @@ number in it.
   useless. The alternative is matching the Claude Code process specifically and accepting that other
   agents go unattributed. Worth deciding with phase 4's baselines in hand, since the cost of the current
   default is exactly "how small does the comparable subset get".
+
+  Two things narrowed the question in 0.6.1 without answering it. The names are now matched against a whole
+  process name rather than as a substring of one, because a match is expanded to its descendant tree and the
+  tree's CPU is *summed* against a threshold meaning "an agent is working" — so a loose match adds not a
+  process but everything that process ever started. And the sampler now logs what the configured names
+  actually matched, once, at startup, because the count was otherwise invisible: on the development machine
+  the shipped `["claude", "node"]` matches **21 processes**, which is the measurement this question was
+  waiting for. The threshold itself is untouched — it cannot be validated by a test that supplies its own
+  inputs — but the number needed to decide is now in the operational log of every machine that runs this.

@@ -43,7 +43,7 @@ pub struct Report {
 impl Report {
     /// Read the current state. Does not start anything.
     pub fn build(config: &WatchConfig, reader: &Reader) -> Result<Self> {
-        let status = watch::status(reader, EVENT_LIMIT)?;
+        let status = watch::status(config, reader, EVENT_LIMIT)?;
         Ok(Self {
             data_dir: config.data_dir.clone(),
             status,

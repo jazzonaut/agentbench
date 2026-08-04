@@ -64,9 +64,10 @@ pub fn in_range(
 
 /// Versions whose *first* sighting falls in the range.
 ///
-/// `tool_versions` records every sighting, because the importer sees the running version on every
-/// transcript row it reads. What matters for a chart is the earliest one: that is the instant the
-/// behaviour could have changed, and a mark on every subsequent sighting would paint the axis solid.
+/// `tool_versions` holds one row per version, carrying the earliest instant it was seen — the store keeps it
+/// that way on the write side, so this is a lookup rather than an aggregate over every sighting. The
+/// earliest sighting is the only one worth a mark: it is the instant the behaviour could have changed, and a
+/// mark on every subsequent sighting would paint the axis solid.
 ///
 /// A version whose first sighting predates the range is deliberately absent. It was already in use when
 /// the range opened, so it explains nothing inside it.
@@ -78,12 +79,10 @@ fn version_changes(
 ) -> Result<Vec<Annotation>> {
     let mut statement = conn
         .prepare_cached(
-            "SELECT tool, version, min(ts) AS first_seen
+            "SELECT tool, version, ts
                FROM tool_versions
-              WHERE machine_id = ?1
-              GROUP BY tool, version
-             HAVING first_seen >= ?2 AND first_seen <= ?3
-              ORDER BY first_seen",
+              WHERE machine_id = ?1 AND ts >= ?2 AND ts <= ?3
+              ORDER BY ts",
         )
         .context("prepare the version-change query")?;
     let mut rows = statement.query(rusqlite::params![machine_id, from_ms, to_ms])?;
@@ -165,7 +164,8 @@ mod tests {
         )
         .unwrap();
 
-        // One version seen repeatedly, then an upgrade. Only the two first sightings are annotations.
+        // One version seen repeatedly, then an upgrade, written the way the store writes them: keyed on the
+        // version, keeping the earliest sighting. Five sightings therefore leave two rows.
         for (ts, version) in [
             (MINUTE, "2.1.180"),
             (2 * MINUTE, "2.1.180"),
@@ -175,7 +175,8 @@ mod tests {
         ] {
             conn.execute(
                 "INSERT INTO tool_versions (machine_id, ts, tool, version)
-                 VALUES (?1, ?2, 'claude-code', ?3)",
+                 VALUES (?1, ?2, 'claude-code', ?3)
+                 ON CONFLICT(machine_id, tool, version) DO UPDATE SET ts = min(ts, excluded.ts)",
                 rusqlite::params![MACHINE, ts, version],
             )
             .unwrap();
@@ -195,6 +196,24 @@ mod tests {
         )
         .unwrap();
         conn
+    }
+
+    /// Repeated sightings are one row, not a history, so the table cannot grow per poll.
+    #[test]
+    fn a_version_seen_repeatedly_occupies_one_row_holding_its_earliest_sighting() {
+        let conn = fixture();
+        let (rows, earliest): (i64, i64) = conn
+            .query_row(
+                "SELECT count(*), min(ts) FROM tool_versions WHERE version = '2.1.180'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(rows, 1, "three sightings of one version is one row");
+        assert_eq!(
+            earliest, MINUTE,
+            "and it is the first sighting that is kept"
+        );
     }
 
     #[test]

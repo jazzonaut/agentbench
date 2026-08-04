@@ -4,8 +4,85 @@ All notable changes to AgentBench are documented here. The project follows [Sema
 
 ## [0.6.1] - 2026-08-04
 
+### Changed
+
+- **An agent process name has to name a process, not appear inside one.** `agent_process_names` was matched
+  as a case-insensitive substring, and an agent match is expanded to its whole descendant tree whose CPU is
+  then summed against a threshold meaning "an agent is working" — so a name matching more broadly than
+  intended added not a process but everything that process had ever started. Names now match a whole process
+  name, with or without its extension, so `"claude"` still finds `claude.exe` and no longer finds
+  `claude-monitor.exe`. Scanner names are still fragments, deliberately: that list is written as fragments
+  (`msmpeng` for `MsMpEng.exe`), and a scanner is recorded as one process rather than a tree.
+- **The daemon says what it thinks the coding agent is.** One line in its own event log at startup, naming
+  how many processes the configured agent names matched and how many scanner processes were found. This was
+  invisible, and it is the setting most likely to be wrong: a name matching most of a developer's machine
+  tags every probe as contended, which empties the comparable subset and leaves every verdict reading
+  `insufficient` indefinitely, with nothing anywhere to say why.
+
 ### Fixed
 
+- **The tray daemon collects `process.spawn_ms` again, and no longer flickers five icons per probe.** The
+  process workload launched `current_exe()` with the hidden `internal-noop` subcommand, which is right for
+  `agentbench.exe` and wrong for `agentbench-tray.exe`: that binary started a daemon whatever its arguments
+  said, so each child loaded the configuration, failed to take the instance lock its own parent was holding,
+  added a notification-area icon on the way out and exited non-zero. For anyone who had turned on "Start in
+  tray" the `process` phase therefore failed on *every* probe — a metric the README documents, permanently
+  absent from history — while five short-lived tray icons appeared four times an hour, and the recurring log
+  entry was burst-limited to every hundredth occurrence so it read as a rare event rather than a permanent
+  one. The workload now resolves the console build beside it, the same rename the logon task uses, and the
+  tray build answers `internal-noop` by exiting successfully.
+- **A `watch.toml` that only slows the sampler down no longer refuses to start.** Setting
+  `sample_interval = "60s"` and nothing else left the shipped 30s idle default *faster* than the active
+  interval, and the loader rejected that pair — `collect.sample_interval_idle (30s) must not be shorter than
+  collect.sample_interval (60s)` — naming a key the user had never written, for the single most obvious edit
+  there is to make to that file. Both the command line and the control centre clamped the same pair silently;
+  only the file rejected it. There is now one rule, applied by all three: the idle cadence is raised to the
+  active one, and the startup event reports the pair that was used.
+- **`sample_interval_idle` from the file is honoured by `agentbench dashboard`.** It applied the rule that
+  scales an idle cadence down to the shipped 1:6 ratio unconditionally — including when no interval flag had
+  been passed at all — so a file asking for `5s` active and `300s` idle was sampled every 30s when idle. The
+  tray build has no command line and honoured the file, so one configuration produced two behaviours
+  depending on which executable the logon task pointed at. The scaling now applies only where a flag actually
+  overrode the active interval and said nothing about the idle one, which is the case it exists for:
+  `--sample-interval 1s` still pulls an untouched idle cadence down to 6s.
+- **One abandoned tool call no longer counts a fresh import error every poll, for ever.** A pass caps how
+  much of a transcript's tail it will re-read to recover measurements still waiting for their other half, and
+  it spent that budget by clamping the resume offset to `end - 1 MiB` — an arbitrary byte position, where
+  every offset the importer records has to be the start of a line. So an unanswered `tool_use` followed by
+  more than a megabyte of further conversation — an interrupted call, an Escape, a session that crashed —
+  left the watermark inside a line, and every subsequent pass seeked there, read a fragment, failed to parse
+  it and counted an import error: ~2,880 fabricated errors and ~2.8 GiB of re-reads a day against a number
+  the dashboard and `--status` both show prominently. The budget is now spent deciding which rows still count
+  as open, so the recorded offset is a line boundary by construction.
+- **A healthy daemon on a quiet machine is no longer reported as stalled.** Collection was judged stale
+  after a fixed two minutes, while the idle sampling cadence is the user's to choose and legitimately reaches
+  minutes — an active interval of 60s scales to six. At that setting `/api/status` returned
+  `collecting: false` and the page drew `stalled · last sample 4m ago` beside a warning dot on a daemon that
+  was working perfectly. The bound now follows the configured idle cadence — two intervals, never less than
+  two minutes — and `dashboard --status` reaches the same verdict from the same rows.
+- **`tool_versions` no longer grows a redundant row per import pass.** The row was keyed on the instant it
+  was recorded, and the importer's deriver state is per-pass, so every poll that read new bytes wrote another
+  row for a version that had not changed: roughly one row per poll while a session is live, ~2,880 a day, in
+  a table nothing prunes and that `/api/annotations` grouped over in full every sixty seconds. The row is now
+  keyed on the version and keeps the earliest sighting, which is the only one anything ever asked for.
+  Migration v5 collapses the history already on disk; nothing on the page changes, which is exactly why this
+  would have gone unnoticed until the query got slow.
+- **A failed live-Claude case no longer discards a completed benchmark.** Every other phase degrades a
+  failure to a warning; this one propagated, so a failed `claude` spawn or an unreadable fixture threw away
+  the minutes of CPU, memory, filesystem, SQLite, process and network measurement already taken and wrote no
+  report at all — for the one phase that depends on an external program behaving. It is now a warning like
+  the rest. Cancellation stays an exception: it is a request to stop rather than a phase that failed, so it
+  still unwinds and still cleans up the temporary files on the way out.
+- **A baseline's measurement count no longer includes days the band excluded.** A day dropped for a
+  non-finite value still contributed its measurements to the "N in the baseline" figure and to the thin-day
+  caveat's arithmetic, so the disclosure that exists to say how much evidence is behind a verdict slightly
+  overstated it.
+- **An agent that restarts between two discovery passes is no longer invisible for a minute.** The sampler
+  refreshes only the pids it discovered, on a fast cadence, and re-enumerates the whole process table on a
+  slow one; the refresh has always reported how many watched processes are still alive, and both callers
+  discarded it. When every watched process has gone there is nothing left for the next ticks to measure, so
+  that case now rediscovers immediately — one process-table walk, in exactly the situation where the
+  alternative is measuring an empty set.
 - **The dashboard no longer renders a blank page against a cached copy of its own script.** Assets were
   served as `Cache-Control: public, max-age=604800, immutable` at a URL carrying no version, while
   `index.html` was sent `no-store`. So a browser that had opened the dashboard within the previous week

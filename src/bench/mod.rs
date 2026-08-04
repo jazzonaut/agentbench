@@ -165,7 +165,7 @@ pub fn run_with_cancel(
             .prefix(".agentbench-tmp-llm-")
             .tempdir_in(target)
             .context("create live-LLM fixture directory")?;
-        let live = live_llm::run_suite(
+        let suite = live_llm::run_suite(
             &live_llm::LiveOptions {
                 route: options.llm_route,
                 model: options.llm_model.clone(),
@@ -178,11 +178,28 @@ pub fn run_with_cancel(
             fixture_home.path(),
             started,
             &cancel,
-        )?;
-        metrics.extend(live.metrics);
-        profiles.extend(live.profiles);
-        llm_runs.extend(live.runs);
-        warnings.extend(live.warnings);
+        );
+        match suite {
+            Ok(live) => {
+                metrics.extend(live.metrics);
+                profiles.extend(live.profiles);
+                llm_runs.extend(live.runs);
+                warnings.extend(live.warnings);
+            }
+            // Degraded to a warning, in the same shape as the HTTPS phase above. This phase used to
+            // propagate, so a failed `claude` spawn or an unreadable fixture threw away the minutes of CPU,
+            // memory, filesystem, SQLite, process and network measurement already taken and wrote no report
+            // at all — for the one phase that depends on an external program behaving.
+            //
+            // Cancellation is the deliberate exception: it is a request to stop, not a phase that failed, so
+            // it is re-propagated and the temporary directories are still dropped on the way out.
+            Err(error) => {
+                check_cancel(&cancel)?;
+                warnings.push(format!(
+                    "live Claude benchmark skipped after error: {error:#}"
+                ));
+            }
+        }
     } else {
         progress.phase(7, "Live Claude benchmark skipped (--no-live-llm)");
     }

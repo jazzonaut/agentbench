@@ -179,10 +179,18 @@ pub fn tool_call(tx: &Transaction<'_>, machine_id: &str, call: &ToolCall) -> Res
     Ok(())
 }
 
-/// A version observation. Duplicates at the same instant are the same observation.
+/// A version observation, kept as the earliest sighting of that version.
+///
+/// The row is keyed on the version, not on the instant, so re-seeing a version is not a new row. It has to
+/// be: the importer's deriver is per-pass, so it emits a record for the first row of every pass carrying a
+/// version, and keyed on `ts` that wrote another row per poll — for ever — recording a version that had not
+/// changed. `min` rather than `OR IGNORE` because a pass can legitimately read *older* bytes than a
+/// previous one, when a transcript is rewritten or re-imported from the start, and the first sighting is the
+/// only thing this table is asked for.
 pub fn tool_version(tx: &Transaction<'_>, machine_id: &str, version: &ToolVersion) -> Result<()> {
     tx.prepare_cached(
-        "INSERT OR IGNORE INTO tool_versions (machine_id, ts, tool, version) VALUES (?1,?2,?3,?4)",
+        "INSERT INTO tool_versions (machine_id, ts, tool, version) VALUES (?1,?2,?3,?4)
+         ON CONFLICT(machine_id, tool, version) DO UPDATE SET ts = min(ts, excluded.ts)",
     )?
     .execute(params![
         machine_id,

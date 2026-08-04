@@ -455,8 +455,17 @@ fn run_dashboard(args: DashboardArgs) -> Result<()> {
     // save path use. A flag that could go below the file's own minimum would make the minimum decorative,
     // and three copies of the rule is how one of them ends up disagreeing with the other two.
     if let Some(value) = sample_interval {
-        config.collect.sample_interval =
-            watch::config::parse_duration(&value).context("--sample-interval")?;
+        let active = watch::config::parse_duration(&value).context("--sample-interval")?;
+        // Asking for faster sampling has to actually produce it, so the idle cadence follows — but only
+        // because a flag asked for a faster active interval and said nothing about the idle one. Scaling it
+        // unconditionally overrode a `sample_interval_idle` the user had written in the file, and only on
+        // this path: the tray build has no command line and honoured the file, so one configuration behaved
+        // two ways depending on which executable the logon task pointed at.
+        if sample_interval_idle.is_none() {
+            config.collect.sample_interval_idle =
+                watch::config::idle_following_active(active, config.collect.sample_interval_idle);
+        }
+        config.collect.sample_interval = active;
     }
     if let Some(value) = sample_interval_idle {
         config.collect.sample_interval_idle =

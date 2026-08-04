@@ -187,7 +187,7 @@ pub fn run_with(config: WatchConfig, narrator: &Narrator, shutdown: Arc<AtomicBo
             &store,
             &sink,
             shutdown.clone(),
-            serve::Settings::from(&config.analysis).watching(store.writer_health()),
+            serve::Settings::from(&config).watching(store.writer_health()),
         );
     } else {
         narrator.say("AgentBench dashboard: collecting only (server disabled)");
@@ -215,8 +215,13 @@ pub fn run_with(config: WatchConfig, narrator: &Narrator, shutdown: Arc<AtomicBo
 }
 
 /// Read the current status without starting anything.
-pub fn status(reader: &store::Reader, event_limit: usize) -> Result<Status> {
-    serve::handlers::status::build(reader, event_limit, None)
+///
+/// Takes the configuration for the same reason the dashboard's own settings do: whether collection has
+/// stalled is a question about the configured cadence, and the command line has to reach the same verdict
+/// the page does from the same rows. No writer is passed — a second process reading this file has none of
+/// its own to ask about.
+pub fn status(config: &WatchConfig, reader: &store::Reader, event_limit: usize) -> Result<Status> {
+    serve::handlers::status::build(reader, event_limit, &serve::Settings::from(config))
 }
 
 /// Compare today against its trailing baseline without starting anything.

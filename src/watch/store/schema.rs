@@ -189,3 +189,35 @@ ALTER TABLE samples_1m ADD COLUMN agent_rss_max INTEGER;
 pub const ALTER_V4: &str = r#"
 CREATE INDEX IF NOT EXISTS idx_samples_ts ON samples(ts);
 "#;
+
+/// One row per version, rather than one per sighting.
+///
+/// The v1 key was `(machine_id, tool, ts)`, which made "the same version, seen again" a new row. The
+/// importer sees the running version on nearly every transcript row it reads and its deriver state is
+/// per-pass, so every poll that read new bytes wrote another row recording a version that had not changed:
+/// roughly one row per poll while a session is live, ~2,880 a day, and nothing prunes this table. The
+/// dashboard's display was never wrong — it groups and takes `min(ts)` — which is exactly why this would
+/// have gone unnoticed until the annotations query, which ran over the whole table every sixty seconds,
+/// got slow.
+///
+/// Keying on the version instead makes the write idempotent in intent as well as effect, and makes "when
+/// was this version first seen" a lookup rather than an aggregate. The table has to be rebuilt because
+/// SQLite cannot change a primary key in place; the copy collapses the history that is already there,
+/// keeping the earliest sighting of each version, which is the only one that ever meant anything.
+pub const ALTER_V5: &str = r#"
+CREATE TABLE tool_versions_by_version (
+    machine_id TEXT NOT NULL REFERENCES machines(id),
+    ts         INTEGER NOT NULL,
+    tool       TEXT NOT NULL,
+    version    TEXT NOT NULL,
+    PRIMARY KEY (machine_id, tool, version)
+) WITHOUT ROWID;
+
+INSERT INTO tool_versions_by_version (machine_id, ts, tool, version)
+    SELECT machine_id, min(ts), tool, version
+      FROM tool_versions
+     GROUP BY machine_id, tool, version;
+
+DROP TABLE tool_versions;
+ALTER TABLE tool_versions_by_version RENAME TO tool_versions;
+"#;

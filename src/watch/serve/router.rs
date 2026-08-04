@@ -20,7 +20,7 @@ pub fn route(req: &Req, reader: &Reader, settings: &Settings) -> Resp {
     match req.path.as_str() {
         "/api/live" => live::handle(req, reader),
         "/api/series" => series::handle(req, reader),
-        "/api/status" => status::handle(req, reader, settings.writer.as_ref()),
+        "/api/status" => status::handle(req, reader, settings),
         "/api/verdicts" => verdicts::handle(req, reader, settings.baseline_window_days),
         "/api/annotations" => annotations::handle(req, reader),
         _ => Resp::not_found(),
@@ -336,6 +336,56 @@ mod tests {
         let resp = route(&Req::parse("/api/live"), &reader, &Settings::default());
         let live: Value = serde_json::from_slice(&resp.body).unwrap();
         assert_eq!(live["sample"]["process_count"], 300);
+    }
+
+    /// A quiet machine on a slow idle cadence is between samples, not stalled.
+    ///
+    /// `sample_interval_idle` reaches minutes legitimately, and against the fixed two-minute threshold this
+    /// replaced, a healthy daemon four minutes into a six-minute idle gap reported `collecting: false` and
+    /// the page drew `stalled` beside a warning dot.
+    #[test]
+    fn a_sample_older_than_two_minutes_is_not_stalled_at_a_slow_idle_cadence() {
+        let fixture = Fixture::new();
+        let four_minutes_ago = crate::watch::store::now_ms() - 4 * 60 * 1000;
+        fixture.store.sink().send(crate::watch::store::Sample {
+            ts: four_minutes_ago,
+            cpu_percent: 1.5,
+            used_memory: 1 << 30,
+            total_memory: 8 << 30,
+            used_swap: 0,
+            process_count: 300,
+            scanner_cpu: None,
+            agent_cpu: None,
+            agent_rss: None,
+            agent_processes: None,
+        });
+        let inventory = Inventory {
+            hostname_hash: "hash-router".into(),
+            ..Default::default()
+        };
+        let temp = fixture.close();
+        let store = Store::open(&temp.path().join("watch.db"), &inventory).unwrap();
+        let reader = store.reader().unwrap();
+
+        let judge = |idle: std::time::Duration| -> Value {
+            let settings = Settings {
+                idle_interval: idle,
+                ..Settings::default()
+            };
+            let resp = route(&Req::parse("/api/status"), &reader, &settings);
+            serde_json::from_slice(&resp.body).unwrap()
+        };
+
+        assert_eq!(
+            judge(std::time::Duration::from_secs(360))["collecting"],
+            true,
+            "four minutes into a six-minute cadence is a quiet machine"
+        );
+        assert_eq!(
+            judge(std::time::Duration::from_secs(30))["collecting"],
+            false,
+            "at the shipped cadence four minutes really is a stall"
+        );
     }
 
     /// A fresh sample and a dead writer is a stalled daemon, not a working one.

@@ -242,18 +242,42 @@ pub fn parse_duration(value: &str) -> Result<Duration> {
 
 /// Apply the floor and the ordering invariant to a pair of sampling intervals.
 ///
-/// Shared by the CLI overrides and the control centre's save path, because both can otherwise defeat the
-/// file's own minimum and make it decorative. The idle cadence is the subtle half: asking for faster
-/// sampling has to actually produce it, and left alone a configured idle interval would keep a quiet
-/// machine at its slow default so the override would appear to do nothing at all. Idle is scaled to the
-/// shipped active-to-idle ratio and never allowed below the active value.
+/// The one rule, applied by the configuration file, the CLI overrides and the control centre's save path
+/// alike, because any of them can otherwise defeat the file's own minimum and make it decorative. Three
+/// copies of a rule is how one of them ends up disagreeing with the other two, which is exactly what
+/// happened: the file *rejected* an idle interval shorter than the active one while the other two quietly
+/// corrected it, so setting `sample_interval = "60s"` on its own — the most obvious edit there is to make
+/// to that file — was a hard startup failure naming `sample_interval_idle`, a key the user had never
+/// written.
+///
+/// Clamped rather than rejected, like the probe and poll intervals: the value is a preference, not a claim
+/// about the data, so collecting slightly less often than asked beats refusing to collect at all. The
+/// daemon's startup event reports the pair it ended up with, so an adjustment is visible without it having
+/// to be fatal.
+///
+/// Note what is deliberately *not* here: nothing pulls a configured idle cadence *down* towards the active
+/// one. That belongs to [`idle_following_active`], which only a caller that knows an override was given
+/// may apply.
 pub fn clamp_sample_intervals(active: Duration, idle: Duration) -> (Duration, Duration) {
     let active = active.max(SHORTEST_SAMPLE);
-    let idle = idle
-        .min(active * IDLE_INTERVAL_RATIO)
-        .max(active)
-        .max(SHORTEST_SAMPLE);
+    let idle = idle.max(active);
     (active, idle)
+}
+
+/// The idle cadence to use when the *active* interval was overridden and the idle one was not.
+///
+/// Asking for faster sampling has to actually produce it: left alone, an unchanged idle interval keeps a
+/// quiet machine at its slow default, so `--sample-interval 1s` would appear to do nothing at all. The
+/// idle cadence therefore follows, scaled to the shipped [`IDLE_INTERVAL_RATIO`].
+///
+/// Applied only where an override was actually given, and that distinction is the whole point of this
+/// being separate from [`clamp_sample_intervals`]. A `sample_interval_idle` written in `watch.toml` is a
+/// value the user chose, not a default to be scaled: applying this to it unconditionally is how
+/// `agentbench dashboard` came to sample a `300s` idle cadence every `30s` while `agentbench-tray` — which
+/// has no command line to override anything — honoured the file, so one configuration produced two
+/// behaviours depending on which executable the logon task pointed at.
+pub fn idle_following_active(active: Duration, idle: Duration) -> Duration {
+    idle.min(active * IDLE_INTERVAL_RATIO)
 }
 
 /// Apply the floor to a probe interval.
@@ -400,18 +424,13 @@ impl FileConfig {
                 .with_context(|| format!("server.bind {text:?} is not an IP address"))?,
             None => IpAddr::V4(Ipv4Addr::LOCALHOST),
         };
-        // Clamped rather than rejected, like the probe and poll intervals: the value is a preference, not
-        // a claim about the data, so collecting slightly less often than asked beats refusing to start.
-        // The floor also subsumes the zero this used to reject separately.
-        let sample_interval = interval(self.collect.sample_interval, "5s")?.max(SHORTEST_SAMPLE);
-        let sample_interval_idle =
-            interval(self.collect.sample_interval_idle, "30s")?.max(SHORTEST_SAMPLE);
-        if sample_interval_idle < sample_interval {
-            bail!(
-                "collect.sample_interval_idle ({sample_interval_idle:?}) must not be shorter than \
-                 collect.sample_interval ({sample_interval:?})"
-            );
-        }
+        // The same clamp the CLI overrides and the control centre's save path use, rather than a second
+        // rule that rejects what those two correct. See [`clamp_sample_intervals`] for why the file used to
+        // be the only one of the three that could refuse to start.
+        let (sample_interval, sample_interval_idle) = clamp_sample_intervals(
+            interval(self.collect.sample_interval, "5s")?,
+            interval(self.collect.sample_interval_idle, "30s")?,
+        );
         let config = WatchConfig {
             server: ServerConfig {
                 enabled: self.server.enabled.unwrap_or(true),
@@ -607,16 +626,66 @@ mod tests {
         assert!(error.contains("loopback-only"), "{error}");
     }
 
+    /// An idle cadence faster than the active one is not a cadence; it is raised, not refused.
     #[test]
-    fn an_idle_cadence_faster_than_the_active_one_is_refused() {
+    fn an_idle_cadence_faster_than_the_active_one_is_raised_to_it() {
         let file: FileConfig =
             toml::from_str("[collect]\nsample_interval = \"30s\"\nsample_interval_idle = \"5s\"\n")
                 .unwrap();
-        let error = file
+        let config = file.resolve(PathBuf::from("/tmp/agentbench")).unwrap();
+        assert_eq!(config.collect.sample_interval, Duration::from_secs(30));
+        assert_eq!(config.collect.sample_interval_idle, Duration::from_secs(30));
+    }
+
+    /// The single most obvious edit to make to `watch.toml`, which used to refuse to start.
+    ///
+    /// Slowing the sampler down leaves the shipped 30s idle default *faster* than the active interval, and
+    /// the loader rejected that pair by naming a key the user never wrote. Every other path clamped.
+    #[test]
+    fn slowing_the_sampler_down_on_its_own_still_starts() {
+        let file: FileConfig = toml::from_str("[collect]\nsample_interval = \"60s\"\n").unwrap();
+        let config = file
             .resolve(PathBuf::from("/tmp/agentbench"))
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("must not be shorter"), "{error}");
+            .expect("slowing the sampler down is a preference, not an error");
+        assert_eq!(config.collect.sample_interval, Duration::from_secs(60));
+        assert_eq!(
+            config.collect.sample_interval_idle,
+            Duration::from_secs(60),
+            "the idle cadence is raised to the active one, not rejected against it"
+        );
+    }
+
+    /// A value the user wrote is not a default to be scaled down to the shipped ratio.
+    ///
+    /// The ratio clamp belongs to a caller that overrode the active interval and said nothing about the
+    /// idle one. Applied here it made the file's own value unreachable through `agentbench dashboard` while
+    /// `agentbench-tray` honoured it.
+    #[test]
+    fn a_configured_idle_cadence_survives_the_loader_unscaled() {
+        let file: FileConfig = toml::from_str(
+            "[collect]\nsample_interval = \"5s\"\nsample_interval_idle = \"300s\"\n",
+        )
+        .unwrap();
+        let config = file.resolve(PathBuf::from("/tmp/agentbench")).unwrap();
+        assert_eq!(
+            config.collect.sample_interval_idle,
+            Duration::from_secs(300)
+        );
+    }
+
+    /// The rule that scaling is *for*: a faster active interval with no idle override.
+    #[test]
+    fn an_overridden_active_interval_pulls_an_untouched_idle_one_down_with_it() {
+        let active = Duration::from_secs(1);
+        assert_eq!(
+            idle_following_active(active, Duration::from_secs(30)),
+            active * IDLE_INTERVAL_RATIO
+        );
+        // Already faster than the ratio allows for: scaling must not slow a cadence down.
+        assert_eq!(
+            idle_following_active(Duration::from_secs(60), Duration::from_secs(90)),
+            Duration::from_secs(90)
+        );
     }
 
     /// A probe is real load, so an interval short enough to make probing continuous is clamped rather

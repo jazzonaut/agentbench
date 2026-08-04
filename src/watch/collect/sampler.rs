@@ -45,14 +45,17 @@ impl Sampler {
     /// Take one observation, rediscovering pids first if the discovery interval has elapsed.
     pub fn tick(&mut self, config: &CollectConfig, now_ms: i64) -> Sample {
         if self.ms_since_discovery >= config.discovery_interval.as_millis() as u64 {
-            self.targets = targets::discover(
-                &mut self.system,
-                &config.agent_process_names,
-                &config.scanner_process_names,
-            );
-            self.ms_since_discovery = 0;
+            self.discover(config);
         } else {
-            targets::refresh_watched(&mut self.system, &self.targets);
+            // The live count is what makes the discovery interval a schedule rather than a ceiling. Once
+            // every watched process has gone there is nothing left for the next ticks to refresh, so an
+            // agent that exited and restarted inside the interval would be invisible for up to a minute —
+            // and this is the decay the count was returned for. Rediscovering costs one process-table walk,
+            // and only in the case where the alternative is measuring an empty set.
+            let live = targets::refresh_watched(&mut self.system, &self.targets);
+            if live == 0 && !self.targets.is_empty() {
+                self.discover(config);
+            }
         }
 
         self.system.refresh_specifics(
@@ -88,6 +91,33 @@ impl Sampler {
         let _ = self.tick(config, 0);
     }
 
+    /// Re-enumerate the process table and restart the discovery interval.
+    fn discover(&mut self, config: &CollectConfig) {
+        self.targets = targets::discover(
+            &mut self.system,
+            &config.agent_process_names,
+            &config.scanner_process_names,
+        );
+        self.ms_since_discovery = 0;
+    }
+
+    /// What the configured names matched at the last discovery, for the operational log.
+    ///
+    /// Said once at startup because it is otherwise invisible, and it is the thing most likely to be wrong.
+    /// `agent_process_names` is matched against every process on the machine and each match's whole
+    /// descendant tree has its CPU summed, so a name that matches more than the user meant — the shipped
+    /// `node` on a machine full of language servers and MCP servers — silently tags every probe as contended
+    /// and leaves every verdict reading `insufficient`. A count in the log is how a reader finds that out
+    /// without attaching a debugger to a daemon they cannot see.
+    fn matched_summary(&self, config: &CollectConfig) -> String {
+        format!(
+            "watching {} agent process(es) matching {:?} (descendants included) and {} scanner process(es)",
+            self.targets.agents.len(),
+            config.agent_process_names,
+            self.targets.scanners.len()
+        )
+    }
+
     /// Note that `elapsed_ms` passed, for discovery scheduling.
     pub fn advance(&mut self, elapsed_ms: u64) {
         self.ms_since_discovery = self.ms_since_discovery.saturating_add(elapsed_ms);
@@ -113,6 +143,7 @@ pub fn run(config: &CollectConfig, clock: &dyn Clock, sink: &Sink) {
 
     // Prime, then wait a full interval before the first recorded reading so its CPU delta is real.
     sampler.prime(config);
+    sink.log(Level::Info, "sampler", sampler.matched_summary(config));
     let priming_wait = config
         .sample_interval
         .max(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
@@ -257,10 +288,61 @@ mod tests {
         // One sleep is the priming wait; the rest are cadence sleeps, ending with the refusal.
         let sleeps = clock.sleeps();
         assert_eq!(sleeps.len(), 4, "priming wait plus three permitted ticks");
-        let samples = receiver.iter().count();
+        let samples = receiver
+            .iter()
+            .filter(|record| matches!(record, crate::watch::store::Record::Sample(_)))
+            .count();
         assert_eq!(
             samples, 3,
             "the primed throwaway reading must not be recorded"
+        );
+    }
+
+    /// A target set that has entirely gone is rediscovered rather than refreshed for another minute.
+    #[test]
+    fn a_decayed_target_set_is_rediscovered_before_the_interval_elapses() {
+        let mut sampler = Sampler::new();
+        // A pid nothing can own, standing in for an agent that has exited.
+        sampler
+            .targets
+            .agents
+            .insert(sysinfo::Pid::from_u32(u32::MAX));
+        sampler.ms_since_discovery = 0;
+        let _ = sampler.tick(&config(), 1);
+        assert!(
+            sampler.targets.is_empty(),
+            "a dead target set should have been replaced by a fresh discovery"
+        );
+    }
+
+    /// The control: a live target is not rediscovered away between scheduled walks.
+    #[test]
+    fn a_live_target_set_is_left_to_the_discovery_cadence() {
+        let mut sampler = Sampler::new();
+        let own = sysinfo::Pid::from_u32(std::process::id());
+        sampler.targets.agents.insert(own);
+        sampler.ms_since_discovery = 0;
+        let _ = sampler.tick(&config(), 1);
+        assert!(
+            sampler.targets.agents.contains(&own),
+            "the process is still alive, so there was nothing to rediscover"
+        );
+    }
+
+    /// What the daemon thinks the agent is, which is otherwise invisible.
+    #[test]
+    fn the_startup_summary_reports_what_the_configured_names_matched() {
+        let mut sampler = Sampler::new();
+        let config = config();
+        sampler.prime(&config);
+        let summary = sampler.matched_summary(&config);
+        assert!(
+            summary.contains("watching 0 agent process(es)"),
+            "the count has to be in it: {summary}"
+        );
+        assert!(
+            summary.contains("none"),
+            "so do the names it was matching: {summary}"
         );
     }
 }

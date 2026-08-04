@@ -107,7 +107,11 @@ impl Observer {
     /// sampler narrows them: a full refresh walks the process table, and doing that inside a probe would
     /// make the probe measure itself.
     fn refresh(&mut self) {
-        targets::refresh_watched(&mut self.system, &self.targets);
+        // The live count is discarded here, unlike in the sampler: `prime` rediscovers at the start of every
+        // probe, so a target set cannot decay across one and there is nothing for the count to bring
+        // forward. Rediscovering inside `read` would be worse than useless — the process-table walk is the
+        // expensive part, and doing it here would put it inside the interval whose CPU use is measured.
+        let _live = targets::refresh_watched(&mut self.system, &self.targets);
         self.system.refresh_specifics(
             RefreshKind::nothing()
                 .with_cpu(CpuRefreshKind::nothing().with_cpu_usage())
