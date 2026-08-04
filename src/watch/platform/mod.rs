@@ -110,6 +110,77 @@ pub fn on_battery() -> Option<bool> {
     imp::on_battery()
 }
 
+/// One reading of the conditions a measurement began in, from counters the OS keeps rather than from
+/// anything this process can compute.
+///
+/// Every field is optional for the same reason [`on_battery`] is: a platform that will not answer must
+/// say so. A probe stamped "unknown clock" is still usable; one stamped with a guessed clock is not.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct CounterReading {
+    /// Clock speed as a percentage of the CPU's *nominal* frequency, so it reads above 100 while the
+    /// part is boosting and below 100 while it is throttled.
+    ///
+    /// A ratio rather than a figure in MHz, and deliberately: the absolute frequency available to an
+    /// ordinary process on Windows is a static value copied out of the registry at boot. Measured on the
+    /// development machine, `sysinfo::Cpu::frequency()` and WMI's `CurrentClockSpeed` both reported
+    /// exactly 3801 MHz across thirty-six readings spanning 8% to 98% machine CPU, while this ratio moved
+    /// from 136% idle to 129% with every core loaded. A number that never moves is worse than an absent
+    /// one, because a chart of it looks like a machine that is behaving.
+    pub clock_percent: Option<f32>,
+    /// Bytes per second written to every physical disk on the machine, by anything at all.
+    ///
+    /// Whole-machine and unattributed, which is the point. Per-process counters are attributable and
+    /// *blind*: an unelevated process reads exactly zero bytes for every SYSTEM-owned writer — Defender,
+    /// the update stack, the search indexer — while still reading their CPU, so a figure summed from
+    /// processes cannot see the backups and updates that make a filesystem probe read slow. This one can,
+    /// and cannot say what caused it. [`crate::watch::store::Sample`] carries the attributable version
+    /// beside it; the two answer different questions and neither replaces the other.
+    pub disk_write_bytes_s: Option<f64>,
+}
+
+/// Counters that have to be held open across two readings to mean anything.
+///
+/// Unlike everything else in this module these are not free functions, because a rate is a difference
+/// between two observations and something has to remember the first. The handle is opened once for the
+/// life of the daemon and read four times an hour.
+///
+/// Deliberately shaped like [`crate::watch::collect::probes::covariates::Observer`], whose vocabulary it
+/// borrows: [`Counters::prime`] takes the opening reading, [`Counters::read`] takes the closing one and
+/// returns the interval between them. The prober already waits between those two calls for the CPU
+/// delta's sake, so the rate spans exactly the window the CPU covariate spans and one sentence describes
+/// both.
+pub struct Counters {
+    imp: imp::Counters,
+}
+
+impl Counters {
+    /// Open the counters, reporting whether the platform provided them.
+    ///
+    /// Returns a usable value either way. A `Counters` the OS refused reads absent for ever rather than
+    /// being an `Option` every caller has to unwrap, because "this machine will not say" is a normal
+    /// outcome here and not an error path.
+    pub fn open() -> (Self, Capability) {
+        let (imp, capability) = imp::Counters::open();
+        (Self { imp }, capability)
+    }
+
+    /// Take the opening reading of the pair.
+    pub fn prime(&mut self) {
+        self.imp.prime();
+    }
+
+    /// Take the closing reading, and report the interval between it and the last [`Counters::prime`].
+    ///
+    /// The first reading of a rate is never a rate. On Windows the counter simply has no value to
+    /// format yet; on Linux there is no earlier total to subtract. Both report absent, which is the same
+    /// discipline the sampler's primed CPU reading and the per-process I/O deltas already follow — a
+    /// process's first I/O delta is its whole lifetime's traffic, which on this machine presented as
+    /// 12 GiB written "in one second".
+    pub fn read(&mut self) -> CounterReading {
+        self.imp.read()
+    }
+}
+
 /// Whether this process holds administrative privileges.
 ///
 /// One syscall, no child process. Both readings this replaced spawned one — `net session` on Windows and
@@ -185,6 +256,51 @@ mod tests {
             is_elevated(),
             "two adjacent readings disagree, so at least one was not a reading"
         );
+    }
+
+    /// The first reading of a rate is never a rate, on every platform.
+    ///
+    /// This is the one part of the contract that can be asserted without knowing what the machine is:
+    /// a container has no cpufreq, a virtual disk may report nothing at all, and a busy CI runner
+    /// reports whatever it is doing. What must hold everywhere is that a `Counters` which has been
+    /// collected from once declines to name a throughput, because it has nothing to subtract.
+    #[test]
+    fn a_rate_needs_two_readings_and_says_so_after_one() {
+        let (mut counters, capability) = Counters::open();
+        if !capability.is_applied() {
+            assert!(
+                capability.reason().is_some_and(|reason| !reason.is_empty()),
+                "a refusal has to explain itself"
+            );
+        }
+        assert_eq!(
+            counters.read().disk_write_bytes_s,
+            None,
+            "one reading cannot be a rate"
+        );
+    }
+
+    /// A primed pair either produces a plausible reading or declines, and never produces nonsense.
+    #[test]
+    fn a_primed_pair_reports_plausible_conditions_or_nothing() {
+        let (mut counters, _) = Counters::open();
+        counters.prime();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let reading = counters.read();
+        if let Some(rate) = reading.disk_write_bytes_s {
+            assert!(
+                rate.is_finite() && rate >= 0.0,
+                "a throughput of {rate} is not a reading"
+            );
+        }
+        if let Some(percent) = reading.clock_percent {
+            // No upper bound asserted: the Windows counter is a ratio of *nominal* and legitimately
+            // exceeds 100 while boosting, which is most of the point of collecting it.
+            assert!(
+                percent.is_finite() && percent > 0.0,
+                "a clock of {percent}% is not a reading"
+            );
+        }
     }
 
     /// Asking is safe on every target, and the answer is a reading rather than a coin toss.

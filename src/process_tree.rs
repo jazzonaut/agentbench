@@ -28,8 +28,31 @@ pub struct TreeUsage {
     /// one extra priming reading before the first probe of a session.
     pub cpu_percent: f32,
     pub rss_bytes: u64,
+    /// Bytes read over the whole life of these processes.
     pub read_bytes: u64,
+    /// Bytes written over the whole life of these processes.
     pub written_bytes: u64,
+    /// Bytes written since the previous refresh of these processes.
+    ///
+    /// Carries the same hazard as [`cpu_percent`] and a worse first reading: on the refresh that first
+    /// sees a process this is not a delta at all but its entire lifetime's traffic. Measured on the
+    /// development machine, the first reading of a full process table reported 12.2 GiB written and
+    /// 33.8 GiB read "in one second". A caller therefore has to discard the reading that follows a
+    /// discovery, and must report *absent* rather than zero for it — zero is a claim that nothing was
+    /// written, which is exactly what a busy machine looks like if you get this wrong.
+    ///
+    /// **Attributable but partly blind.** An unelevated process cannot open a SYSTEM-owned process, so
+    /// these counters read exactly zero for Defender, the update stack and the search indexer while
+    /// their CPU still reads correctly. Whole-machine throughput has to come from
+    /// [`crate::watch::platform::CounterReading::disk_write_bytes_s`] instead; this figure answers
+    /// "which of the user's processes", not "how busy was the disk".
+    ///
+    /// [`cpu_percent`]: TreeUsage::cpu_percent
+    pub written_delta_bytes: u64,
+    /// Bytes read since the previous refresh, with the same caveats as [`written_delta_bytes`].
+    ///
+    /// [`written_delta_bytes`]: TreeUsage::written_delta_bytes
+    pub read_delta_bytes: u64,
     pub process_count: usize,
 }
 
@@ -79,7 +102,7 @@ pub fn descendants(system: &System, root: Pid) -> HashSet<Pid> {
     }
 }
 
-/// Sum CPU, resident memory, and cumulative disk bytes over `pids`.
+/// Sum CPU, resident memory, and both the cumulative and per-refresh disk bytes over `pids`.
 ///
 /// Pids that have exited since collection are skipped rather than treated as zero, so
 /// `process_count` reflects what was actually observable.
@@ -92,6 +115,8 @@ pub fn usage<'a>(system: &System, pids: impl IntoIterator<Item = &'a Pid>) -> Tr
             let disk = process.disk_usage();
             usage.read_bytes += disk.total_read_bytes;
             usage.written_bytes += disk.total_written_bytes;
+            usage.written_delta_bytes += disk.written_bytes;
+            usage.read_delta_bytes += disk.read_bytes;
             usage.process_count += 1;
         }
     }

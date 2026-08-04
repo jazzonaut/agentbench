@@ -171,7 +171,15 @@ fn import_once(
             continue;
         }
         let offset = recorded.map_or(0, |position| position.offset);
-        match import::import(&transcript.path, offset, transcript.mtime_ms) {
+        // A transcript nothing has touched for a couple of poll intervals is finished with, and its last
+        // response can be closed. Two intervals rather than one: a session that pauses for exactly the
+        // poll interval is still a live session, and treating it as finished would record a response that
+        // stops where the poll landed. The judgement lives here because this is where the clock is.
+        let settled = clock
+            .now_ms()
+            .saturating_sub(transcript.mtime_ms)
+            > 2 * config.poll_interval.as_millis() as i64;
+        match import::import(&transcript.path, offset, transcript.mtime_ms, settled) {
             Ok((imported, mark)) => {
                 pass.files_read += 1;
                 pass.rows_error += imported.rows_error;

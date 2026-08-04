@@ -93,10 +93,12 @@ fn rollup_chunk(conn: &mut Connection, from_ms: i64, to_ms: i64) -> Result<Summa
         .execute(
             "INSERT INTO samples_1m (machine_id, bucket, samples, cpu_avg, cpu_max,
                  used_memory_avg, used_swap_max, scanner_cpu_max, agent_cpu_max,
-                 process_count_avg, agent_rss_max)
+                 process_count_avg, agent_rss_max, agent_write_bytes_s_max,
+                 scanner_write_bytes_s_max)
              SELECT machine_id, ts / ?3 * ?3, count(*), avg(cpu_percent), max(cpu_percent),
                     cast(round(avg(used_memory)) AS INTEGER), max(used_swap), max(scanner_cpu),
-                    max(agent_cpu), cast(round(avg(process_count)) AS INTEGER), max(agent_rss)
+                    max(agent_cpu), cast(round(avg(process_count)) AS INTEGER), max(agent_rss),
+                    max(agent_write_bytes_s), max(scanner_write_bytes_s)
                FROM samples
               WHERE ts >= ?1 AND ts < ?2
               GROUP BY machine_id, ts / ?3 * ?3

@@ -208,10 +208,15 @@ fn seeded_probe(ts: i64, ops: f64) -> agentbench::watch::store::Record {
         covariates: Covariates {
             cpu_percent: Some(3.0),
             scanner_percent: Some(0.1),
+            agent_percent: Some(0.5),
             agent_active: false,
             contended: false,
             on_battery: Some(false),
+            clock_percent: Some(136.0),
+            disk_write_bytes_s: Some(64_000.0),
+            scratch_free_bytes: Some(110 << 30),
         },
+        processes: Vec::new(),
         metrics: vec![ProbeMetric {
             name: "filesystem.small_file_ops_s".into(),
             value: ops,
@@ -728,6 +733,8 @@ fn retention_summarises_old_samples_and_the_series_survives_it() {
                 agent_cpu: None,
                 agent_rss: None,
                 agent_processes: None,
+                agent_write_bytes_s: None,
+                scanner_write_bytes_s: None,
             }
             .into()
         })

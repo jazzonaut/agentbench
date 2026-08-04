@@ -18,6 +18,25 @@ pub fn redact_text(value: &str) -> String {
     output
 }
 
+/// Free space on the most specific mounted volume containing `path`.
+///
+/// `None` when no mount point matches, which every caller treats as unknown rather than as empty.
+///
+/// Extracted for the same reason [`machine_id`] was: two callers now need it and they must agree. The
+/// benchmark asks before it writes, to refuse a run that would fill the volume; the prober asks on every
+/// probe, because both NTFS and SSDs slow down as a volume fills and that is the one cause of a slow
+/// monotonic drift the dashboard could not previously explain. "Most specific mount point" is the part
+/// worth sharing — on Windows the match is a drive letter, but on Unix a nested mount means the longest
+/// matching prefix is the only correct answer.
+pub fn available_space(path: &Path) -> Option<u64> {
+    let disks = sysinfo::Disks::new_with_refreshed_list();
+    disks
+        .iter()
+        .filter(|disk| path.starts_with(disk.mount_point()))
+        .max_by_key(|disk| disk.mount_point().as_os_str().len())
+        .map(|disk| disk.available_space())
+}
+
 /// Stable, hashed identity of this machine.
 ///
 /// Extracted so that a caller needing only the identity does not have to build a whole [`Inventory`],

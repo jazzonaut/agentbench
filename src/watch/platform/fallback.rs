@@ -2,7 +2,7 @@
 //!
 //! Nothing here pretends to work. The daemon still runs; it simply reports the missing capabilities.
 
-use super::Capability;
+use super::{Capability, CounterReading};
 use anyhow::{Result, bail};
 use std::{fs::File, path::PathBuf};
 
@@ -28,4 +28,24 @@ pub(super) fn is_elevated() -> bool {
 /// one stamped with nothing.
 pub(super) fn on_battery() -> Option<bool> {
     None
+}
+
+/// No performance-counter interface is known here either, for the same reason and with the same answer.
+pub(super) struct Counters;
+
+impl Counters {
+    pub(super) fn open() -> (Self, Capability) {
+        (
+            Self,
+            Capability::Unsupported(
+                "this platform exposes no performance counters for clock or disk throughput".into(),
+            ),
+        )
+    }
+
+    pub(super) fn prime(&mut self) {}
+
+    pub(super) fn read(&mut self) -> CounterReading {
+        CounterReading::default()
+    }
 }

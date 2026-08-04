@@ -40,6 +40,23 @@ pub struct Sample {
     pub agent_cpu: Option<f32>,
     pub agent_rss: Option<u64>,
     pub agent_processes: Option<u64>,
+    /// Bytes per second the agent's process tree wrote over the interval ending at [`ts`].
+    ///
+    /// Absent on the tick that follows a discovery pass, and absent is not zero. `sysinfo` reports a
+    /// newly seen process's first I/O delta as its whole lifetime's traffic, so that one tick would
+    /// otherwise record gigabytes per second and put a spike in the series at every rediscovery — the
+    /// same shape of fault as the unprimed CPU reading, and harder to spot because a build genuinely
+    /// does write hundreds of megabytes.
+    ///
+    /// Writes only. A read is usually served from cache and says little about what the disk was doing,
+    /// whereas a write is what a scanner inspects and what a probe competes with.
+    ///
+    /// [`ts`]: Sample::ts
+    pub agent_write_bytes_s: Option<f64>,
+    /// Bytes per second the security scanners wrote, on the same terms as [`agent_write_bytes_s`].
+    ///
+    /// [`agent_write_bytes_s`]: Sample::agent_write_bytes_s
+    pub scanner_write_bytes_s: Option<f64>,
 }
 
 /// What the machine looked like when a measurement started.
@@ -63,6 +80,18 @@ pub struct Covariates {
     ///
     /// [`cpu_percent`]: Covariates::cpu_percent
     pub scanner_percent: Option<f32>,
+    /// CPU use of the coding agent's process tree, per core like [`scanner_percent`].
+    ///
+    /// Stored beside [`agent_active`] rather than replaced by it, because `agent_active` is a *threshold
+    /// applied at write time* and this is the number it was applied to. The threshold is the one thing in
+    /// this design most likely to be revised — the ADR's last open question is whether it and the default
+    /// process names are right — and without the raw value every row collected under the old constant
+    /// would be stranded: uncomparable to later rows and impossible to reclassify. A verdict that can be
+    /// recomputed from stored facts is worth one column.
+    ///
+    /// [`scanner_percent`]: Covariates::scanner_percent
+    /// [`agent_active`]: Covariates::agent_active
+    pub agent_percent: Option<f32>,
     /// Whether a coding agent was doing work.
     pub agent_active: bool,
     /// Whether anything was already competing for the machine when this started.
@@ -70,6 +99,30 @@ pub struct Covariates {
     /// Absent where the platform will not say. Never guessed: a laptop on battery runs slower for a
     /// reason that has nothing to do with the machine degrading.
     pub on_battery: Option<bool>,
+    /// Clock as a percentage of nominal, from
+    /// [`platform::CounterReading::clock_percent`](crate::watch::platform::CounterReading::clock_percent).
+    ///
+    /// The covariate that explains a slow CPU day. Without it a verdict can say `single-core CPU worse by
+    /// 22%` and the database holds nothing that could say the part was running at two thirds of its usual
+    /// clock. Not in MHz: the absolute figure available to an ordinary process on Windows is a static
+    /// registry value, measured flat at 3801 MHz across readings spanning 8% to 98% machine CPU.
+    pub clock_percent: Option<f32>,
+    /// Whole-machine disk write throughput when the measurement began, in bytes per second.
+    ///
+    /// The gap this closes: `contended` used to be three CPU thresholds, so a probe that ran while an
+    /// update or a backup wrote gigabytes read slow at 15% CPU and was filed as clean data straight into
+    /// the baseline. Two of the five judged series are filesystem measurements, which made that the most
+    /// consequential blind spot in the design.
+    ///
+    /// Unattributed on purpose — see the field's platform documentation for why a figure summed from
+    /// per-process counters cannot answer this question at all.
+    pub disk_write_bytes_s: Option<f64>,
+    /// Free space on the volume the probe writes to, when the measurement began.
+    ///
+    /// Both NTFS and SSDs slow down as a volume fills, which produces exactly the slow monotonic drift
+    /// over months that this tool exists to detect and could not previously explain. Absent when no mount
+    /// point matched, which is unknown rather than full.
+    pub scratch_free_bytes: Option<u64>,
 }
 
 /// One measurement within a run: a metric name, its value, and where it came from.
@@ -133,7 +186,31 @@ impl MetricSource {
     }
 }
 
-/// One probe run: the covariates, and every metric it measured.
+/// What was using the machine most when a probe began.
+///
+/// The covariates say *how much* contention there was; this says *what*. It is the difference between
+/// "small-file operations dropped 30% at 14:00" and "…and `MsMpEng` was at 180% of a core", which is the
+/// whole distance between a number and an explanation.
+///
+/// Free to collect: the prober already walks the process table to discover its targets, so this is a sort
+/// over data in hand. Bounded to a handful of rows per run rather than a table of everything running.
+///
+/// Process names are stored in plain text, like every other identifier in this local database and unlike
+/// every exported artefact. Any future export has to hash them.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ProbeProcess {
+    /// 1 for the largest consumer, so a reader can ask for "the top one" without sorting.
+    pub rank: u8,
+    /// Process name only — never the command line, which carries file paths and sometimes secrets.
+    pub name: String,
+    /// Per core, on `sysinfo`'s scale, so it runs to 100 × cores like every other tree figure here.
+    pub cpu_percent: f32,
+    /// Bytes this process wrote over the covariate window, subject to the same blindness as every
+    /// per-process I/O figure: a SYSTEM-owned writer reports zero here while reporting its CPU.
+    pub write_bytes: u64,
+}
+
+/// One probe run: the covariates, what was competing with it, and every metric it measured.
 ///
 /// The metrics travel with the run rather than as separate records because a metric row is meaningless
 /// without the run row it hangs off, and the run's identity is a rowid the writer only learns on
@@ -142,6 +219,9 @@ impl MetricSource {
 pub struct ProbeRun {
     pub ts: i64,
     pub covariates: Covariates,
+    /// The largest consumers when the run began, in rank order. Empty is a legitimate reading: an idle
+    /// machine has nothing worth naming.
+    pub processes: Vec<ProbeProcess>,
     pub metrics: Vec<ProbeMetric>,
 }
 
@@ -200,6 +280,29 @@ pub struct Turn {
     /// Present only on the request that answers a prompt directly; a continuation driven by a tool
     /// result has no prompt to measure from.
     pub first_response_ms: Option<i64>,
+    /// Interval from the first row of this request to its last, which is how long the response took to
+    /// arrive once it had started.
+    ///
+    /// The point of having it is [`output_tokens`] divided by it: an output-token rate cancels the one
+    /// thing that makes [`first_response_ms`] unjudgeable, which is that a model deciding to think for
+    /// longer moves it. Tokens per second describes the service; a raw wait describes the conversation.
+    ///
+    /// Absent for a request that emitted only one row, which is a little over a third of them —
+    /// measured across 411 real transcripts, 1,844 of 2,926 requests emit more than one. A span of zero
+    /// is not a span.
+    ///
+    /// It is the interval to when Claude Code *wrote* the last row, not to when generation ended, and it
+    /// is charted rather than judged for that reason among others.
+    ///
+    /// [`output_tokens`]: Turn::output_tokens
+    /// [`first_response_ms`]: Turn::first_response_ms
+    pub generation_ms: Option<i64>,
+    /// Whether this request belongs to a subagent rather than to the session a person is talking to.
+    ///
+    /// Recorded so the question can be asked at all. Subagent work is real work on this machine and is
+    /// imported either way, but a workflow that spawns twenty explorers has a different tool mix from a
+    /// person editing one file, and until now nothing in the database could tell the two apart.
+    pub sidechain: bool,
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub cache_read: i64,
@@ -218,6 +321,11 @@ pub struct ToolCall {
     /// False for an error, an interruption, or a denied permission. Such a call returns early and
     /// would deflate a latency series, so charts exclude it.
     pub ok: bool,
+    /// Whether a subagent made this call rather than the session a person is talking to.
+    ///
+    /// See [`Turn::sidechain`]. Recorded on both tables because the two are aggregated separately and a
+    /// filter available on one but not the other would be a trap.
+    pub sidechain: bool,
 }
 
 /// A version of an external tool, observed at a point in time.

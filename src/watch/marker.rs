@@ -150,11 +150,20 @@ fn observe() -> Covariates {
         cpu_percent: Some(cpu),
         // No process discovery, so no scanner or agent attribution is claimed rather than guessed at.
         scanner_percent: None,
+        agent_percent: None,
         agent_active: false,
         // A benchmark is a controlled measurement of a machine it is about to saturate itself, so the
         // only contention worth recording is what was already there.
         contended: cpu > BENCH_BUSY_CPU_PERCENT,
         on_battery: platform::on_battery(),
+        // The counter-based conditions are deliberately not collected here. They need a handle held open
+        // across two readings, and this code path is a short-lived process that writes one row and exits —
+        // it would pay the full cost of opening a query to read a rate over a window it invented. A
+        // benchmark's own numbers are the measurement; these covariates exist to explain *probes*, whose
+        // values are small enough for the machine's state to dominate them.
+        clock_percent: None,
+        disk_write_bytes_s: None,
+        scratch_free_bytes: None,
     }
 }
 
@@ -191,6 +200,9 @@ fn record(
         let run = ProbeRun {
             ts: marker.started,
             covariates,
+            // A benchmark does no process discovery, so it has no ranked consumers to offer. Empty rather
+            // than absent: the table simply has no rows for this run, which reads correctly everywhere.
+            processes: Vec::new(),
             metrics: metrics
                 .iter()
                 .map(|metric| ProbeMetric::from_metric(metric, MetricSource::Bench))
@@ -216,9 +228,14 @@ mod tests {
         Covariates {
             cpu_percent: Some(72.0),
             scanner_percent: None,
+            agent_percent: None,
             agent_active: false,
             contended: true,
             on_battery: Some(false),
+            // A marker never collects these; see [`observe`].
+            clock_percent: None,
+            disk_write_bytes_s: None,
+            scratch_free_bytes: None,
         }
     }
 

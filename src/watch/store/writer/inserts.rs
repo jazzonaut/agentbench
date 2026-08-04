@@ -25,8 +25,9 @@ const EVENT_RETENTION: i64 = 5_000;
 pub fn sample(tx: &Transaction<'_>, machine_id: &str, sample: &Sample) -> Result<()> {
     tx.prepare_cached(
         "INSERT OR REPLACE INTO samples (machine_id, ts, cpu_percent, used_memory, total_memory,
-             used_swap, process_count, scanner_cpu, agent_cpu, agent_rss, agent_processes)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+             used_swap, process_count, scanner_cpu, agent_cpu, agent_rss, agent_processes,
+             agent_write_bytes_s, scanner_write_bytes_s)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
     )?
     .execute(params![
         machine_id,
@@ -40,6 +41,8 @@ pub fn sample(tx: &Transaction<'_>, machine_id: &str, sample: &Sample) -> Result
         sample.agent_cpu,
         sample.agent_rss.map(|bytes| bytes as i64),
         sample.agent_processes.map(|count| count as i64),
+        sample.agent_write_bytes_s,
+        sample.scanner_write_bytes_s,
     ])
     .context("insert sample")?;
     Ok(())
@@ -56,9 +59,9 @@ pub fn sample(tx: &Transaction<'_>, machine_id: &str, sample: &Sample) -> Result
 /// the whole run over a duplicate would discard the covariates too.
 pub fn probe_run(tx: &Transaction<'_>, machine_id: &str, run: &ProbeRun) -> Result<()> {
     tx.prepare_cached(
-        "INSERT INTO probe_runs (machine_id, ts, contended, cpu_at, scanner_at, agent_active,
-             on_battery)
-         VALUES (?1,?2,?3,?4,?5,?6,?7)",
+        "INSERT INTO probe_runs (machine_id, ts, contended, cpu_at, scanner_at, agent_at,
+             agent_active, on_battery, clock_percent, disk_write_bytes_s, scratch_free_bytes)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
     )?
     .execute(params![
         machine_id,
@@ -66,8 +69,12 @@ pub fn probe_run(tx: &Transaction<'_>, machine_id: &str, run: &ProbeRun) -> Resu
         run.covariates.contended as i64,
         run.covariates.cpu_percent,
         run.covariates.scanner_percent,
+        run.covariates.agent_percent,
         run.covariates.agent_active as i64,
         run.covariates.on_battery.map(|value| value as i64),
+        run.covariates.clock_percent,
+        run.covariates.disk_write_bytes_s,
+        run.covariates.scratch_free_bytes.map(|bytes| bytes as i64),
     ])
     .context("insert probe run")?;
     let run_id = tx.last_insert_rowid();
@@ -87,6 +94,24 @@ pub fn probe_run(tx: &Transaction<'_>, machine_id: &str, run: &ProbeRun) -> Resu
                 metric.source.as_str(),
             ])
             .with_context(|| format!("insert probe metric {}", metric.name))?;
+    }
+
+    // `OR REPLACE` for the same reason the metrics use it: `(run_id, rank)` is the key, and a duplicate
+    // rank is not worth losing a run's covariates over.
+    let mut consumer = tx.prepare_cached(
+        "INSERT OR REPLACE INTO probe_processes (run_id, rank, name, cpu_percent, write_bytes)
+         VALUES (?1,?2,?3,?4,?5)",
+    )?;
+    for process in &run.processes {
+        consumer
+            .execute(params![
+                run_id,
+                process.rank,
+                process.name,
+                process.cpu_percent,
+                process.write_bytes as i64,
+            ])
+            .with_context(|| format!("insert probe consumer {}", process.name))?;
     }
     Ok(())
 }
@@ -151,8 +176,8 @@ pub fn turn(tx: &Transaction<'_>, machine_id: &str, turn: &Turn) -> Result<()> {
     tx.prepare_cached(
         "INSERT OR IGNORE INTO session_turns (uuid, machine_id, ts, project, branch, model, effort,
              service_tier, first_response_ms, input_tokens, output_tokens, cache_read, cache_create,
-             session_id, request_id)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+             session_id, request_id, generation_ms, sidechain)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
     )?
     .execute(params![
         turn.uuid,
@@ -170,6 +195,8 @@ pub fn turn(tx: &Transaction<'_>, machine_id: &str, turn: &Turn) -> Result<()> {
         turn.cache_create,
         turn.session_id,
         turn.request_id,
+        turn.generation_ms,
+        turn.sidechain as i64,
     ])
     .context("insert session turn")?;
     Ok(())
@@ -178,8 +205,9 @@ pub fn turn(tx: &Transaction<'_>, machine_id: &str, turn: &Turn) -> Result<()> {
 /// One timed tool call. Idempotent on the result row's uuid.
 pub fn tool_call(tx: &Transaction<'_>, machine_id: &str, call: &ToolCall) -> Result<()> {
     tx.prepare_cached(
-        "INSERT OR IGNORE INTO session_tools (uuid, machine_id, ts, project, tool, duration_ms, ok)
-         VALUES (?1,?2,?3,?4,?5,?6,?7)",
+        "INSERT OR IGNORE INTO session_tools (uuid, machine_id, ts, project, tool, duration_ms, ok,
+             sidechain)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
     )?
     .execute(params![
         call.uuid,
@@ -189,6 +217,7 @@ pub fn tool_call(tx: &Transaction<'_>, machine_id: &str, call: &ToolCall) -> Res
         call.tool,
         call.duration_ms,
         call.ok as i64,
+        call.sidechain as i64,
     ])
     .context("insert session tool call")?;
     Ok(())

@@ -324,6 +324,8 @@ mod tests {
             agent_cpu: None,
             agent_rss: None,
             agent_processes: None,
+            agent_write_bytes_s: None,
+            scanner_write_bytes_s: None,
         }
     }
 

@@ -2,6 +2,10 @@
 //!
 //! Distinct from [`crate::SCHEMA_VERSION`], which versions exported JSON reports. Adding a migration
 //! means appending to [`MIGRATIONS`]; existing entries are immutable once released.
+//!
+//! There is one entry, and that is deliberate rather than the state of a young project: five of them
+//! existed and were collapsed before 0.7.0, because no release had shipped any of them and they
+//! described an upgrade from a database that exists nowhere. See [`super::schema`].
 
 use anyhow::{Result, bail};
 use rusqlite::Connection;
@@ -12,28 +16,10 @@ struct Migration {
     sql: &'static str,
 }
 
-const MIGRATIONS: &[Migration] = &[
-    Migration {
-        version: 1,
-        sql: super::schema::CREATE_V1,
-    },
-    Migration {
-        version: 2,
-        sql: super::schema::ALTER_V2,
-    },
-    Migration {
-        version: 3,
-        sql: super::schema::ALTER_V3,
-    },
-    Migration {
-        version: 4,
-        sql: super::schema::ALTER_V4,
-    },
-    Migration {
-        version: 5,
-        sql: super::schema::ALTER_V5,
-    },
-];
+const MIGRATIONS: &[Migration] = &[Migration {
+    version: 1,
+    sql: super::schema::CREATE_V1,
+}];
 
 /// Version this build expects after migrating.
 pub fn target_version() -> u32 {
@@ -48,9 +34,15 @@ pub fn migrate(conn: &mut Connection) -> Result<u32> {
     let current: u32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     let target = target_version();
     if current > target {
+        // Reachable two ways, and the message has to serve both. A genuinely newer build is the case
+        // this guard was written for. The other is a database written by 0.6.x, whose schema counter had
+        // reached 5 before the migrations were collapsed — so on the machines that were collecting
+        // during development, "newer" means "older", and the remedy is to move the file aside rather
+        // than to install anything.
         bail!(
-            "database schema version {current} is newer than this build understands ({target}); \
-             upgrade AgentBench or point --data-dir at a different directory"
+            "database schema version {current} is not one this build understands ({target}); \
+             either it was written by a newer AgentBench, or it predates the 0.7.0 schema reset — \
+             move the file aside or point --data-dir somewhere else"
         );
     }
     for migration in MIGRATIONS.iter().filter(|m| m.version > current) {
@@ -102,6 +94,7 @@ mod tests {
             "samples_1m",
             "probe_runs",
             "probe_metrics",
+            "probe_processes",
             "session_turns",
             "session_tools",
             "run_markers",
@@ -120,51 +113,36 @@ mod tests {
         }
     }
 
-    /// Databases written by the phase-1 build exist on real machines, so v2 has to reach them.
+    /// Every passive series the dashboard can chart needs a rollup column, or its history stops dead at
+    /// the retention boundary while the chart beside it keeps going.
+    ///
+    /// Asserted against the columns rather than against a list in prose, because the failure is silent:
+    /// nothing writes to `samples_1m` until a fortnight has passed on a real machine.
     #[test]
-    fn a_v1_database_gains_the_session_turn_corrections() {
+    fn every_raw_sample_column_has_a_rollup_counterpart() {
         let mut conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(crate::watch::store::schema::CREATE_V1)
-            .unwrap();
-        conn.pragma_update(None, "user_version", 1).unwrap();
-
         migrate(&mut conn).unwrap();
-
-        let column = |name: &str| -> u32 {
+        let column = |table: &str, name: &str| -> u32 {
             conn.query_row(
-                "SELECT count(*) FROM pragma_table_info('session_turns') WHERE name = ?1",
+                &format!("SELECT count(*) FROM pragma_table_info('{table}') WHERE name = ?1"),
                 [name],
                 |row| row.get(0),
             )
             .unwrap()
         };
-        assert_eq!(column("first_response_ms"), 1, "the honest name");
-        assert_eq!(column("ttft_ms"), 0, "the misleading one is gone");
-        assert_eq!(column("session_id"), 1);
-        assert_eq!(column("request_id"), 1);
-    }
-
-    /// The rollup target has to reach every series the dashboard advertises, on old databases too.
-    #[test]
-    fn a_v2_database_gains_the_rollup_columns_retention_needs() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(crate::watch::store::schema::CREATE_V1)
-            .unwrap();
-        conn.execute_batch(crate::watch::store::schema::ALTER_V2)
-            .unwrap();
-        conn.pragma_update(None, "user_version", 2).unwrap();
-
-        migrate(&mut conn).unwrap();
-
-        for name in ["process_count_avg", "agent_rss_max"] {
-            let found: u32 = conn
-                .query_row(
-                    "SELECT count(*) FROM pragma_table_info('samples_1m') WHERE name = ?1",
-                    [name],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert_eq!(found, 1, "samples_1m.{name} missing");
+        for (raw, rolled) in [
+            ("cpu_percent", "cpu_avg"),
+            ("used_memory", "used_memory_avg"),
+            ("used_swap", "used_swap_max"),
+            ("process_count", "process_count_avg"),
+            ("scanner_cpu", "scanner_cpu_max"),
+            ("agent_cpu", "agent_cpu_max"),
+            ("agent_rss", "agent_rss_max"),
+            ("agent_write_bytes_s", "agent_write_bytes_s_max"),
+            ("scanner_write_bytes_s", "scanner_write_bytes_s_max"),
+        ] {
+            assert_eq!(column("samples", raw), 1, "samples.{raw} missing");
+            assert_eq!(column("samples_1m", rolled), 1, "samples_1m.{rolled} missing");
         }
     }
 
@@ -201,22 +179,37 @@ mod tests {
         assert_eq!(tokens, 400, "tokens must not be counted twice");
     }
 
-    /// Retention filters on `ts` alone, and on an existing database there was nothing to serve it.
+    /// A version seen twice is one row, which is what stops this table growing by a row per poll.
     #[test]
-    fn a_v3_database_gains_the_index_retention_scans_on() {
+    fn a_tool_version_is_keyed_on_the_version_rather_than_the_sighting() {
         let mut conn = Connection::open_in_memory().unwrap();
-        for sql in [
-            crate::watch::store::schema::CREATE_V1,
-            crate::watch::store::schema::ALTER_V2,
-            crate::watch::store::schema::ALTER_V3,
-        ] {
-            conn.execute_batch(sql).unwrap();
-        }
-        conn.pragma_update(None, "user_version", 3).unwrap();
-
         migrate(&mut conn).unwrap();
+        conn.execute(
+            "INSERT INTO machines (id, hostname_hash, os, os_version, architecture, cpu,
+                 logical_cores, memory_bytes, first_seen, last_seen)
+             VALUES ('m', 'm', 'os', '1', 'x86_64', 'cpu', 1, 0, 0, 0)",
+            [],
+        )
+        .unwrap();
+        let insert = |ts: i64| {
+            conn.execute(
+                "INSERT INTO tool_versions (machine_id, ts, tool, version)
+                 VALUES ('m', ?1, 'claude-code', '2.1.187')",
+                [ts],
+            )
+        };
+        insert(5_000).unwrap();
+        assert!(
+            insert(6_000).is_err(),
+            "the version, not the instant, has to be the key"
+        );
+    }
 
-        // The plan, not merely the index's existence: an index the planner will not use is no fix.
+    /// Retention filters on `ts` alone, and the planner has to use the index for it.
+    #[test]
+    fn retention_does_not_full_scan_the_sample_table() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrate(&mut conn).unwrap();
         let plan: String = conn
             .query_row(
                 "EXPLAIN QUERY PLAN SELECT min(ts) FROM samples WHERE ts < 1",
@@ -230,78 +223,15 @@ mod tests {
         );
     }
 
-    /// Real databases hold a row per sighting, so v5 has to collapse them without losing the first one.
     #[test]
-    fn a_v4_database_collapses_its_tool_version_history_to_one_row_per_version() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        // As the writer opens it. This migration drops and renames a table whose rows reference
-        // `machines`, and enforcement being on is the difference between an upgrade and a failure to start.
-        conn.pragma_update(None, "foreign_keys", true).unwrap();
-        for sql in [
-            crate::watch::store::schema::CREATE_V1,
-            crate::watch::store::schema::ALTER_V2,
-            crate::watch::store::schema::ALTER_V3,
-            crate::watch::store::schema::ALTER_V4,
-        ] {
-            conn.execute_batch(sql).unwrap();
-        }
-        conn.pragma_update(None, "user_version", 4).unwrap();
-        conn.execute(
-            "INSERT INTO machines (id, hostname_hash, os, os_version, architecture, cpu,
-                 logical_cores, memory_bytes, first_seen, last_seen)
-             VALUES ('m', 'm', 'os', '1', 'x86_64', 'cpu', 1, 0, 0, 0)",
-            [],
-        )
-        .unwrap();
-        // What a fortnight of polling actually left behind: the same version, over and over.
-        for ts in [5_000, 6_000, 7_000, 8_000] {
-            conn.execute(
-                "INSERT INTO tool_versions (machine_id, ts, tool, version)
-                 VALUES ('m', ?1, 'claude-code', '2.1.187')",
-                [ts],
-            )
-            .unwrap();
-        }
-        conn.execute(
-            "INSERT INTO tool_versions (machine_id, ts, tool, version)
-             VALUES ('m', 9_000, 'claude-code', '2.2.0')",
-            [],
-        )
-        .unwrap();
-
-        migrate(&mut conn).unwrap();
-
-        let rows: Vec<(String, i64)> = conn
-            .prepare("SELECT version, ts FROM tool_versions ORDER BY ts")
-            .unwrap()
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap();
-        assert_eq!(
-            rows,
-            vec![("2.1.187".to_string(), 5_000), ("2.2.0".to_string(), 9_000)],
-            "five sightings of two versions must become two rows at their first sightings"
-        );
-
-        // The new key is what stops the table growing again, so the write has to be refused without it.
-        let duplicate = conn.execute(
-            "INSERT INTO tool_versions (machine_id, ts, tool, version)
-             VALUES ('m', 10_000, 'claude-code', '2.1.187')",
-            [],
-        );
-        assert!(
-            duplicate.is_err(),
-            "the version, not the instant, has to be the key"
-        );
-    }
-
-    #[test]
-    fn a_newer_database_is_refused_rather_than_downgraded() {
+    fn an_unrecognised_schema_version_is_refused_rather_than_touched() {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "user_version", target_version() + 5)
             .unwrap();
         let error = migrate(&mut conn).unwrap_err().to_string();
-        assert!(error.contains("newer than this build"), "{error}");
+        assert!(error.contains("not one this build understands"), "{error}");
+        // The remedy has to be in the message: the likeliest cause is a database from the development
+        // line, whose counter had reached 5, and "upgrade AgentBench" would be advice that cannot work.
+        assert!(error.contains("move the file aside"), "{error}");
     }
 }

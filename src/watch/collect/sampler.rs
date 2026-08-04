@@ -24,6 +24,12 @@ pub struct Sampler {
     system: System,
     targets: Targets,
     ms_since_discovery: u64,
+    /// Timestamp of the previous recorded observation, for turning an I/O delta into a rate.
+    ///
+    /// Taken from the readings themselves rather than from the interval the loop slept, because the two
+    /// are not the same number: the delta `sysinfo` reports spans refresh to refresh, and a machine that
+    /// suspended between them slept for longer than anybody asked it to.
+    previous_ts: Option<i64>,
 }
 
 impl Default for Sampler {
@@ -39,13 +45,16 @@ impl Sampler {
             system: System::new(),
             targets: Targets::default(),
             ms_since_discovery: u64::MAX,
+            previous_ts: None,
         }
     }
 
     /// Take one observation, rediscovering pids first if the discovery interval has elapsed.
     pub fn tick(&mut self, config: &CollectConfig, now_ms: i64) -> Sample {
+        let mut rediscovered = false;
         if self.ms_since_discovery >= config.discovery_interval.as_millis() as u64 {
             self.discover(config);
+            rediscovered = true;
         } else {
             // The live count is what makes the discovery interval a schedule rather than a ceiling. Once
             // every watched process has gone there is nothing left for the next ticks to refresh, so an
@@ -55,6 +64,7 @@ impl Sampler {
             let live = targets::refresh_watched(&mut self.system, &self.targets);
             if live == 0 && !self.targets.is_empty() {
                 self.discover(config);
+                rediscovered = true;
             }
         }
 
@@ -66,6 +76,24 @@ impl Sampler {
 
         let agents = process_tree::usage(&self.system, &self.targets.agents);
         let scanners = process_tree::usage(&self.system, &self.targets.scanners);
+
+        // A rate needs a previous reading of the same processes, and a discovery pass destroys that: the
+        // first I/O delta `sysinfo` reports for a process it has just seen is the process's whole
+        // lifetime's traffic, which on this machine presented as 12 GiB written "in one second". So the
+        // tick that rediscovered reports absent, and absent is not zero — zero would claim the disk was
+        // quiet, which is precisely what a busy machine would then look like.
+        let elapsed_ms = self
+            .previous_ts
+            .filter(|previous| now_ms > *previous)
+            .map(|previous| now_ms - previous);
+        self.previous_ts = Some(now_ms);
+        let rate = |delta: u64, processes: usize| -> Option<f64> {
+            if rediscovered || processes == 0 {
+                return None;
+            }
+            let ms = elapsed_ms?;
+            Some(delta as f64 * 1_000.0 / ms as f64)
+        };
 
         Sample {
             ts: now_ms,
@@ -79,6 +107,8 @@ impl Sampler {
             agent_cpu: (agents.process_count > 0).then_some(agents.cpu_percent),
             agent_rss: (agents.process_count > 0).then_some(agents.rss_bytes),
             agent_processes: (agents.process_count > 0).then_some(agents.process_count as u64),
+            agent_write_bytes_s: rate(agents.written_delta_bytes, agents.process_count),
+            scanner_write_bytes_s: rate(scanners.written_delta_bytes, scanners.process_count),
         }
     }
 
@@ -89,6 +119,11 @@ impl Sampler {
     /// a phantom spike at the start of every daemon session and pollute any baseline computed from it.
     pub fn prime(&mut self, config: &CollectConfig) {
         let _ = self.tick(config, 0);
+        // The throwaway reading was stamped with a placeholder, so it must not become the instant the
+        // first real rate is measured from — the interval between them would be the whole Unix epoch.
+        // Clearing it costs the first recorded sample its write rates, which is one absent reading at
+        // startup and the same price the CPU reading already pays.
+        self.previous_ts = None;
     }
 
     /// Re-enumerate the process table and restart the discovery interval.
@@ -206,6 +241,8 @@ mod tests {
             agent_cpu,
             agent_rss: None,
             agent_processes: None,
+            agent_write_bytes_s: None,
+            scanner_write_bytes_s: None,
         }
     }
 
@@ -326,6 +363,70 @@ mod tests {
         assert!(
             sampler.targets.agents.contains(&own),
             "the process is still alive, so there was nothing to rediscover"
+        );
+    }
+
+    /// A write rate is absent on the tick that rediscovered, and absent is not zero.
+    ///
+    /// This is the fault the priming rule exists to prevent, and it is worth a test because the artefact
+    /// is plausible: a first I/O delta is the process's whole lifetime's traffic, so the bogus reading
+    /// looks like a real build writing hundreds of megabytes rather than like an obvious error. Measured
+    /// on the development machine, an unguarded first reading of the full process table reported 12.2 GiB
+    /// written in a one-second window.
+    ///
+    /// Asserted against this process as its own agent, so the target set is never empty and the rate has
+    /// something to be absent *about*.
+    #[test]
+    fn a_write_rate_is_absent_until_two_readings_of_the_same_processes_exist() {
+        let mut config = config();
+        let own = {
+            let mut probe = System::new();
+            probe.refresh_processes_specifics(
+                sysinfo::ProcessesToUpdate::All,
+                true,
+                targets::process_refresh_kind(),
+            );
+            probe
+                .process(sysinfo::Pid::from_u32(std::process::id()))
+                .map(|process| process.name().to_string_lossy().into_owned())
+                .expect("own process is visible")
+        };
+        config.agent_process_names = vec![own];
+        // A long discovery interval, so only the first tick rediscovers.
+        config.discovery_interval = Duration::from_secs(3_600);
+
+        let mut sampler = Sampler::new();
+        let first = sampler.tick(&config, 1_000);
+        assert!(
+            first.agent_processes.is_some_and(|count| count > 0),
+            "this process should have matched itself"
+        );
+        assert_eq!(
+            first.agent_write_bytes_s, None,
+            "the tick that discovered has a lifetime total, not a rate"
+        );
+
+        sampler.advance(5_000);
+        let second = sampler.tick(&config, 6_000);
+        // Now there are two readings of the same pids, so a rate is computable. Its value depends on what
+        // this process happened to write and is not asserted; that it is a *number* is the contract.
+        assert!(
+            second
+                .agent_write_bytes_s
+                .is_none_or(|rate| rate.is_finite() && rate >= 0.0),
+            "a rate of {:?} is not a reading",
+            second.agent_write_bytes_s
+        );
+    }
+
+    /// Priming must not leave its placeholder timestamp behind as the start of the first interval.
+    #[test]
+    fn priming_does_not_become_the_instant_a_rate_is_measured_from() {
+        let mut sampler = Sampler::new();
+        sampler.prime(&config());
+        assert_eq!(
+            sampler.previous_ts, None,
+            "a reading stamped 0 and discarded cannot anchor an interval"
         );
     }
 

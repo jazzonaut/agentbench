@@ -59,6 +59,10 @@ pub fn run(config: &CollectConfig, data_dir: &Path, clock: &dyn Clock, sink: &Si
     );
 
     let mut observer = Observer::new();
+    // Said once, beside the cadence: two covariates that are permanently absent on a platform which
+    // declines to report them look identical to a collector that has broken, and only the log can tell
+    // a reader which it is.
+    sink.log(Level::Info, "prober", observer.conditions_note());
     // The prober owns no cancellation of its own: the clock already knows when to stop, and a workload
     // that checks a flag it can never see set is a workload that reads no flag at all.
     let cancel = Arc::new(AtomicBool::new(false));
@@ -115,7 +119,7 @@ pub fn run(config: &CollectConfig, data_dir: &Path, clock: &dyn Clock, sink: &Si
         }
         // Read before any workload runs. There is no second reading afterwards, because its CPU delta
         // would span the probe and report the probe's own footprint as contention.
-        let covariates = observer.read();
+        let observation = observer.read(scratch.path());
 
         let outcome = workloads::run(scratch.path(), config.probe_network, &cancel);
 
@@ -135,7 +139,8 @@ pub fn run(config: &CollectConfig, data_dir: &Path, clock: &dyn Clock, sink: &Si
         // start is harder to reason about than one that is exactly the end.
         sink.send(ProbeRun {
             ts: clock.now_ms(),
-            covariates,
+            covariates: observation.covariates,
+            processes: observation.consumers,
             metrics: outcome.metrics,
         });
     }

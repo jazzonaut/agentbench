@@ -11,8 +11,8 @@ pub mod schema;
 pub mod writer;
 
 pub use records::{
-    Covariates, Event, ForgetWatermarks, Level, Maintenance, MetricSource, ProbeMetric, ProbeRun,
-    Record, RunMarker, Sample, ToolCall, ToolVersion, Turn, Watermark,
+    Covariates, Event, ForgetWatermarks, Level, Maintenance, MetricSource, ProbeMetric,
+    ProbeProcess, ProbeRun, Record, RunMarker, Sample, ToolCall, ToolVersion, Turn, Watermark,
 };
 pub use writer::{Sink, WriterHealth};
 
@@ -230,6 +230,8 @@ mod tests {
             agent_cpu: Some(12.0),
             agent_rss: Some(512 << 20),
             agent_processes: Some(3),
+            agent_write_bytes_s: Some(1_048_576.0),
+            scanner_write_bytes_s: None,
         }
     }
 
@@ -389,6 +391,8 @@ mod tests {
             effort: Some("high".into()),
             service_tier: Some("standard".into()),
             first_response_ms: Some(4_200),
+            generation_ms: Some(2_100),
+            sidechain: false,
             input_tokens: 10,
             output_tokens: 20,
             cache_read: 900,
@@ -404,6 +408,7 @@ mod tests {
             tool: "Read".into(),
             duration_ms: 11,
             ok: true,
+            sidechain: false,
         }));
         // The same version again, later: what the importer emits on every pass that reads new bytes, and
         // what used to leave a row per poll in a table nothing prunes.

@@ -1,6 +1,7 @@
-//! Unix implementations: XDG/Application Support paths, `flock`, and nice/idle-I/O scheduling.
+//! Unix implementations: XDG/Application Support paths, `flock`, nice/idle-I/O scheduling, and the
+//! sysfs/procfs counters Linux exposes for free.
 
-use super::Capability;
+use super::{Capability, CounterReading};
 use anyhow::{Context, Result, bail};
 use std::{env, fs::File, os::unix::io::AsRawFd, path::PathBuf};
 
@@ -175,6 +176,156 @@ pub(super) fn on_battery() -> Option<bool> {
 pub(super) fn is_elevated() -> bool {
     // SAFETY: geteuid cannot fail, takes no arguments and touches no memory.
     unsafe { libc::geteuid() == 0 }
+}
+
+/// Live conditions from procfs and sysfs, both of which are world-readable.
+///
+/// No handle to open and nothing to close, unlike the Windows counterpart: what has to be remembered is
+/// the opening total, because `/proc/diskstats` is cumulative and the rate is ours to compute.
+#[cfg(target_os = "linux")]
+pub(super) struct Counters {
+    /// Sectors written across every whole device, and when that was read.
+    opening: Option<(u64, std::time::Instant)>,
+}
+
+#[cfg(target_os = "linux")]
+impl Counters {
+    pub(super) fn open() -> (Self, Capability) {
+        let counters = Self { opening: None };
+        // Both readings are plain file reads, so the only thing worth reporting is whether the files a
+        // container or an unusual kernel might not have are actually there.
+        let capability = match (
+            std::path::Path::new(DISKSTATS).exists(),
+            clock_percent().is_some(),
+        ) {
+            (true, true) => Capability::Applied,
+            (disk, clock) => Capability::Unsupported(format!(
+                "{} unavailable{}",
+                if disk { "cpufreq" } else { DISKSTATS },
+                if disk || clock {
+                    ""
+                } else {
+                    " and cpufreq is absent too"
+                }
+            )),
+        };
+        (counters, capability)
+    }
+
+    pub(super) fn prime(&mut self) {
+        self.opening = sectors_written().map(|total| (total, std::time::Instant::now()));
+    }
+
+    pub(super) fn read(&mut self) -> CounterReading {
+        let closing = sectors_written().map(|total| (total, std::time::Instant::now()));
+        let rate = match (self.opening, closing) {
+            (Some((before, at)), Some((after, now))) => {
+                let seconds = now.duration_since(at).as_secs_f64();
+                // A counter that went backwards is a device that was removed, not negative throughput.
+                (seconds > 0.0 && after >= before)
+                    .then(|| (after - before) as f64 * SECTOR_BYTES as f64 / seconds)
+            }
+            _ => None,
+        };
+        self.opening = closing;
+        CounterReading {
+            clock_percent: clock_percent(),
+            disk_write_bytes_s: rate,
+        }
+    }
+}
+
+/// Every other Unix reports nothing, which is true rather than convenient.
+///
+/// macOS has no equivalent it can be asked cheaply: the disk figure lives behind IOKit, which would mean a
+/// new dependency for one covariate, and the CPU's live clock is not exposed to an ordinary process at
+/// all. A guessed clock would be the worst outcome — see [`CounterReading::clock_percent`].
+#[cfg(not(target_os = "linux"))]
+pub(super) struct Counters;
+
+#[cfg(not(target_os = "linux"))]
+impl Counters {
+    pub(super) fn open() -> (Self, Capability) {
+        (
+            Self,
+            Capability::Unsupported(
+                "this platform exposes neither a live clock ratio nor whole-machine disk throughput \
+                 to an unprivileged process"
+                    .into(),
+            ),
+        )
+    }
+
+    pub(super) fn prime(&mut self) {}
+
+    pub(super) fn read(&mut self) -> CounterReading {
+        CounterReading::default()
+    }
+}
+
+/// Kernel-reported block I/O totals. Cumulative, so a rate is the caller's to compute.
+#[cfg(target_os = "linux")]
+const DISKSTATS: &str = "/proc/diskstats";
+
+/// `/proc/diskstats` counts sectors, and the unit there is fixed at 512 bytes regardless of the
+/// device's real sector size. Not `logical_block_size`: the kernel normalises before reporting.
+#[cfg(target_os = "linux")]
+const SECTOR_BYTES: u64 = 512;
+
+/// Sectors written across every whole block device.
+///
+/// Whole devices only, established by asking whether `/sys/block/<name>` exists. Partitions appear in
+/// `/proc/diskstats` beside the disk that contains them, so summing every line would count the same write
+/// twice — and `dm-` and `md` devices stack, which would count some of them three times.
+#[cfg(target_os = "linux")]
+fn sectors_written() -> Option<u64> {
+    let text = std::fs::read_to_string(DISKSTATS).ok()?;
+    let mut total = 0_u64;
+    for line in text.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        // major, minor, name, then four read fields before the write ones.
+        let (Some(name), Some(written)) = (fields.get(2), fields.get(9)) else {
+            continue;
+        };
+        if !std::path::Path::new("/sys/block").join(name).exists() {
+            continue;
+        }
+        total = total.saturating_add(written.parse::<u64>().unwrap_or(0));
+    }
+    Some(total)
+}
+
+/// Current clock as a percentage of the maximum this CPU advertises, averaged over the cores that say.
+///
+/// `scaling_cur_freq` against `cpuinfo_max_freq`, both in kHz. Absent where cpufreq is not built or not
+/// exposed, which is what a virtual machine usually looks like. Note the ceiling differs from the Windows
+/// counterpart's: this is a percentage of *maximum*, so it reaches 100 rather than exceeding it, and the
+/// two are therefore comparable in direction and in relative movement but not in absolute value. That is
+/// stated here because nothing downstream can discover it.
+#[cfg(target_os = "linux")]
+fn clock_percent() -> Option<f32> {
+    let root = std::path::Path::new("/sys/devices/system/cpu");
+    let mut ratios = Vec::new();
+    for entry in std::fs::read_dir(root).ok()?.flatten() {
+        let cpufreq = entry.path().join("cpufreq");
+        let read = |name: &str| -> Option<f64> {
+            std::fs::read_to_string(cpufreq.join(name))
+                .ok()?
+                .trim()
+                .parse::<f64>()
+                .ok()
+        };
+        let (Some(current), Some(max)) = (read("scaling_cur_freq"), read("cpuinfo_max_freq")) else {
+            continue;
+        };
+        if max > 0.0 {
+            ratios.push(current / max * 100.0);
+        }
+    }
+    if ratios.is_empty() {
+        return None;
+    }
+    Some((ratios.iter().sum::<f64>() / ratios.len() as f64) as f32)
 }
 
 /// Apply one `setpriority` call to the caller, naming it for the refusal message.

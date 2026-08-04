@@ -63,7 +63,18 @@ impl Imported {
 /// Import everything after `offset`, returning the records and the new watermark.
 ///
 /// `offset` is where the previous pass stopped. Passing zero imports the whole file.
-pub fn import(path: &Path, offset: i64, mtime_ms: i64) -> Result<(Imported, Watermark)> {
+///
+/// `settled` says the caller believes nothing more will be appended — a transcript untouched for longer
+/// than a couple of poll intervals. It closes the one measurement that has no other way to end: a session
+/// finishes on the assistant's last message, so the request behind it is still open when the file runs
+/// out, and a file whose mtime never changes again is never read again either. Passing `false` for a live
+/// transcript is what stops a response being recorded as however much of it one poll happened to catch.
+pub fn import(
+    path: &Path,
+    offset: i64,
+    mtime_ms: i64,
+    settled: bool,
+) -> Result<(Imported, Watermark)> {
     let mut file =
         File::open(path).with_context(|| format!("open transcript {}", path.display()))?;
     let length = file
@@ -77,7 +88,7 @@ pub fn import(path: &Path, offset: i64, mtime_ms: i64) -> Result<(Imported, Wate
             .with_context(|| format!("seek transcript {}", path.display()))?;
     }
 
-    let imported = read_from(&mut file, start)?;
+    let imported = read_from(&mut file, start, settled)?;
     let mark = Watermark {
         path: path.to_string_lossy().into_owned(),
         size: imported.offset,
@@ -99,7 +110,7 @@ fn start_offset(offset: i64, length: u64) -> u64 {
 }
 
 /// Feed whole lines to a fresh deriver until the file ends or a partial line is reached.
-fn read_from(file: &mut File, start: u64) -> Result<Imported> {
+fn read_from(file: &mut File, start: u64, settled: bool) -> Result<Imported> {
     let mut reader = BufReader::with_capacity(BUFFER_BYTES, file);
     let mut imported = Imported {
         offset: start as i64,
@@ -110,10 +121,15 @@ fn read_from(file: &mut File, start: u64) -> Result<Imported> {
     let start = start as i64;
     let mut consumed = 0_i64;
 
+    // Whether the file genuinely ran out, as opposed to ending in a line Claude Code is still writing.
+    // Only the first of those means "there is nothing more in this file to see".
+    let mut reached_end = false;
+
     loop {
         line.clear();
         let read = reader.read_until(b'\n', &mut line)?;
         if read == 0 {
+            reached_end = true;
             break;
         }
         if !line.ends_with(b"\n") {
@@ -133,6 +149,12 @@ fn read_from(file: &mut File, start: u64) -> Result<Imported> {
             }
         }
         consumed += read as i64;
+    }
+
+    // Both conditions, not either. A transcript that has been quiet for a while but whose last line is
+    // half-written is not finished; one read to its end but still being appended to is not either.
+    if settled && reached_end {
+        deriver.finish(&mut imported.records);
     }
 
     let end = start + consumed;
@@ -207,7 +229,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let text = transcript(3);
         let path = write(temp.path(), "session.jsonl", &text);
-        let (imported, mark) = import(&path, 0, 1).unwrap();
+        let (imported, mark) = import(&path, 0, 1, true).unwrap();
         assert_eq!(counts(&imported), (3, 3));
         assert_eq!(imported.rows_ok, 9);
         assert_eq!(imported.rows_error, 0);
@@ -220,8 +242,8 @@ mod tests {
     fn a_second_pass_over_an_unchanged_file_finds_nothing_new() {
         let temp = tempfile::tempdir().unwrap();
         let path = write(temp.path(), "session.jsonl", &transcript(2));
-        let (first, mark) = import(&path, 0, 1).unwrap();
-        let (second, _) = import(&path, mark.size, 1).unwrap();
+        let (first, mark) = import(&path, 0, 1, true).unwrap();
+        let (second, _) = import(&path, mark.size, 1, true).unwrap();
         assert_eq!(counts(&second), (0, 0));
         assert_eq!(second.offset, first.offset);
     }
@@ -231,7 +253,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let head = transcript(2);
         let path = write(temp.path(), "session.jsonl", &head);
-        let (_, mark) = import(&path, 0, 1).unwrap();
+        let (_, mark) = import(&path, 0, 1, true).unwrap();
 
         let mut file = std::fs::OpenOptions::new()
             .append(true)
@@ -242,7 +264,7 @@ mod tests {
         file.write_all(tail.as_bytes()).unwrap();
         drop(file);
 
-        let (second, _) = import(&path, mark.size, 2).unwrap();
+        let (second, _) = import(&path, mark.size, 2, true).unwrap();
         assert_eq!(counts(&second), (2, 2), "only the appended pairs are new");
         assert_eq!(second.offset as usize, head.len() + tail.len());
         assert_eq!(
@@ -262,7 +284,7 @@ mod tests {
             "session.jsonl",
             &format!("{complete}{{\"type\":\"assist"),
         );
-        let (imported, mark) = import(&path, 0, 1).unwrap();
+        let (imported, mark) = import(&path, 0, 1, true).unwrap();
         assert_eq!(counts(&imported), (1, 1));
         assert_eq!(
             mark.size as usize,
@@ -280,7 +302,7 @@ mod tests {
 "#;
         file.write_all(rest.as_bytes()).unwrap();
         drop(file);
-        let (second, _) = import(&path, mark.size, 2).unwrap();
+        let (second, _) = import(&path, mark.size, 2, true).unwrap();
         assert_eq!(counts(&second), (1, 0));
     }
 
@@ -291,7 +313,7 @@ mod tests {
         let opening = r#"{"type":"assistant","uuid":"a1","parentUuid":"p1","requestId":"req_1","timestamp":"2026-06-27T00:00:10.000Z","sessionId":"s1","version":"2.1.187","message":{"model":"claude-opus-5","usage":{"input_tokens":1,"output_tokens":2},"content":[{"type":"tool_use","id":"t1","name":"Grep"}]}}
 "#;
         let path = write(temp.path(), "session.jsonl", opening);
-        let (first, mark) = import(&path, 0, 1).unwrap();
+        let (first, mark) = import(&path, 0, 1, true).unwrap();
         assert_eq!(
             counts(&first),
             (1, 0),
@@ -309,7 +331,7 @@ mod tests {
         .unwrap();
         drop(file);
 
-        let (second, _) = import(&path, mark.size, 2).unwrap();
+        let (second, _) = import(&path, mark.size, 2, true).unwrap();
         let calls: Vec<_> = second
             .records
             .iter()
@@ -345,7 +367,7 @@ mod tests {
         );
         let path = write(temp.path(), "session.jsonl", &text);
 
-        let (imported, mark) = import(&path, 0, 1).unwrap();
+        let (imported, mark) = import(&path, 0, 1, true).unwrap();
         assert_eq!(imported.rows_error, 0);
         assert!(
             text.len() as i64 - mark.size <= MAX_REREAD_BYTES,
@@ -360,7 +382,7 @@ mod tests {
 
         // The invariant: whatever was recorded is the start of a line, so the next pass parses every row it
         // reads rather than counting a phantom error against the file.
-        let (second, _) = import(&path, mark.size, 2).unwrap();
+        let (second, _) = import(&path, mark.size, 2, true).unwrap();
         assert_eq!(
             second.rows_error, 0,
             "the watermark landed inside a line, so the next pass read a fragment"
@@ -375,7 +397,7 @@ mod tests {
         let unanswered = r#"{"type":"assistant","uuid":"a9","parentUuid":"p9","requestId":"req_9","timestamp":"2026-06-27T00:01:01.000Z","sessionId":"s1","version":"2.1.187","message":{"model":"claude-opus-5","usage":{"input_tokens":1,"output_tokens":2},"content":[{"type":"tool_use","id":"t9","name":"Grep"}]}}
 "#;
         let path = write(temp.path(), "session.jsonl", &format!("{head}{unanswered}"));
-        let (_, mark) = import(&path, 0, 1).unwrap();
+        let (_, mark) = import(&path, 0, 1, true).unwrap();
         assert_eq!(
             mark.size as usize,
             head.len(),
@@ -387,11 +409,11 @@ mod tests {
     fn a_rewritten_shorter_file_is_imported_again_from_the_start() {
         let temp = tempfile::tempdir().unwrap();
         let path = write(temp.path(), "session.jsonl", &transcript(4));
-        let (_, mark) = import(&path, 0, 1).unwrap();
+        let (_, mark) = import(&path, 0, 1, true).unwrap();
         // Replaced by something shorter: the recorded offset now points past the end.
         let replacement = transcript(1);
         std::fs::write(&path, &replacement).unwrap();
-        let (second, new_mark) = import(&path, mark.size, 2).unwrap();
+        let (second, new_mark) = import(&path, mark.size, 2, true).unwrap();
         assert_eq!(counts(&second), (1, 1));
         assert_eq!(new_mark.size as usize, replacement.len());
         assert!(new_mark.size < mark.size, "the offset must move backwards");
@@ -402,7 +424,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let text = format!("{{not json at all\n\n{}", transcript(2));
         let path = write(temp.path(), "session.jsonl", &text);
-        let (imported, _) = import(&path, 0, 1).unwrap();
+        let (imported, _) = import(&path, 0, 1, true).unwrap();
         assert_eq!(imported.rows_error, 1);
         assert_eq!(imported.rows_ok, 6);
         assert_eq!(counts(&imported), (2, 2), "one bad line loses only itself");
@@ -412,7 +434,7 @@ mod tests {
     fn an_empty_file_imports_nothing_and_reports_an_offset_of_zero() {
         let temp = tempfile::tempdir().unwrap();
         let path = write(temp.path(), "session.jsonl", "");
-        let (imported, mark) = import(&path, 0, 1).unwrap();
+        let (imported, mark) = import(&path, 0, 1, true).unwrap();
         assert!(imported.is_empty());
         assert_eq!(mark.size, 0);
     }
@@ -420,10 +442,61 @@ mod tests {
     #[test]
     fn a_missing_file_is_an_error_rather_than_a_silent_success() {
         let temp = tempfile::tempdir().unwrap();
-        let error = import(&temp.path().join("gone.jsonl"), 0, 1)
+        let error = import(&temp.path().join("gone.jsonl"), 0, 1, true)
             .unwrap_err()
             .to_string();
         assert!(error.contains("open transcript"), "{error}");
+    }
+
+    /// A live transcript's final response is left open; a finished one's is closed.
+    ///
+    /// The distinction is the whole reason `settled` exists. A session ends on the assistant's last
+    /// message, so its final request is still open when the file runs out — and a file whose mtime never
+    /// changes again is never read again, which would lose that turn for good. Flushing unconditionally
+    /// instead would be worse than losing it: a response can easily outlast a thirty-second poll, and the
+    /// span recorded would be however much of it the poll caught, which reads as a *faster* response than
+    /// actually happened.
+    #[test]
+    fn the_last_response_is_closed_only_once_the_transcript_is_finished_with() {
+        let temp = tempfile::tempdir().unwrap();
+        // Two assistant rows of one request and nothing after them: a response still arriving.
+        let text = r#"{"type":"user","uuid":"p1","timestamp":"2026-06-27T00:00:00.000Z","message":{"content":"go"}}
+{"type":"assistant","uuid":"a1","parentUuid":"p1","requestId":"req_1","timestamp":"2026-06-27T00:00:04.000Z","sessionId":"s1","version":"2.1.187","message":{"model":"claude-opus-5","usage":{"input_tokens":1,"output_tokens":9},"content":[]}}
+{"type":"assistant","uuid":"a2","parentUuid":"a1","requestId":"req_1","timestamp":"2026-06-27T00:00:07.000Z","sessionId":"s1","version":"2.1.187","message":{"model":"claude-opus-5","usage":{"input_tokens":1,"output_tokens":9},"content":[]}}
+"#;
+        let path = write(temp.path(), "session.jsonl", text);
+
+        let (live, live_mark) = import(&path, 0, 1, false).unwrap();
+        assert_eq!(
+            counts(&live),
+            (0, 0),
+            "a response still arriving is not a measurement yet"
+        );
+        assert!(
+            (live_mark.size as usize) < text.len(),
+            "the watermark has to hold at the request so the next pass can finish it"
+        );
+
+        let (settled, settled_mark) = import(&path, 0, 1, true).unwrap();
+        let turns: Vec<_> = settled
+            .records
+            .iter()
+            .filter_map(|record| match record {
+                Record::Turn(turn) => Some(turn),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(turns.len(), 1, "a finished transcript yields its last turn");
+        assert_eq!(
+            turns[0].generation_ms,
+            Some(3_000),
+            "the span is first row to last, not first row to prompt"
+        );
+        assert_eq!(
+            settled_mark.size as usize,
+            text.len(),
+            "nothing is left open, so the watermark reaches the end"
+        );
     }
 
     #[test]
@@ -434,7 +507,7 @@ mod tests {
             "session.jsonl",
             &transcript(2).replace('\n', "\r\n"),
         );
-        let (imported, _) = import(&path, 0, 1).unwrap();
+        let (imported, _) = import(&path, 0, 1, true).unwrap();
         assert_eq!(counts(&imported), (2, 2));
         assert_eq!(imported.rows_error, 0);
     }

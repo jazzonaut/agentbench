@@ -239,10 +239,15 @@ mod tests {
             covariates: crate::watch::store::Covariates {
                 cpu_percent: Some(if contended { 90.0 } else { 4.0 }),
                 scanner_percent: Some(if contended { 30.0 } else { 0.1 }),
+                agent_percent: Some(if contended { 250.0 } else { 1.0 }),
                 agent_active: false,
                 contended,
                 on_battery: Some(false),
+                clock_percent: Some(if contended { 128.0 } else { 136.0 }),
+                disk_write_bytes_s: Some(if contended { 45.0e6 } else { 64.0e3 }),
+                scratch_free_bytes: Some(110 << 30),
             },
+            processes: Vec::new(),
             metrics: vec![crate::watch::store::ProbeMetric {
                 name: "filesystem.small_file_ops_s".into(),
                 value: ops,
@@ -337,6 +342,8 @@ mod tests {
             agent_cpu: Some(4.0),
             agent_rss: Some(1 << 28),
             agent_processes: Some(2),
+            agent_write_bytes_s: Some(2_097_152.0),
+            scanner_write_bytes_s: Some(131_072.0),
         });
         // Force the writer to commit by closing the store, then reopen for reading.
         let inventory = Inventory {
@@ -377,6 +384,8 @@ mod tests {
             agent_cpu: None,
             agent_rss: None,
             agent_processes: None,
+            agent_write_bytes_s: None,
+            scanner_write_bytes_s: None,
         });
         let inventory = Inventory {
             hostname_hash: "hash-router".into(),
@@ -425,6 +434,8 @@ mod tests {
             agent_cpu: None,
             agent_rss: None,
             agent_processes: None,
+            agent_write_bytes_s: None,
+            scanner_write_bytes_s: None,
         });
         let health = fixture.store.writer_health();
         let inventory = Inventory {

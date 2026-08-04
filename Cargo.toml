@@ -93,6 +93,11 @@ windows-sys = { version = "0.61", features = [
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
+    # PDH, for the two live conditions no other Windows interface will give an ordinary process: the
+    # clock as a ratio of nominal, and whole-machine disk throughput. `sysinfo` and WMI both report a
+    # static frequency copied from the registry, and per-process I/O counters are unreadable for every
+    # SYSTEM-owned writer, so without this the covariates would be a flat line and a blind spot.
+    "Win32_System_Performance",
     "Win32_System_Power",
     # Reading and writing the user's `PATH` under `HKCU\Environment`. Done through the registry rather
     # than `setx`, which truncates the value at 1024 characters, or .NET's `SetEnvironmentVariable`, which

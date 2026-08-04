@@ -52,6 +52,11 @@ struct PendingTool {
     name: String,
     /// Byte offset of the row that asked, so a later pass can find it again.
     offset: i64,
+    /// Whether the row that asked belonged to a subagent.
+    ///
+    /// Taken from the request rather than from the result, because the request is what attributes the
+    /// work: they agree in every transcript seen, and if they ever disagree the asker is the truthful one.
+    sidechain: bool,
 }
 
 /// A prompt awaiting the first assistant message that answers it.
@@ -61,6 +66,26 @@ struct PendingPrompt {
     /// The prompt row, plus any rows descended from it that are not themselves answers.
     chain: HashSet<String>,
     offset: i64,
+}
+
+/// A request whose response is still arriving.
+///
+/// One API request emits several assistant rows, and the interval between its first and its last is how
+/// long the response took to come through. That cannot be known when the first row is read, so a turn is
+/// now held here until something proves the request has finished — either a row belonging to a different
+/// request, or a row that is not an assistant row at all.
+///
+/// The cost is that a turn is emitted later than the row that opened it, and the benefit is
+/// [`Turn::generation_ms`]. Both halves matter: `offset` is reported through
+/// [`Deriver::resume_offset`], so a pass that ends mid-response re-reads the response next time rather
+/// than recording a span that stops wherever the poll happened to land.
+#[derive(Debug, Clone)]
+struct OpenTurn {
+    turn: Turn,
+    /// Byte offset of the row that opened the request.
+    offset: i64,
+    /// Timestamp of the most recent row seen for it.
+    last_ts: i64,
 }
 
 /// Derives measurements from one transcript's rows, in file order.
@@ -73,6 +98,8 @@ pub struct Deriver {
     /// Insertion order, so the bound evicts the oldest rather than an arbitrary entry.
     order: VecDeque<String>,
     prompt: Option<PendingPrompt>,
+    /// The request whose response is still arriving, if one is.
+    open_turn: Option<OpenTurn>,
     /// Requests already turned into a turn during this pass, capped at [`MAX_SEEN_REQUESTS`].
     seen_requests: HashSet<String>,
     version: Option<String>,
@@ -87,10 +114,33 @@ impl Deriver {
         self.note_version(row, out);
         match row.kind() {
             Kind::Assistant => self.assistant(offset, row, out),
-            Kind::Prompt => self.begin_prompt(offset, row),
-            Kind::ToolResult => self.tool_result(row, out),
-            Kind::Other => self.extend_prompt_chain(row),
+            // Anything that is not an assistant row proves the response before it has finished, so the
+            // turn it belonged to can be closed and its span is known.
+            other => {
+                self.close_turn(out);
+                match other {
+                    Kind::Prompt => self.begin_prompt(offset, row),
+                    Kind::ToolResult => self.tool_result(row, out),
+                    Kind::Assistant | Kind::Other => self.extend_prompt_chain(row),
+                }
+            }
         }
+    }
+
+    /// Close a response that nothing further will be added to.
+    ///
+    /// Called by the importer when it has read a transcript to its end *and* that transcript has been
+    /// quiet long enough to be finished with. Without it the last turn of every completed session would
+    /// be lost: a session normally ends on the assistant's final message, so the request that produced it
+    /// is still open when the file runs out, and a file whose mtime never changes again is never read
+    /// again either.
+    ///
+    /// Deliberately not called at the end of every pass. A live transcript is polled every thirty
+    /// seconds and a response can easily take longer than that, so flushing unconditionally would record
+    /// a span that stops wherever the poll landed — a wrong number rather than a missing one, and an
+    /// optimistic one, since a truncated span inflates the token rate derived from it.
+    pub fn finish(&mut self, out: &mut Vec<Record>) {
+        self.close_turn(out);
     }
 
     /// The earliest row still awaiting its other half, ignoring any that began before `floor`.
@@ -112,6 +162,11 @@ impl Deriver {
             .values()
             .map(|pending| pending.offset)
             .chain(self.prompt.as_ref().map(|prompt| prompt.offset))
+            // A response still arriving is open in exactly the same sense as a tool call still running:
+            // its measurement needs a row this pass has not reached. Leaving it out would let the
+            // watermark advance past the request and record the span as whatever fraction of it the poll
+            // happened to catch.
+            .chain(self.open_turn.as_ref().map(|open| open.offset))
             .filter(|offset| *offset >= floor)
             .min()
     }
@@ -140,7 +195,7 @@ impl Deriver {
         }
     }
 
-    /// An assistant row: possibly a new turn, possibly the start of tool calls.
+    /// An assistant row: possibly a new turn, possibly a continuation of one, possibly tool calls.
     fn assistant(&mut self, offset: i64, row: &Row, out: &mut Vec<Record>) {
         let Some(ts) = row.ts_ms() else { return };
         for (id, name) in row.tool_uses() {
@@ -148,15 +203,48 @@ impl Deriver {
                 ts,
                 name: name.to_string(),
                 offset,
+                sidechain: row.is_sidechain,
             };
             if let Some(uuid) = row.uuid.as_deref() {
                 self.tools_by_row.insert(uuid.to_string(), pending.clone());
             }
             self.remember_tool(id.to_string(), pending);
         }
-        if let Some(turn) = self.turn(row, ts) {
-            out.push(turn.into());
+
+        // Another row of the request already in progress: it carries the same cumulative usage and adds
+        // nothing but the fact that the response was still arriving at this moment.
+        if let Some(open) = self.open_turn.as_mut()
+            && row
+                .request_id
+                .as_deref()
+                .is_some_and(|id| id == open.turn.request_id)
+        {
+            open.last_ts = ts;
+            return;
         }
+
+        // A different request, so whatever was open has finished.
+        self.close_turn(out);
+        if let Some(turn) = self.turn(row, ts) {
+            self.open_turn = Some(OpenTurn {
+                turn,
+                offset,
+                last_ts: ts,
+            });
+        }
+    }
+
+    /// Emit the open turn, with the span of the response as it was actually observed.
+    fn close_turn(&mut self, out: &mut Vec<Record>) {
+        let Some(open) = self.open_turn.take() else {
+            return;
+        };
+        let mut turn = open.turn;
+        let span = open.last_ts - turn.ts;
+        // A single-row request has a span of zero, which is not a duration. That is a little over a third
+        // of them: measured across 411 real transcripts, 1,844 of 2,926 requests emit more than one row.
+        turn.generation_ms = (span > 0 && span <= MAX_INTERVAL_MS).then_some(span);
+        out.push(turn.into());
     }
 
     /// Build the turn for a request, or nothing if this row does not open one.
@@ -196,6 +284,9 @@ impl Deriver {
             effort: row.effort.clone(),
             service_tier: usage.and_then(|usage| usage.service_tier.clone()),
             first_response_ms: self.claim_prompt(row, ts),
+            // Assigned when the request closes, which is the only point at which it is knowable.
+            generation_ms: None,
+            sidechain: row.is_sidechain,
             input_tokens: usage.map_or(0, |usage| usage.input_tokens),
             output_tokens: usage.map_or(0, |usage| usage.output_tokens),
             cache_read: usage.map_or(0, |usage| usage.cache_read_input_tokens),
@@ -271,6 +362,7 @@ impl Deriver {
                 // A refused call spent its time waiting for a person, and a failed one returned
                 // early. Either would corrupt a latency series, so the flag is what charts filter on.
                 ok: !failed && row.tool_denial_kind.is_none(),
+                sidechain: pending.sidechain,
             }
             .into(),
         );
@@ -315,23 +407,36 @@ mod tests {
     use super::*;
     use crate::watch::store::Record;
 
-    /// Feed raw JSON lines and collect what they derive.
+    /// Feed raw JSON lines and collect what they derive, as a *finished* transcript would.
+    ///
+    /// Calls [`Deriver::finish`], which is what the importer does once a transcript has been read to its
+    /// end and left alone long enough to be finished with. Without it the last response of these fixtures
+    /// would still be open — correctly, since a session normally ends on an assistant row and nothing in
+    /// the file proves the response is complete.
     fn derive(lines: &[&str]) -> Vec<Record> {
-        let (records, _) = derive_with_offsets(lines);
-        records
+        let mut deriver = Deriver::default();
+        let mut out = Vec::new();
+        feed(&mut deriver, lines, &mut out);
+        deriver.finish(&mut out);
+        out
     }
 
-    /// As [`derive`], also reporting where a later pass would have to resume.
+    /// As [`derive`], but mid-flight: nothing is closed, and the resume point is reported.
     fn derive_with_offsets(lines: &[&str]) -> (Vec<Record>, Option<i64>) {
         let mut deriver = Deriver::default();
         let mut out = Vec::new();
+        feed(&mut deriver, lines, &mut out);
+        (out, deriver.resume_offset(0))
+    }
+
+    /// Push every line, advancing the offset by the line and its newline.
+    fn feed(deriver: &mut Deriver, lines: &[&str], out: &mut Vec<Record>) {
         let mut offset = 0;
         for line in lines {
             let row: Row = serde_json::from_str(line).expect(line);
-            deriver.push(offset, &row, &mut out);
+            deriver.push(offset, &row, out);
             offset += line.len() as i64 + 1;
         }
-        (out, deriver.resume_offset(0))
     }
 
     fn turns(records: &[Record]) -> Vec<Turn> {
@@ -379,6 +484,9 @@ mod tests {
             turns[0].output_tokens, 378,
             "usage is cumulative, not additive"
         );
+        // The span the extra rows are good for: first row to last, which is how long the response took to
+        // come through once it had started.
+        assert_eq!(turns[0].generation_ms, Some(2_000));
         assert_eq!(turns[0].cache_read, 26_850);
         assert_eq!(turns[0].model.as_deref(), Some("claude-opus-5"));
         assert_eq!(turns[0].service_tier.as_deref(), Some("standard"));
@@ -405,6 +513,8 @@ mod tests {
             let row: Row = serde_json::from_str(&line).expect(&line);
             deriver.push(0, &row, &mut out);
         }
+        // The last request has nothing after it, so it is still open until the transcript is finished.
+        deriver.finish(&mut out);
         assert_eq!(
             turns(&out).len(),
             MAX_SEEN_REQUESTS + 1,

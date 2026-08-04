@@ -185,6 +185,20 @@ machine look faster the more went wrong. On real data they are 3.3% of calls.
 | 3 | Probes: micro workloads, covariates, run markers | **done** |
 | 4 | Analysis: baseline, verdicts, annotations, rollup and retention | **done** |
 | 5 | Ship: README/CHANGELOG polish, autostart docs, 0.4.0 | **done** |
+| 6 | Conditions: what was different today, and making every collected series reachable | **collection done; analysis, API and dashboard outstanding** |
+
+### Phase 6: why
+
+Phases 1–5 answer "is my machine slower today than yesterday" and cannot answer the second half of the
+question this document opens with, *"and what changed?"* Two of the five judged subjects are filesystem
+series, and `contended` was three CPU thresholds — so a probe that ran while an update or a backup wrote
+gigabytes read slow at 15% CPU and entered the baseline as clean data. `cpu.single_mops_s` is judged with
+nothing recorded that could say the part was throttled. Neither filesystem series had a free-space
+covariate, so the slow monotonic drift the tool exists to detect was the one thing it could not explain.
+
+The display half is the same problem seen from the other end: `/api/series` advertises thirteen series
+nobody can reach — six passive and six session, against the two that are charted. Collection that cannot
+be read is cost without benefit.
 
 ### Deviations from the plan as executed
 
@@ -480,6 +494,110 @@ test targets would only invite a failure the day a dev-dependency raises its own
 The general lesson is worth keeping: a version constraint that nothing executes is a guess with a
 number in it.
 
+### Phase 6 deviations, and what measurement decided
+
+- **The obvious API for the clock covariate is useless, and would have shipped a permanently flat line.**
+  The design said "record the CPU frequency". `sysinfo::Cpu::frequency()` reported exactly **3801 MHz on
+  all thirty-six readings**, spanning 8% to 98% whole-machine CPU, on a part whose nominal figure is
+  3801 MHz; WMI's `Win32_Processor.CurrentClockSpeed` agrees with it and equals `MaxClockSpeed`. Both read
+  a value the registry holds from boot. What *is* live is the PDH counter
+  `\Processor Information(_Total)\% Processor Performance`, which read 135–137 idle and **128–131 under an
+  all-core `cargo build`**. So the covariate is a ratio of nominal rather than a figure in MHz — above 100
+  while boosting, below 100 while throttled — and it comes from PDH. Had this not been measured first, a
+  judged CPU chart would have gained a covariate that never moved, which is worse than one that is absent:
+  a flat line reads as a machine behaving.
+- **An unelevated process sees SYSTEM-owned processes' CPU but not their I/O.** `svchost` reported 1.5%
+  CPU and **exactly zero bytes**; so did Defender, the search indexer, `System` and `Registry`, and 346
+  processes had an unreadable `exe()`. Per-process I/O therefore cannot see the backups, updates and
+  scans that make a filesystem probe read slow — which is most of what the covariate was for. Whole-machine
+  throughput comes from `\PhysicalDisk(_Total)\Disk Write Bytes/sec` instead, unattributed by construction,
+  and the per-process figures are kept beside it as attribution for the user's own processes only. The two
+  answer different questions and neither replaces the other. The daemon stays unelevated, so this is a
+  permanent property rather than something to fix.
+- **PDH costs one feature on an existing dependency and 302 µs a call.** `windows-sys` was already a direct
+  dependency; `Win32_System_Performance` is one more feature and no new crate. `PdhAddEnglishCounterW`
+  rather than `PdhAddCounterW`, because a counter path is localised and `\PhysicalDisk` does not exist by
+  that name on a German install — a failure that would appear only on machines no test of ours runs on. The
+  first collect of a rate counter returns no value, which is the same priming rule the sampler's CPU delta
+  and the per-process I/O deltas already follow.
+- **The extra process-table walk the plan budgeted turned out to be unnecessary.** A PDH collect needs no
+  walk, so the machine-wide disk rate spans exactly the window the CPU covariate spans, and one disclosure
+  covers both: the reading is the ~200 ms before the workloads, so it catches sustained background I/O and
+  misses a burst that starts mid-probe.
+- **`Current Disk Queue Length` was collected and dropped.** Flat 0.0 in every reading, including while
+  45 MiB/s was being written, which is what that counter does on NVMe.
+- **The disk threshold is 20 MiB/s, from measurement.** An idle desktop with a browser and an editor open
+  wrote 17 KiB/s at the median and peaked at 1.3 MiB/s; an all-core build ran to 44.9 MiB/s. Validated
+  against a live daemon under a sustained writer: **all five probes were tagged contended at 769–1066 MiB/s
+  while whole-machine CPU sat at 16–22%**, every one of which the old rules would have filed as clean data.
+  Like every threshold here it cannot be validated by a test that supplies its own inputs, and unlike the
+  CPU ones it has no history behind it yet.
+- **`Read` latency is *not* confounded by file size, and that is worth recording so nobody re-opens it.**
+  The pooled-tools finding was that three quarters of the movement in the only judged session series was
+  composition, at r = −0.86. The same objection applied on its face to file size within `Read`: a 40-line
+  read and a 4,000-line read are not the same measurement and the mix is the model's choice. Measured over
+  7,493 real calls, **Spearman r = −0.035**; across size quintiles whose medians span 634 B to 11,990 B, a
+  nineteenfold range, the median latency reads **11, 11, 11, 10, 11 ms**; and the day-level composition test
+  over 24 days gives **r = −0.125** against the −0.86 that condemned tool pooling. No column, no re-import.
+  The quintile row is also the cleanest demonstration yet of something already claimed above: the
+  measurement sits on its own 1 ms resolution floor, so a nineteenfold change in what is being read moves
+  the median by at most one quantum.
+- **The probe ranked itself as its own competition, and only real data showed it.** The second probe of a
+  session named `agentbench.exe` at 14.3% of a core as the machine's second-largest consumer: the *previous*
+  probe's workloads, averaged over the interval since. The busier the probe, the higher it would have
+  ranked, putting a plausible and entirely wrong explanation beside every reading. The daemon's own process
+  tree is now excluded; the agent's deliberately is not, since an agent working while a probe runs is
+  exactly the competition worth naming. Every unit test passed before and after, for the third time in this
+  document's history.
+- **Ranked consumers span the interval since the previous probe, not the priming window.** The figures come
+  from the walk in `Observer::prime`, and `sysinfo` reports a process's CPU as a delta since that process
+  was last refreshed. Walking again inside `read` would make them an instant and would put the walk inside
+  the window the CPU covariate is computed from, which is what the two-reading version was reverted for.
+  The longer window is arguably the more useful one — what explains a slow probe is a scanner busy for ten
+  minutes, not one scheduled during a particular 200 ms — but it answers "what has been using the machine"
+  rather than "what is using it now", and nothing downstream may claim otherwise.
+- **Consumers are ranked by absolute CPU, and this is the weakest part of phase 6.** On the development
+  machine `RadeonSoftware.exe` and `NGenuity2Helper.exe` each burn about a whole core continuously —
+  corroborated independently, since Task Manager's 6% of a sixteen-core machine is 96% of one core — so they
+  hold two of the three slots on every probe for ever, and the one remaining slot is all that is left to
+  name the process that was *unusual* today. A process that always burns a core explains nothing about why
+  today differs from yesterday, which is the question this whole design exists to answer. Ranking by
+  deviation from each process's own usual level would answer it and needs per-process history the schema
+  does not have. Shipped absolute, recorded as an open question, and worth revisiting once a week of real
+  consumer data exists to look at.
+- **`agent_at` is stored beside `agent_active` although one is derived from the other.** `agent_active` is a
+  threshold applied at write time, and the open question at the foot of this document says that threshold
+  and its default process names are likely to change. Without the raw figure every row collected under the
+  old constant would be impossible to reclassify: stranded, and silently mixed with later rows that meant
+  something different. One column buys the ability to recompute a verdict from stored facts.
+- **`generation_ms` forced turns to be held open, which created and then closed a new failure mode.** The
+  span of a response is first row to last, so it cannot be known when the first row is read; a turn is now
+  held until something proves the request finished. That alone would have lost the last turn of every
+  completed transcript, because a session ends on the assistant's final message and a file whose mtime never
+  changes again is never re-read. The importer therefore takes a `settled` flag — a transcript untouched for
+  more than two poll intervals has its last response closed, a live one does not. Flushing unconditionally
+  was rejected as *worse than losing the turn*: a response can outlast a thirty-second poll, and a truncated
+  span reads as a faster response than actually happened, which is a wrong number rather than a missing one.
+- **Migrations v1–v5 were collapsed into one statement.** No release carried any of them, so they described
+  an upgrade from a database that exists nowhere, and keeping them meant 270 lines of SQL and upgrade tests
+  for paths that can never run again. The reasoning was moved here and into `schema.rs`, not deleted, and the
+  rule stands: an entry is immutable once a release has shipped it. The refusal message for an unrecognised
+  `user_version` now names the real remedy, because the likeliest cause is a database from the development
+  line whose counter had reached 5, for which "upgrade AgentBench" would be advice that cannot work.
+- **The accepted cost of that collapse is four days of verdicts.** Wiping the databases loses the sample and
+  probe history, so every probe verdict reads `insufficient` until four days have accumulated, and the open
+  question about whether the 5% band floor survives a real week restarts from zero. Sessions are unaffected:
+  a full transcript backfill regenerates them, which is also how the new session columns reach history.
+
+### Questions phase 6 answered
+
+- **Whether subagent activity can be distinguished is now yes, and it was nearly free.** `Row::is_sidechain`
+  was already being parsed and thrown away. It is populated: **164 of 431 transcripts** on the development
+  machine are subagent transcripts, so 38% of the corpus was blended into the parent project's numbers with
+  nothing in the database able to separate it. Both session tables now carry the flag. Subagent rows also
+  carry `agentId` and a `slug`, so naming *which* agent is available later without a second pass.
+- **Whether `Read` latency needs a file-size control is now no**, with the numbers above.
+
 ### Questions phase 4 answered
 
 - **"What a verdict does when the uncontended subset is too small" is now a number.** Fewer than three
@@ -495,9 +613,15 @@ number in it.
 - **Whether `first_response_ms` deserves to be split.** It currently mixes queue wait, thinking time and
   real latency. The transcript may carry enough to separate them — `queue-operation` rows exist, and a
   thinking block's size is visible — but until something is measured that separation is speculation.
-- **Whether subagent activity should be distinguishable from the session that spawned it.** Both are
-  real work on this machine and both are imported, but a heavy workflow's tool calls currently blend
-  into the parent project's numbers, and neither table records which is which.
+- ~~**Whether subagent activity should be distinguishable from the session that spawned it.**~~ Answered in
+  phase 6: both session tables now record it. What remains is a *display* question — no series filters on it
+  yet, and 38% of the corpus being subagent work means the judged `Read` series is still a blend until one
+  does.
+- **Whether ranked consumers should be ordered by absolute CPU or by deviation from their own norm.** Two
+  processes on the development machine burn a core each around the clock and hold two of three slots on every
+  probe, leaving one slot to name whatever was actually unusual. Absolute is what shipped; deviation is what
+  the question the dashboard asks would want, and it needs per-process history no table holds. Revisit with a
+  week of real consumer rows in hand.
 - **How to break a line when the cadence changed inside the range.** One threshold for the whole series
   cannot serve two cadences, and the two wrong answers are both known: the median leaves the sparse stretch
   blank, and a range-relative floor interpolates across real outages. A per-neighbourhood rule — compare each

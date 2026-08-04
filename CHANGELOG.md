@@ -2,6 +2,57 @@
 
 All notable changes to AgentBench are documented here. The project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+Collection for the "and what changed?" half of the dashboard's question. Nothing here is on screen yet:
+the analysis, API and dashboard work that surfaces it is still to come, so the values are being recorded
+and are readable only from the database.
+
+### Added
+
+- **Probes record the conditions they ran in.** Four covariates on every run: the CPU clock as a percentage
+  of nominal, whole-machine disk write throughput, free space on the scratch volume, and the raw agent CPU
+  figure that `agent_active` was derived from. Between them they are the difference between a verdict saying
+  `single-core CPU worse by 22%` and one that can also say the part was running at two thirds of its usual
+  clock.
+- **A busy disk now counts as contention.** `contended` was three CPU thresholds, so a probe that ran while
+  an update, a backup or a cloud sync wrote gigabytes read slow at 15% CPU and went into the baseline as
+  clean data — and two of the five judged series are filesystem measurements. Validated against a live
+  daemon under a sustained writer: all five probes were tagged, at 769–1066 MiB/s with CPU at 16–22%.
+- **Every probe records the three largest consumers on the machine.** Names and CPU, from the process walk
+  the prober already does, which is the difference between "small-file operations dropped at 14:00" and
+  "…and `MsMpEng` was at 180% of a core". The daemon's own process tree is excluded: an early version ranked
+  `agentbench.exe` itself, which was the previous probe's own workloads.
+- **The passive stream records the agent's and the scanners' disk write rates.** Attributable, unlike the
+  whole-machine figure above, and blind in a way that is documented rather than hidden: an unelevated
+  process reads exactly zero bytes for every SYSTEM-owned writer while still reading its CPU.
+- **Sessions record how long a response took to arrive** (`generation_ms`, the span from a request's first
+  row to its last) **and whether a subagent produced it** (`sidechain`). The first exists to be divided into
+  the token count, which cancels the thing that makes a raw wait unjudgeable — a model choosing to think
+  for longer. The second was already being parsed and discarded, and matters more than expected: 38% of the
+  transcripts on the development machine are subagent transcripts whose work was blended into the parent
+  project's numbers.
+
+### Changed
+
+- **The clock is recorded as a ratio, not in MHz, because the MHz figure available to an ordinary process on
+  Windows is a static registry value.** `sysinfo` and WMI both reported exactly 3801 MHz across thirty-six
+  readings spanning 8% to 98% CPU. The live reading comes from a performance counter instead and moved from
+  136% of nominal at idle to 129% with every core loaded. This needs one additional feature on a dependency
+  the project already had, and no new crate.
+- **The schema was reset to a single migration.** Migrations v2–v5 corrected the development line and were
+  never carried by a release, so they described an upgrade from a database that exists nowhere. **A database
+  written by 0.6.x cannot be read by this build and has to be moved aside**, which the error message says.
+  Transcript history is unaffected — a backfill regenerates it — but sample and probe history is lost, so
+  probe verdicts read `insufficient` until four days have accumulated again.
+
+### Fixed
+
+- **A write rate is absent, never zero, on the tick that rediscovered the processes it measures.** The first
+  I/O delta `sysinfo` reports for a newly seen process is its whole lifetime's traffic; unguarded, one tick
+  of a full process table reported 12.2 GiB written "in one second". Absent rather than zero because zero is
+  a claim the disk was quiet, which is exactly what a busy machine would then look like.
+
 ## [0.6.1] - 2026-08-04
 
 ### Changed
