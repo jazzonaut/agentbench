@@ -66,10 +66,11 @@ pub enum SessionSeries {
     /// Output tokens per second of generation.
     ///
     /// **Only the requests that had a span to measure.** `generation_ms` is the interval from a request's
-    /// first assistant row to its last, so a single-row request has none — about 37% of real requests, 1,844
-    /// of 2,926 when it was measured. Those turns are excluded rather than divided by, which makes this a
-    /// series about multi-row responses and not about all output. It is also end of *stream* rather than end
-    /// of generation.
+    /// first assistant row to its last, so a single-row request has none: 1,844 of 2,926 real requests
+    /// emitted more than one row, leaving about 37% with nothing to measure. Those turns are excluded rather
+    /// than divided by, which makes this a series about multi-row responses and not about all output. It is
+    /// also end of *stream* rather than end of generation, and a response whose end nothing in the
+    /// transcript proves has no span either — see `Deriver::finish`.
     ///
     /// A rate rather than a duration because a slow day and a verbose day are different things and the token
     /// count alone cannot tell them apart. Aggregated as a [`Aggregation::Ratio`] — tokens summed over

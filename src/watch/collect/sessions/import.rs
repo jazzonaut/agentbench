@@ -452,10 +452,14 @@ mod tests {
     ///
     /// The distinction is the whole reason `settled` exists. A session ends on the assistant's last
     /// message, so its final request is still open when the file runs out — and a file whose mtime never
-    /// changes again is never read again, which would lose that turn for good. Flushing unconditionally
-    /// instead would be worse than losing it: a response can easily outlast a thirty-second poll, and the
-    /// span recorded would be however much of it the poll caught, which reads as a *faster* response than
-    /// actually happened.
+    /// changes again is never read again, which would lose that turn for good.
+    ///
+    /// What the settled close does *not* do is name a span. "Settled" is inferred from an mtime, which
+    /// moves only when a row is appended, so a response that pauses for longer than the settle window looks
+    /// finished while it is still generating; and the next pass cannot repair it, because its duplicate turn
+    /// is discarded by the unique index on `request_id`. A truncated span reads as a *faster* response than
+    /// actually happened, so the turn is kept with everything the file does establish and the span is left
+    /// absent.
     #[test]
     fn the_last_response_is_closed_only_once_the_transcript_is_finished_with() {
         let temp = tempfile::tempdir().unwrap();
@@ -488,10 +492,15 @@ mod tests {
             .collect();
         assert_eq!(turns.len(), 1, "a finished transcript yields its last turn");
         assert_eq!(
-            turns[0].generation_ms,
-            Some(3_000),
-            "the span is first row to last, not first row to prompt"
+            turns[0].generation_ms, None,
+            "an mtime cannot prove the last row was the last row, so the span is not claimed"
         );
+        assert_eq!(
+            turns[0].first_response_ms,
+            Some(4_000),
+            "everything the file does establish is still recorded, which is why the turn is worth keeping"
+        );
+        assert_eq!(turns[0].output_tokens, 9);
         assert_eq!(
             settled_mark.size as usize,
             text.len(),

@@ -72,8 +72,8 @@ struct PendingPrompt {
 ///
 /// One API request emits several assistant rows, and the interval between its first and its last is how
 /// long the response took to come through. That cannot be known when the first row is read, so a turn is
-/// now held here until something proves the request has finished — either a row belonging to a different
-/// request, or a row that is not an assistant row at all.
+/// held here until something proves the request has finished: an assistant row belonging to a different
+/// request, a prompt, or a tool result. Any of the three can only exist once this response had ended.
 ///
 /// The cost is that a turn is emitted later than the row that opened it, and the benefit is
 /// [`Turn::generation_ms`]. Both halves matter: `offset` is reported through
@@ -86,6 +86,19 @@ struct OpenTurn {
     offset: i64,
     /// Timestamp of the most recent row seen for it.
     last_ts: i64,
+}
+
+/// Whether the last row seen for a request is provably the last row it will ever have.
+///
+/// The distinction exists because a span is only a measurement when both ends are real. It is not a
+/// nicety: a truncated span is *shorter* than the truth, so the token rate derived from it is higher, and
+/// the artefact reads as a machine responding faster rather than as an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Span {
+    /// Something in the file came after the response, so the response had ended.
+    Complete,
+    /// The file simply ran out. See [`Deriver::finish`].
+    Unproven,
 }
 
 /// Derives measurements from one transcript's rows, in file order.
@@ -114,16 +127,23 @@ impl Deriver {
         self.note_version(row, out);
         match row.kind() {
             Kind::Assistant => self.assistant(offset, row, out),
-            // Anything that is not an assistant row proves the response before it has finished, so the
-            // turn it belonged to can be closed and its span is known.
-            other => {
-                self.close_turn(out);
-                match other {
-                    Kind::Prompt => self.begin_prompt(offset, row),
-                    Kind::ToolResult => self.tool_result(row, out),
-                    Kind::Assistant | Kind::Other => self.extend_prompt_chain(row),
-                }
+            // A prompt and a tool result both prove the response before them finished: neither can be
+            // written until the assistant has stopped. So the turn closes, and its span is the whole span.
+            Kind::Prompt => {
+                self.close_turn(out, Span::Complete);
+                self.begin_prompt(offset, row);
             }
+            Kind::ToolResult => {
+                self.close_turn(out, Span::Complete);
+                self.tool_result(row, out);
+            }
+            // `Kind::Other` proves nothing, and used to close the turn anyway. A row this deriver has no
+            // opinion about can be interleaved with a response rather than following it, and closing on
+            // one would end the span early — after which the request's remaining rows are dropped by
+            // `seen_requests` and the truncated figure is the one that reaches the database. Leaving the
+            // turn open costs nothing: a prompt, a tool result or a different request all still close it,
+            // and a transcript that ends here is closed by `finish`.
+            Kind::Other => self.extend_prompt_chain(row),
         }
     }
 
@@ -139,8 +159,16 @@ impl Deriver {
     /// seconds and a response can easily take longer than that, so flushing unconditionally would record
     /// a span that stops wherever the poll landed — a wrong number rather than a missing one, and an
     /// optimistic one, since a truncated span inflates the token rate derived from it.
+    ///
+    /// **The turn is saved and its span is not.** "Settled" is inferred from an mtime, and an mtime only
+    /// moves when a row is appended — so a response with a gap between rows longer than the settle window
+    /// looks finished while it is still generating. There is no way to tell that case from a genuinely
+    /// finished one here, and no second chance to correct it later: the next pass opens a fresh deriver
+    /// whose duplicate turn the unique index on `request_id` discards, so whatever is written now is
+    /// final. The turn's tokens are worth keeping either way; a span that might be a fraction of the real
+    /// one is not, and absent is the reading this whole module owes a covariate it cannot vouch for.
     pub fn finish(&mut self, out: &mut Vec<Record>) {
-        self.close_turn(out);
+        self.close_turn(out, Span::Unproven);
     }
 
     /// The earliest row still awaiting its other half, ignoring any that began before `floor`.
@@ -223,8 +251,8 @@ impl Deriver {
             return;
         }
 
-        // A different request, so whatever was open has finished.
-        self.close_turn(out);
+        // A different request, so whatever was open has finished and its last row was the last row.
+        self.close_turn(out, Span::Complete);
         if let Some(turn) = self.turn(row, ts) {
             self.open_turn = Some(OpenTurn {
                 turn,
@@ -234,16 +262,18 @@ impl Deriver {
         }
     }
 
-    /// Emit the open turn, with the span of the response as it was actually observed.
-    fn close_turn(&mut self, out: &mut Vec<Record>) {
+    /// Emit the open turn, recording its span only when the last row seen is provably the last row.
+    fn close_turn(&mut self, out: &mut Vec<Record>, span: Span) {
         let Some(open) = self.open_turn.take() else {
             return;
         };
         let mut turn = open.turn;
-        let span = open.last_ts - turn.ts;
-        // A single-row request has a span of zero, which is not a duration. That is a little over a third
-        // of them: measured across 411 real transcripts, 1,844 of 2,926 requests emit more than one row.
-        turn.generation_ms = (span > 0 && span <= MAX_INTERVAL_MS).then_some(span);
+        let observed = open.last_ts - turn.ts;
+        // A single-row request has a span of zero, which is not a duration. Rather over a third of requests
+        // are single-row: measured across 411 real transcripts, 1,844 of 2,926 emit more than one.
+        turn.generation_ms =
+            (span == Span::Complete && observed > 0 && observed <= MAX_INTERVAL_MS)
+                .then_some(observed);
         out.push(turn.into());
     }
 
@@ -476,7 +506,12 @@ mod tests {
         let first = assistant("a1", "p1", "req_1", "2026-06-27T00:00:10.000Z", "");
         let second = assistant("a2", "a1", "req_1", "2026-06-27T00:00:11.000Z", "");
         let third = assistant("a3", "a2", "req_1", "2026-06-27T00:00:12.000Z", "");
-        let records = derive(&[&first, &second, &third]);
+        // A prompt afterwards, which is what proves the response had ended: a span needs both of its ends
+        // to be real, and the file merely running out establishes only one of them.
+        let next = r#"{"type":"user","uuid":"p2","promptSource":"typed",
+            "timestamp":"2026-06-27T00:00:20.000Z","sessionId":"s1",
+            "message":{"content":"and now something else"}}"#;
+        let records = derive(&[&first, &second, &third, next]);
         let turns = turns(&records);
         assert_eq!(turns.len(), 1, "one request must yield one turn");
         assert_eq!(turns[0].uuid, "a1", "the first row identifies the turn");
@@ -491,6 +526,53 @@ mod tests {
         assert_eq!(turns[0].model.as_deref(), Some("claude-opus-5"));
         assert_eq!(turns[0].service_tier.as_deref(), Some("standard"));
         assert_eq!(turns[0].branch.as_deref(), Some("main"));
+    }
+
+    /// A span whose end nothing proves is absent, and the turn that carries it is kept anyway.
+    ///
+    /// The fault this prevents. "Settled" is inferred from an mtime, which moves only when a row is
+    /// appended, so a response that pauses for longer than the settle window looks finished while it is
+    /// still generating — and the next pass cannot correct it, because its duplicate turn is discarded by
+    /// the unique index on `request_id`. Whatever is written here is final. A truncated span is *shorter*
+    /// than the truth, so the rate derived from it is higher: the artefact reads as a machine responding
+    /// faster rather than as an error, which is the one shape of wrong number this tool must not produce.
+    #[test]
+    fn a_response_the_file_merely_ran_out_of_keeps_its_tokens_and_not_its_span() {
+        let first = assistant("a1", "p1", "req_1", "2026-06-27T00:00:10.000Z", "");
+        let second = assistant("a2", "a1", "req_1", "2026-06-27T00:00:11.000Z", "");
+        let turns = turns(&derive(&[&first, &second]));
+        assert_eq!(turns.len(), 1, "the turn is still worth keeping");
+        assert_eq!(turns[0].output_tokens, 378, "its tokens are known");
+        assert_eq!(
+            turns[0].generation_ms, None,
+            "nothing after the last row proves it was the last row"
+        );
+    }
+
+    /// A row this deriver has no opinion about must not end a response.
+    ///
+    /// `Kind::Other` used to close the open turn, on the theory that anything after an assistant row proves
+    /// the response finished. A prompt and a tool result do prove that — neither can be written while the
+    /// assistant is still speaking — but an unclassified row can be interleaved, and closing on one ends
+    /// the span early. The rest of the request is then dropped by `seen_requests`, so the truncated figure
+    /// is the one that reaches the database.
+    #[test]
+    fn an_unclassified_row_between_two_assistant_rows_does_not_end_the_response() {
+        let first = assistant("a1", "p1", "req_1", "2026-06-27T00:00:10.000Z", "");
+        let meta = r#"{"type":"user","uuid":"m1","isMeta":true,
+            "timestamp":"2026-06-27T00:00:11.000Z","sessionId":"s1",
+            "message":{"content":"a caveat the harness injected"}}"#;
+        let last = assistant("a2", "a1", "req_1", "2026-06-27T00:00:14.000Z", "");
+        let next = r#"{"type":"user","uuid":"p2","promptSource":"typed",
+            "timestamp":"2026-06-27T00:00:30.000Z","sessionId":"s1",
+            "message":{"content":"next"}}"#;
+        let turns = turns(&derive(&[&first, meta, &last, next]));
+        assert_eq!(turns.len(), 1, "still one request, still one turn");
+        assert_eq!(
+            turns[0].generation_ms,
+            Some(4_000),
+            "the span runs to the request's real last row, not to the row in the middle of it"
+        );
     }
 
     /// The dedupe set is a cache, not the guarantee, so it is allowed to be bounded.
