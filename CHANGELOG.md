@@ -2,7 +2,7 @@
 
 All notable changes to AgentBench are documented here. The project follows [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.8.0] - 2026-08-04
 
 The dashboard stops being read-only. Two pages join the machine view: one that starts a benchmark from a form
 instead of twelve flags, and one that compares two reports as a page instead of generating a file to open.
@@ -38,6 +38,13 @@ instead of twelve flags, and one that compares two reports as a page instead of 
 - **`compare` now computes a `Comparison` value that markdown and the page both render.** The CLI keeps its
   behaviour and its `--output diff.md`; what changed is that the arithmetic and the direction rules live in
   one place, so a page displaying the same numbers cannot reach a different verdict than the file beside it.
+- **The process-launch workload sends its child's output to the null device.** Inherited handles made the
+  cost of a spawn depend on what the *parent's* stdout happened to be, so the same benchmark run from a
+  terminal, run with its output piped to a file, and run from a logon task with no console measured three
+  slightly different things under one metric name; the null device is the same on every path. Expect a small
+  one-off step in `process.spawn_ms` history where the change lands. It also quiets the test suite, where this
+  program's own executable is the test harness and `internal-noop` reads as a filter matching nothing — 45
+  copies of "running 0 tests … filtered out" interleaved with the real results.
 - **A `405` names what the requested path accepts** rather than advertising `GET, HEAD` for every path alike,
   now that some paths answer `POST`. An unknown path is a `404` whatever the method: there is no allowed set
   to report for a path that does not exist.
@@ -67,6 +74,70 @@ instead of twelve flags, and one that compares two reports as a page instead of 
 
 ### Fixed
 
+- **The last turn of every session is imported.** A transcript is read while it is still live, and the
+  deriver deliberately withholds its final response then — a truncated span reads as a *faster* machine. The
+  position recorded afterwards claimed a complete read, and since neither size nor mtime ever moves again once
+  a session ends, the withheld turn was never asked for a second time. Measured on one real corpus: 436 turns
+  missing across 441 transcripts, one per file, taking their tokens, model, service tier and first-response
+  time with them. Losing them needed no unusual timing — the poll that reads a session's final rows is by
+  definition the one running within a poll interval of them being written. The change detector now carries
+  whether the read left anything a later read could add, so an incomplete one is revisited until the file
+  settles and then never again. A long-lived daemon was the worst affected, because a restart re-read the
+  short watermark and healed it by accident. The importer's tests ran with a clock set to 2027 against
+  fixtures written seconds earlier, which made every one of them settled before it had been read once and left
+  the live path unexercised; one of them now derives its clock from the fixture's own modification time.
+- **A panic in a request handler costs the request, not the daemon.** `Server::serve` had no panic boundary,
+  unlike the worker bodies in `Supervisor::spawn`, and it runs on the main thread — so an unwind left
+  `watch::run_with` through the back door. The workers were detached rather than stopped, each still holding a
+  `Sink` clone, and the writer thread they fed can only end once every sender is gone; the unwind therefore
+  blocked for ever inside `Store::drop` while holding the instance lock. The result was a process that
+  answered nothing, exited never, let no replacement daemon start, and reported `Collecting: yes` throughout.
+  Both halves are closed: the per-request work is wrapped and answers `500` with the fault in the event log,
+  and `Supervisor` now stops and joins its workers however it goes out of scope, so *any* unexpected exit ends
+  the process instead of wedging it.
+- **Query parameters no longer reach unchecked arithmetic.** `GET /api/series?to=-9223372036854775808` made
+  the default window's subtraction overflow: a panic under `overflow-checks`, which is every debug build, and
+  the trigger for the wedge above. It needed no privilege and no write gate — a `GET` any page can issue as an
+  `<img src=…>`, since CORS stops an attacker reading the response and not the server processing the request.
+  The range and the bucket width both saturate now.
+- **A benchmark started from the dashboard is marked in the database that daemon is writing.** `bench`
+  resolves the per-user data directory to find a dashboard to annotate, which is right for a run someone
+  types and wrong for one the daemon spawned itself: a daemon on `--data-dir` recorded no marker for its own
+  run, while the marker and its `bench:` metric rows landed in a different, possibly unrelated database. Both
+  halves were contrary to the design — the cliff a benchmark leaves in *this* daemon's passive series went
+  unannotated for a later baseline to average in, and rows taken under one configuration accumulated in
+  another daemon's history with nothing to distinguish them. `bench` takes a `--data-dir` that affects nothing
+  but the marker, and the dashboard passes its own.
+- **`limit` is honoured by every series family, and truncation is reported by all of them.** The probe,
+  conditions and session series read the parameter and ignored it, and both run-shaped families hardcoded
+  `truncated: false` while their SQL capped the rows — so a partial series described itself as whole. Worse,
+  the cap was `ORDER BY ts LIMIT n`, which keeps the *oldest* n: a range wider than the budget silently
+  dropped the recent end, the exact opposite of the passive series' documented policy of spending the budget
+  newest-first. All four families now agree, which also matters between the two frames that share a cursor.
+- **A daemon that cannot start a benchmark says so with a `500`.** Every failure from `Registry::start` was
+  reported as `409 Conflict` with "a benchmark is still running" as its rationale, including a reports
+  directory that could not be created and a child that would not launch — so the page displayed "the machine
+  is busy" for a full disk.
+- **A request body with no `Content-Length` is read rather than discarded.** `tiny_http` reports no length
+  for a chunked request and decodes the chunks through the same reader; the absence was read as zero, and a
+  valid chunked `POST /api/compare` was answered `unreadable report: EOF while parsing value` — an error
+  blaming the document for a body the server had thrown away. Browsers' `fetch` sends a length for a string
+  body, so the dashboard's own pages were unaffected; `fetch` with a stream body, and most other clients, are
+  not.
+- **A finished run's `ended_ms` is when its exit was seen, not when somebody asked.** The stamp was taken
+  where the run is concluded, which is the same instant only while the page is polling. Nothing polls a page
+  that has been closed, and the next `start` request then concluded the previous run at whatever time it
+  happened to arrive — reporting a two-minute benchmark as having taken an hour. The exit is stamped when it
+  is first observed, which the one-second poll keeps within a second of the truth. The exact end remains in
+  the run marker `bench` writes for itself.
+- **A standing probe failure no longer silences a different one.** One counter served every kind of problem
+  and spoke on every hundredth, so an unwritable scratch volume failing every fifteen minutes could suppress
+  the *first* report of an unrelated fault for up to 99 occurrences. The burst policy is per message now,
+  with a bound on how many distinct messages are remembered, because a failure's text can carry a byte count.
+- **An empty machine identity is refused rather than registered.** `machines.id` is the hashed hostname; every
+  measurement in the file is attributed to it and every query filters on it, so an empty one is not a machine
+  with a missing name but one key that every row belongs to. Only reachable by constructing an `Inventory` by
+  hand, and load-bearing enough to be worth a guard.
 - **A response's span is recorded only when something proves the response ended.** `generation_ms` is the
   interval from a request's first row to its last, and "the transcript has not changed for a while" does not
   establish the last one: an mtime moves only when a row is appended, so a response that pauses for longer
@@ -725,6 +796,8 @@ was different about the day it is describing, and every series the daemon collec
 - Privacy-safe JSON and Markdown reports with offline machine comparison.
 - Evidence-ranked diagnoses for system, network, security-scanner, and proxy bottlenecks.
 - Tag-driven Windows, Linux, macOS Intel, and macOS Apple Silicon GitHub releases.
+
+[0.8.0]: https://github.com/jazzonaut/agentbench/releases/tag/v0.8.0
 
 [0.7.0]: https://github.com/jazzonaut/agentbench/releases/tag/v0.7.0
 

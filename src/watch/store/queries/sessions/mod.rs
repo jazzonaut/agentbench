@@ -62,12 +62,22 @@ pub fn today(conn: &Connection, machine_id: &str, since_ms: i64, now_ms: i64) ->
     // One bucket spanning the whole day, so the day's figure and the chart's points come from the
     // same code and cannot drift apart.
     let whole_day = (now_ms - since_ms).max(1) + 1;
+    // No bucket budget: buckets are aligned to the epoch rather than to the day, so a day whose start does not
+    // fall on a multiple of its own width straddles two of them, and `first` deliberately takes the earlier.
+    // A budget of one would take the later instead and quietly change what every tile reports.
     let single = |series: SessionSeries| -> Result<Option<f64>> {
-        Ok(
-            session_series(conn, machine_id, series, since_ms, now_ms, whole_day)?
-                .first()
-                .map(|point| point.value),
-        )
+        Ok(session_series(
+            conn,
+            machine_id,
+            series,
+            since_ms,
+            now_ms,
+            whole_day,
+            usize::MAX,
+        )?
+        .points
+        .first()
+        .map(|point| point.value))
     };
 
     Ok(Today {

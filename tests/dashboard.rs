@@ -343,6 +343,52 @@ fn raw_post(
     Ok((status, head.to_string(), body.to_string()))
 }
 
+/// One `POST` whose body arrives chunked, so it carries no `Content-Length`.
+///
+/// Hand-written for the reason [`raw_post`] is: what makes this case interesting is a header a well-behaved
+/// helper would supply. `fetch` with a string body always sends a length, so the dashboard's own pages cannot
+/// produce this — `fetch` with a stream body, and most non-browser clients, send exactly this instead.
+fn raw_post_chunked(
+    authority: &str,
+    path: &str,
+    body: &str,
+    headers: &[(&str, &str)],
+) -> Result<(u16, String, String), String> {
+    let mut stream = TcpStream::connect(authority).map_err(|error| error.to_string())?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .map_err(|error| error.to_string())?;
+    use std::io::Write;
+    let mut request = format!(
+        "POST /{path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\
+         Transfer-Encoding: chunked\r\n"
+    );
+    for (name, value) in headers {
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    request.push_str("\r\n");
+    // One chunk, then the terminator. Enough to exercise the decoder without reimplementing it.
+    request.push_str(&format!("{:x}\r\n{body}\r\n0\r\n\r\n", body.len()));
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|error| error.to_string())?;
+    let mut raw = Vec::new();
+    stream
+        .read_to_end(&mut raw)
+        .map_err(|error| error.to_string())?;
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    let (head, body) = text
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| format!("malformed response: {text:?}"))?;
+    let status: u16 = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse().ok())
+        .unwrap_or(0);
+    Ok((status, head.to_string(), body.to_string()))
+}
+
 /// The headers this dashboard's own pages send on a request that acts.
 fn same_origin_headers(port: u16) -> Vec<(&'static str, String)> {
     vec![
@@ -381,6 +427,39 @@ fn a_request_carrying_someone_elses_host_is_refused() {
 
 /// A correct `Host` is not enough for a request that starts work.
 ///
+/// A body with no `Content-Length` is read, not discarded and then blamed on the document.
+///
+/// `tiny_http` reports no length for a chunked request and decodes the chunks through the same reader, so the
+/// body is available under the same size cap — but the length was read as "zero" and the handler was handed an
+/// empty `Vec`. A valid chunked `POST /api/compare` was therefore answered `unreadable report: EOF while
+/// parsing value line 1 column 0`, which describes a body the server threw away.
+///
+/// `{}` is sent rather than two whole reports because the assertion is about which error comes back: a
+/// complaint about a *missing field* proves the body arrived and parsed as JSON.
+#[test]
+fn a_chunked_request_body_reaches_the_handler() {
+    let daemon = Daemon::start(&[]);
+    daemon.wait_until_listening();
+    let authority = format!("127.0.0.1:{}", daemon.port);
+    let headers = same_origin_headers(daemon.port);
+    let pairs: Vec<(&str, &str)> = headers
+        .iter()
+        .map(|(name, value)| (*name, value.as_str()))
+        .collect();
+
+    let (status, head, body) =
+        raw_post_chunked(&authority, "api/compare", "{}", &pairs).expect("connect");
+    assert_eq!(status, 400, "{head} {body}");
+    assert!(
+        body.contains("missing field"),
+        "the body has to have reached serde rather than been discarded: {body}"
+    );
+    assert!(
+        !body.contains("EOF while parsing"),
+        "an EOF means the body was thrown away and the document blamed for it: {body}"
+    );
+}
+
 /// This is the gate the benchmark endpoints exist behind, and the reason it is not the `Host` check above.
 /// A form on `evil.example` submitting to `127.0.0.1:7878` sends exactly the `Host` this server expects —
 /// what it cannot send is a same-origin `Sec-Fetch-Site`, our own `Origin`, and a JSON content type. Each of
@@ -592,6 +671,27 @@ fn a_quick_benchmark_started_from_the_dashboard_writes_a_report() {
     assert_eq!(finished["ok"], true, "{finished}");
     assert_eq!(finished["cancelled"], false, "{finished}");
     assert_eq!(finished["exit_code"], 0, "{finished}");
+
+    // The marker lands in *this* daemon's database, which is the whole point of the daemon telling the child
+    // which one to write to. Without that, a daemon on `--data-dir` recorded nothing for a run it started
+    // itself — leaving the cliff the run left in its own passive series unannotated for a later baseline to
+    // average in — and put the marker and the run's metrics in whichever database the per-user default
+    // resolved to instead.
+    let status: serde_json::Value = serde_json::from_str(&daemon.get("/api/status")).expect("json");
+    assert_eq!(
+        status["health"]["run_markers"].as_i64(),
+        Some(1),
+        "the run this daemon started has to be marked in the database it is writing: {status}"
+    );
+    // And the run's own measurements are readable from here as a `bench:` series, under the source that keeps
+    // them out of the probe series they share a table with.
+    let series: serde_json::Value =
+        serde_json::from_str(&daemon.get("/api/series?metric=bench:cpu.single_mops_s"))
+            .expect("json");
+    assert!(
+        !series["points"].as_array().expect("points").is_empty(),
+        "the benchmark's metrics belong in the same database as its marker: {series}"
+    );
 
     // The report exists, parses, and is the schema this binary compares.
     let path = finished["report_path"].as_str().expect("a report path");

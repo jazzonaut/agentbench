@@ -46,15 +46,36 @@ struct Position {
     size: i64,
     /// Modification time when that offset was recorded.
     mtime_ms: i64,
+    /// Whether that read left anything a later read of the same bytes could still add.
+    ///
+    /// The third fact the change detector needs, and the only one that is not about the file. A pass over a
+    /// live transcript deliberately leaves its last response open — see [`import::import`] — so the read is
+    /// incomplete even though every byte of the file is accounted for. Without this the position claimed a
+    /// complete read of a file with a turn withheld from it, and since neither size nor mtime ever moves
+    /// again once the session ends, the withheld turn was never asked for a second time: one lost turn per
+    /// transcript, and per transcript rather than occasionally, because the poll that reads a session's final
+    /// rows is by definition the one running within a poll interval of them being written. Measured at 436
+    /// missing turns across 441 real transcripts.
+    ///
+    /// True for a settled read, and true for an unsettled one that held nothing back — a transcript whose
+    /// last row is a tool result has no open response, so there is nothing for a later pass to close.
+    complete: bool,
 }
 
 impl Position {
-    /// Whether a scanned transcript still looks exactly like what was read.
+    /// Whether a scanned transcript still looks exactly like what was read, and was read to the end of what
+    /// it had to give.
     ///
-    /// Both facts have to agree. Either one moving is a file to read again; a size that has *shrunk* is a
-    /// replaced file, which [`import`] handles by starting over.
+    /// All three facts have to agree. Either of the two file facts moving is a file to read again; a size
+    /// that has *shrunk* is a replaced file, which [`import`] handles by starting over. An incomplete read is
+    /// a file to read again whatever the bytes say, because the pass that made it withheld a measurement and
+    /// nothing else is ever going to ask for it.
+    ///
+    /// The re-read is bounded and it ends. The recorded offset already sits at the row still waiting, so what
+    /// gets re-read is the tail from there — capped by `import::MAX_REREAD_BYTES` — once per poll until the
+    /// transcript settles, and never again after that.
     fn matches(&self, transcript: &discovery::Transcript) -> bool {
-        self.mtime_ms == transcript.mtime_ms && self.size == transcript.size
+        self.complete && self.mtime_ms == transcript.mtime_ms && self.size == transcript.size
     }
 }
 
@@ -199,6 +220,11 @@ fn import_once(
                         // reads again, which is the answer that loses nothing.
                         size: transcript.size,
                         mtime_ms: mark.mtime,
+                        // A settled pass has closed everything it is going to; an unsettled one is complete
+                        // only if it held nothing back, which is what a resume offset that reached the end of
+                        // the file says. `mark.size` is that offset, so the comparison is "did the read stop
+                        // short of the file, and if so was it because a measurement is still open?".
+                        complete: settled || mark.size >= transcript.size,
                     },
                 );
                 // Sent last, so a crash mid-pass costs a re-read rather than a hole.
@@ -315,6 +341,12 @@ fn report(sink: &Sink, pass: &Pass, what: &str, started: Instant) {
 /// still waiting on a row the recovered size is short, and the first pass after a restart reads it again —
 /// at most the re-read budget, once. Recording the length as well would need a column, and a column is a
 /// migration for a fact that costs one bounded read to rediscover.
+///
+/// [`Position::complete`] needs no column either, and starts `true` rather than `false`, because the short
+/// recovered size already answers the question it would: a transcript that had a measurement open recorded a
+/// resume offset behind its own length, so [`Position::matches`] finds a size that disagrees with the scan and
+/// reads the file again. One whose read held nothing back recorded its length, matches, and is skipped — which
+/// is the promise that restarting the daemon does no work at all.
 fn load_positions(reader: &Reader) -> anyhow::Result<HashMap<PathBuf, Position>> {
     Ok(queries::sessions::watermarks(reader.conn())?
         .into_iter()
@@ -325,6 +357,7 @@ fn load_positions(reader: &Reader) -> anyhow::Result<HashMap<PathBuf, Position>>
                     offset: mark.size,
                     size: mark.size,
                     mtime_ms: mark.mtime,
+                    complete: true,
                 },
             )
         })
@@ -358,10 +391,35 @@ mod tests {
         )
     }
 
+    /// A finished session: one prompt and the assistant's final answer, with nothing after it.
+    ///
+    /// The shape [`transcript`] deliberately is not. Its tool result closes the turn by proving the response
+    /// before it had ended, so that fixture yields its measurement whether or not the file has settled — which
+    /// is why it cannot see the loss `a_transcript_read_before_it_settled_is_read_again` is about. Every real
+    /// transcript ends this way instead, on the assistant message the session stopped at.
+    fn transcript_ending_on_a_response(id: &str) -> String {
+        format!(
+            r#"{{"type":"user","uuid":"p{id}","timestamp":"2026-06-27T00:00:10.000Z","message":{{"content":"go"}}}}
+{{"type":"assistant","uuid":"a{id}","parentUuid":"p{id}","requestId":"req_{id}","timestamp":"2026-06-27T00:00:12.000Z","sessionId":"s{id}","cwd":"D:\\Work","gitBranch":"main","version":"2.1.187","message":{{"model":"claude-opus-5","usage":{{"input_tokens":5,"output_tokens":7}},"content":[]}}}}
+"#
+        )
+    }
+
     fn write(root: &Path, name: &str, text: &str) {
         let path = root.join("D--Work").join(name);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, text).unwrap();
+    }
+
+    /// A file's modification time in epoch milliseconds, as [`discovery`] reports it.
+    fn modified_ms(path: &Path) -> i64 {
+        std::fs::metadata(path)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
     }
 
     fn open_store(path: &Path) -> Store {
@@ -388,11 +446,24 @@ mod tests {
     /// The store is closed and reopened so the assertions read committed rows rather than racing the
     /// writer thread, which is also how the daemon behaves across a restart.
     fn import_into(db: &Path, root: &Path, passes: usize) -> Imported {
+        // A constant far in the future, which makes every fixture settled on its first pass. Fine for the
+        // tests that are about watermarks and appends, and exactly what hid the unsettled path for a
+        // release: see `import_into_from`.
+        import_into_from(db, root, passes, 1_800_000_000_000)
+    }
+
+    /// As [`import_into`], with the clock starting at `start_ms`.
+    ///
+    /// The parameter exists because a constant start time is a trap here. Whether a transcript has settled is
+    /// `now - mtime` against two poll intervals, and the fixtures are written by the test, so a clock set to
+    /// 2027 makes every one of them settled before it has been read once — leaving the live-transcript path
+    /// that every real first read takes unexercised.
+    fn import_into_from(db: &Path, root: &Path, passes: usize, start_ms: i64) -> Imported {
         let store = open_store(db);
         {
             let sink = store.sink();
             let reader = store.reader().unwrap();
-            let clock = FakeClock::new(1_800_000_000_000, passes);
+            let clock = FakeClock::new(start_ms, passes);
             run(&config(root.to_path_buf()), &clock, &sink, &reader);
         }
         store.shutdown().unwrap();
@@ -523,6 +594,84 @@ mod tests {
         assert_eq!(
             second.turns, 2,
             "the appended turn is longer than the file was, whatever the timestamp says"
+        );
+    }
+
+    /// The last turn of a session is imported once the file settles, not lost because it was read too soon.
+    ///
+    /// The bug this covers cost one turn per transcript, permanently: the first poll to reach a session's
+    /// final rows is by definition within a poll interval of them, so the file was not settled and the
+    /// deriver withheld its last response — correctly, since a truncated span reads as a faster machine. The
+    /// position then recorded the file's full length, `matches` returned true on every later pass, and the
+    /// withheld turn was never asked for again. Measured on one real corpus: 436 turns missing across 441
+    /// transcripts.
+    ///
+    /// Four passes at the thirty-second poll interval. Settling takes more than two of them, so passes one to
+    /// three see a live file and only the fourth, at ninety seconds, can close the response.
+    #[test]
+    fn a_transcript_read_before_it_settled_is_read_again() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("projects");
+        write(&root, "one.jsonl", &transcript_ending_on_a_response("1"));
+        let mtime = modified_ms(&root.join("D--Work").join("one.jsonl"));
+
+        // One pass, from the file's own modification time: the transcript is live, so its last response is
+        // deliberately withheld. This is the reading the old position recorded as complete.
+        let live = import_into_from(&temp.path().join("live.db"), &root, 1, mtime);
+        assert_eq!(
+            live.turns, 0,
+            "a response still arriving is not a measurement yet"
+        );
+
+        let settled = import_into_from(&temp.path().join("settled.db"), &root, 4, mtime);
+        assert_eq!(
+            settled.turns, 1,
+            "the withheld turn has to be asked for again once the file has settled"
+        );
+    }
+
+    /// The change detector's rule, stated on its own: three facts, and each one alone is a reason to re-read.
+    ///
+    /// `complete` is the fact that is not about the file, and the one a naive fix gets backwards. Keying the
+    /// re-read on "was it settled?" instead would revisit every quiet transcript for ever, including the ones
+    /// that had nothing open to close.
+    #[test]
+    fn an_incomplete_read_is_revisited_and_a_complete_one_is_not() {
+        let scanned = discovery::Transcript {
+            path: PathBuf::from("one.jsonl"),
+            size: 100,
+            mtime_ms: 5,
+        };
+        let read = Position {
+            offset: 100,
+            size: 100,
+            mtime_ms: 5,
+            complete: true,
+        };
+        assert!(
+            read.matches(&scanned),
+            "nothing has changed and nothing is open"
+        );
+        assert!(
+            !Position {
+                offset: 40,
+                complete: false,
+                ..read
+            }
+            .matches(&scanned),
+            "a response was withheld, so the file has more to give"
+        );
+        assert!(
+            !Position { size: 90, ..read }.matches(&scanned),
+            "the file grew after it was read"
+        );
+        assert!(
+            !Position {
+                mtime_ms: 4,
+                ..read
+            }
+            .matches(&scanned),
+            "the file was touched after it was read"
         );
     }
 

@@ -137,7 +137,14 @@ pub fn handle(req: &Req, reader: &Reader) -> Resp {
 
     let now = crate::watch::store::now_ms();
     let to = req.param_i64("to").unwrap_or(now);
-    let from = req.param_i64("from").unwrap_or(to - DEFAULT_WINDOW_MS);
+    // Saturating, because both ends of the range are whatever a caller put in the query string. `to=i64::MIN`
+    // made this subtraction overflow: a panic under `overflow-checks`, which is every debug build, and this
+    // handler runs on the thread that serves the dashboard — so one `GET` anybody's page could issue as an
+    // `<img src=…>` took the whole daemon down. A wrap in release was harmless only by luck, since the
+    // wrapped value happened to fail the guard below.
+    let from = req
+        .param_i64("from")
+        .unwrap_or_else(|| to.saturating_sub(DEFAULT_WINDOW_MS));
     if from > to {
         return Resp::error(400, "from must not be after to");
     }
@@ -180,22 +187,23 @@ pub fn handle(req: &Req, reader: &Reader) -> Resp {
                 from,
                 to,
                 uncontended_only,
+                limit,
             ) {
-                Ok(points) => Resp::json(&Series {
+                Ok(rows) => Resp::json(&Series {
                     metric: series.wire_name(),
                     from,
                     to,
                     // Probes are far enough apart that a missed one is a real gap worth breaking the
                     // line on, and the observed cadence is the only thing that knows the interval —
                     // configuration can have changed several times across the range.
-                    gap_ms: gap_threshold_ms(&points),
+                    gap_ms: gap_threshold_ms(&rows.points),
                     bucket_ms: None,
                     unit: probe.spec.unit,
                     lower_is_better: Some(probe.spec.lower_is_better),
                     resolution: None,
                     rollup_reducer: None,
-                    truncated: false,
-                    points,
+                    truncated: rows.truncated,
+                    points: rows.points,
                 }),
                 Err(error) => Resp::error(500, &format!("probe series query failed: {error}")),
             }
@@ -208,21 +216,22 @@ pub fn handle(req: &Req, reader: &Reader) -> Resp {
                 from,
                 to,
                 uncontended_only,
+                limit,
             ) {
-                Ok(points) => Resp::json(&Series {
+                Ok(rows) => Resp::json(&Series {
                     metric: series.wire_name(),
                     from,
                     to,
                     // One point per run, at the probe cadence, so a missed probe is as real a gap here as
                     // it is in the frame above.
-                    gap_ms: gap_threshold_ms(&points),
+                    gap_ms: gap_threshold_ms(&rows.points),
                     bucket_ms: None,
                     unit: cond.unit(),
                     lower_is_better: None,
                     resolution: None,
                     rollup_reducer: None,
-                    truncated: false,
-                    points,
+                    truncated: rows.truncated,
+                    points: rows.points,
                 }),
                 Err(error) => Resp::error(500, &format!("conditions query failed: {error}")),
             }
@@ -239,8 +248,9 @@ pub fn handle(req: &Req, reader: &Reader) -> Resp {
                 from,
                 to,
                 bucket,
+                limit,
             ) {
-                Ok(points) => Resp::json(&Series {
+                Ok(rows) => Resp::json(&Series {
                     metric: series.wire_name(),
                     from,
                     to,
@@ -251,8 +261,8 @@ pub fn handle(req: &Req, reader: &Reader) -> Resp {
                     lower_is_better: None,
                     resolution: None,
                     rollup_reducer: None,
-                    truncated: false,
-                    points,
+                    truncated: rows.truncated,
+                    points: rows.points,
                 }),
                 Err(error) => Resp::error(500, &format!("series query failed: {error}")),
             }
@@ -261,8 +271,11 @@ pub fn handle(req: &Req, reader: &Reader) -> Resp {
 }
 
 /// Bucket width for a range, wide enough that a bucket holds a usable number of calls.
+///
+/// Saturating for the same reason the default range is: `from` and `to` are caller-supplied, and a width of
+/// `(i64::MAX - i64::MIN) / 120` is a wide bucket, while the subtraction that produced it was a panic.
 fn bucket_ms(from: i64, to: i64) -> i64 {
-    ((to - from) / TARGET_BUCKETS).max(MIN_BUCKET_MS)
+    (to.saturating_sub(from) / TARGET_BUCKETS).max(MIN_BUCKET_MS)
 }
 
 /// Infer a gap threshold from the observed cadence.

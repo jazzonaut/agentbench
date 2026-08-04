@@ -48,7 +48,12 @@ fn sleep_unless_shutdown(shutdown: &AtomicBool, total: Duration) {
 ///
 /// Anything else is reported as unreadable rather than guessed at: the point of the line is to name
 /// the fault, and a payload nobody can print is itself worth saying out loud.
-fn describe(payload: &(dyn Any + Send)) -> &str {
+///
+/// Shared with [`serve`], which catches a panic for the same reason and has to describe it the same way. Two
+/// copies of this would eventually disagree about which payload types are worth downcasting.
+///
+/// [`serve`]: crate::watch::serve
+pub(crate) fn describe(payload: &(dyn Any + Send)) -> &str {
     if let Some(message) = payload.downcast_ref::<&'static str>() {
         message
     } else if let Some(message) = payload.downcast_ref::<String>() {
@@ -247,6 +252,19 @@ impl Supervisor {
     ///
     /// [`spawn`]: Supervisor::spawn
     pub fn shutdown(mut self) -> Result<()> {
+        let panicked = self.stop();
+        if !panicked.is_empty() {
+            bail!("worker thread(s) panicked: {}", panicked.join(", "));
+        }
+        Ok(())
+    }
+
+    /// Ask every worker to stop and wait for it, naming the ones that panicked.
+    ///
+    /// Idempotent, because both [`shutdown`] and [`Drop`] call it and the first may already have run.
+    ///
+    /// [`shutdown`]: Supervisor::shutdown
+    fn stop(&mut self) -> Vec<&'static str> {
         self.request_shutdown();
         let mut panicked = Vec::new();
         for worker in &mut self.workers {
@@ -256,10 +274,29 @@ impl Supervisor {
                 panicked.push(worker.name);
             }
         }
-        if !panicked.is_empty() {
-            bail!("worker thread(s) panicked: {}", panicked.join(", "));
-        }
-        Ok(())
+        panicked
+    }
+}
+
+/// Stop and join the workers however this supervisor goes out of scope.
+///
+/// Not a tidy-up. The worker threads hold [`Sink`] clones, and the writer thread behind that sink only ends
+/// when *every* sender has been dropped — so `Store`'s own `Drop`, which waits for the writer, cannot finish
+/// while a worker is still alive. Leaving the handles to be dropped unjoined therefore did not detach the
+/// workers harmlessly: it hung the process.
+///
+/// The path that showed it was a panic in an HTTP handler. Serving occupies the main thread, so the panic
+/// unwound out of `watch::run_with` without reaching `shutdown()`; the workers kept collecting, the writer
+/// could never see its channel close, and the unwind blocked for ever inside `Store::drop` still holding the
+/// instance lock — a daemon that answered nothing, exited never, and let no replacement start. The handler
+/// panic has its own boundary now, and this makes any *other* unexpected exit from `run_with` end the process
+/// rather than wedge it.
+impl Drop for Supervisor {
+    fn drop(&mut self) {
+        // The names are discarded rather than reported. A panic reaching here is a panic outside the worker
+        // body — `spawn` catches the ones inside it — and the sink this would complain through is being torn
+        // down in the same breath, so there is nowhere left for the complaint to be written.
+        let _ = self.stop();
     }
 }
 
@@ -414,6 +451,46 @@ mod tests {
             started.elapsed() < RESTART_BACKOFF,
             "shutdown waited {:?} of a {RESTART_BACKOFF:?} backoff",
             started.elapsed()
+        );
+    }
+
+    /// Dropping a supervisor stops its workers, which is what keeps an unwind from hanging the process.
+    ///
+    /// The worker holds a sink clone; the writer thread ends only when the last sender is gone. So a
+    /// supervisor that dropped without joining left `Store::drop` waiting on a channel that could never
+    /// close — which is how a panic in an HTTP handler turned into a daemon that never exited and never
+    /// released its instance lock. The assertion is that the thread is *finished* after the drop, not merely
+    /// that the drop returned.
+    #[test]
+    fn dropping_a_supervisor_stops_and_joins_its_workers() {
+        let (sink, _receiver) = sink();
+        let running = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::new(AtomicBool::new(false));
+        {
+            let mut supervisor = Supervisor::new(sink);
+            let flag = supervisor.shutdown_flag();
+            let entered = running.clone();
+            let left = stopped.clone();
+            supervisor
+                .spawn("dropped", false, move || {
+                    entered.store(true, Ordering::Relaxed);
+                    while !flag.load(Ordering::Relaxed) {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    left.store(true, Ordering::Relaxed);
+                })
+                .unwrap();
+            for _ in 0..500 {
+                if running.load(Ordering::Relaxed) {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(2));
+            }
+            assert!(running.load(Ordering::Relaxed), "the worker never started");
+        }
+        assert!(
+            stopped.load(Ordering::Relaxed),
+            "the drop must have joined the worker, not detached it"
         );
     }
 

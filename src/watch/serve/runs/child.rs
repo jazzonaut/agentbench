@@ -41,6 +41,17 @@ pub struct Running {
     /// The tail of stderr, oldest first.
     stderr: Arc<Mutex<Vec<String>>>,
     readers: Vec<thread::JoinHandle<()>>,
+    /// When the exit was *first* observed, in epoch milliseconds.
+    ///
+    /// Recorded the moment [`Running::exit_status`] sees the child has gone, rather than when the caller gets
+    /// round to concluding the run. The two are usually a fraction of a second apart, because the page polls
+    /// every second while a run is in flight — but not always: a page that was closed leaves nobody polling,
+    /// and the next `start` request concludes the previous run at whatever time it happens to arrive. That
+    /// stamped a two-minute benchmark as having taken an hour.
+    ///
+    /// Still an observation and not the child's own clock. The exact end is in the run marker `bench` writes
+    /// for itself; what this promises is "when this daemon saw it stop", to within one poll.
+    exited_ms: Option<i64>,
 }
 
 impl Running {
@@ -103,6 +114,7 @@ impl Running {
             phase,
             stderr,
             readers,
+            exited_ms: None,
         })
     }
 
@@ -119,12 +131,23 @@ impl Running {
     /// An error from the operating system is reported as "finished": a child that cannot be asked about is
     /// not a child worth continuing to poll, and treating it as still running would leave the page saying a
     /// benchmark was in flight for ever.
+    ///
+    /// Stamps [`Running::exited_ms`] the first time the answer is "finished", so the run's end is the moment it
+    /// was seen rather than the moment somebody asked what happened.
     pub fn exit_status(&mut self) -> Option<Option<i32>> {
-        match self.child.try_wait() {
+        let code = match self.child.try_wait() {
             Ok(Some(status)) => Some(status.code()),
-            Ok(None) => None,
+            Ok(None) => return None,
             Err(_) => Some(None),
-        }
+        };
+        self.exited_ms
+            .get_or_insert_with(crate::watch::store::now_ms);
+        code
+    }
+
+    /// When this child's exit was first observed, if it has been.
+    pub fn exited_ms(&self) -> Option<i64> {
+        self.exited_ms
     }
 
     /// Ask the operating system to end the child.

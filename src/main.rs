@@ -64,6 +64,15 @@ enum Command {
         no_tui: bool,
         #[arg(long)]
         output: Option<PathBuf>,
+        /// Dashboard data directory whose database this run should be marked in.
+        ///
+        /// Affects nothing but the run marker. A benchmark puts a cliff in every passive series, and the
+        /// marker is what stops a later baseline averaging that cliff in as degradation — so it has to land
+        /// in the database the daemon observing this machine is writing. Defaults to the per-user data
+        /// directory, which is where a hand-typed run belongs; the dashboard passes its own, because a run
+        /// it started is a run whose daemon is known.
+        #[arg(long, verbatim_doc_comment)]
+        data_dir: Option<PathBuf>,
     },
     /// Collect metrics in the background and serve a local web dashboard.
     Dashboard {
@@ -217,6 +226,7 @@ fn main() -> Result<()> {
             elevated,
             no_tui,
             output,
+            data_dir,
         } => {
             let target_dir = target_dir.canonicalize().with_context(|| {
                 format!("target directory does not exist: {}", target_dir.display())
@@ -264,7 +274,7 @@ fn main() -> Result<()> {
             // Marked before the load starts and again after the report is written, so an interrupted run
             // still explains the cliff it left in the dashboard's passive series. Silently a no-op when
             // no dashboard database exists, which is the common case.
-            let marking = mark_run("benchmark", Some(preset.name()));
+            let marking = mark_run("benchmark", Some(preset.name()), data_dir);
             let completed = if use_tui {
                 let tui_options = options.clone();
                 let run = move |cancel, progress| {
@@ -339,7 +349,7 @@ fn main() -> Result<()> {
             output,
             command,
         } => {
-            let marking = mark_run("profile", None);
+            let marking = mark_run("profile", None, None);
             let completed = profile::run_report(
                 &label,
                 &command,
@@ -362,7 +372,7 @@ fn main() -> Result<()> {
             elevated,
             output,
         } => {
-            let marking = mark_run("experiment", None);
+            let marking = mark_run("experiment", None, None);
             let completed = experiment::run(&config, elevated)?;
             let paths = report::write_report(&completed, output.as_deref())?;
             // Also no metrics, for the same reason: an experiment's cases are whatever the TOML said.
@@ -388,9 +398,15 @@ fn main() -> Result<()> {
 /// Every command that loads this machine calls this, because every one of them puts a cliff in the passive
 /// series that a later baseline would otherwise average in as degradation. A machine with no dashboard
 /// gets a no-op that says nothing and costs nothing.
-fn mark_run(kind: &str, preset: Option<&str>) -> watch::marker::Marking {
+///
+/// `data_dir` is `None` for a run nobody told where to look, which resolves the per-user directory the way
+/// the daemon does. Only `bench` accepts an override, and only because the dashboard passes one: a run the
+/// daemon spawned itself must be marked in that daemon's database rather than in whichever one the default
+/// resolves to. Without it, a benchmark started from a dashboard running on `--data-dir` wrote its marker and
+/// its `bench:` metric rows into an unrelated database and left its own cliff unannotated.
+fn mark_run(kind: &str, preset: Option<&str>, data_dir: Option<PathBuf>) -> watch::marker::Marking {
     watch::marker::Marking::begin(
-        None,
+        data_dir,
         &uuid::Uuid::new_v4().to_string(),
         kind,
         preset,

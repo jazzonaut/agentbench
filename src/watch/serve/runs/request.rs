@@ -151,7 +151,14 @@ impl ValidRequest {
     /// the `[n/8]` lines are what the run supervisor reads. `--output` is unconditional too — the daemon
     /// chooses where the report lands rather than leaving it in whatever directory the daemon was started
     /// from, which for a logon task is not a directory the user would think to look in.
-    pub fn to_args(&self, report_path: &Path) -> Vec<String> {
+    ///
+    /// `--data-dir` is the third the daemon decides rather than the request, and it exists for the marker.
+    /// `bench` writes a run marker and its `bench:` metric rows into the dashboard database it can find, and
+    /// left to itself it resolves the per-user default — so a daemon started on `--data-dir` got a benchmark
+    /// it had spawned itself recorded in a *different* database, while the cliff the run left in its own
+    /// passive series went unannotated for a later baseline to average in. The daemon knows its own directory,
+    /// and this is where it says so.
+    pub fn to_args(&self, report_path: &Path, data_dir: &Path) -> Vec<String> {
         let mut args = vec![
             "bench".to_string(),
             "--preset".to_string(),
@@ -161,6 +168,8 @@ impl ValidRequest {
             "--no-tui".to_string(),
             "--output".to_string(),
             report_path.display().to_string(),
+            "--data-dir".to_string(),
+            data_dir.display().to_string(),
             "--llm-route".to_string(),
             self.llm_route.to_string(),
             "--llm-model".to_string(),
@@ -290,10 +299,34 @@ mod tests {
         assert_eq!(valid.preset().name(), "standard");
         assert!(!valid.live_llm(), "a form submission must not spend money");
 
-        let args = valid.to_args(Path::new("report.json"));
+        let args = valid.to_args(Path::new("report.json"), Path::new("D:\\data"));
         assert!(args.contains(&"--no-live-llm".to_string()), "{args:?}");
         assert!(args.contains(&"--no-tui".to_string()), "{args:?}");
         assert_eq!(args[0], "bench");
+    }
+
+    /// A dashboard-started run is marked in the daemon's own database, not in whichever one the default
+    /// resolves to.
+    ///
+    /// The marker is the whole reason `watch::marker` exists: without it the cliff a benchmark leaves in the
+    /// passive series is indistinguishable from a machine getting slower, and a later baseline averages it in.
+    /// A daemon on `--data-dir` used to get neither half of that — no marker in its own database, and the
+    /// marker plus 120 `bench:` metric rows in an unrelated one.
+    #[test]
+    fn the_child_is_told_which_database_to_mark_the_run_in() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("daemon-data");
+        std::fs::create_dir(&data_dir).unwrap();
+        let args = request("{}")
+            .validate(temp.path())
+            .expect("valid")
+            .to_args(Path::new("report.json"), &data_dir);
+
+        let index = args
+            .iter()
+            .position(|arg| arg == "--data-dir")
+            .expect("the daemon has to name its own data directory");
+        assert_eq!(args[index + 1], data_dir.display().to_string(), "{args:?}");
     }
 
     /// The one difference from the command line's own defaults, and the reason for it.
@@ -313,7 +346,7 @@ mod tests {
         assert!(valid.live_llm());
         assert!(
             valid
-                .to_args(Path::new("r.json"))
+                .to_args(Path::new("r.json"), temp.path())
                 .contains(&"--live-llm".to_string())
         );
     }
@@ -504,7 +537,7 @@ mod tests {
         let args = request(&json)
             .validate(temp.path())
             .expect("an awkward name is still a directory")
-            .to_args(Path::new("r.json"));
+            .to_args(Path::new("r.json"), temp.path());
 
         let index = args
             .iter()

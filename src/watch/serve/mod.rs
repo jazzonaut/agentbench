@@ -15,11 +15,13 @@ pub mod runs;
 use crate::watch::{
     config::{ServerConfig, WatchConfig},
     store::{Level, Sink, Store, WriterHealth},
+    supervisor,
 };
 use anyhow::{Context, Result};
 use response::{Method, Req, Resp};
 use std::{
     net::SocketAddr,
+    panic::AssertUnwindSafe,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -202,41 +204,85 @@ impl Server {
             };
             accept_failures = 0;
             let mut request = request;
-            let method = Method::parse(request.method().as_str());
-            // Three gates, in widening order of what they cost to check and narrowing order of what they
-            // let through. All of them run before the database is opened.
-            let response = if !origin::is_own_host(host_header(&request), port) {
-                // A rebound request is not a request for this server, and answering it at all is the whole
-                // of the vulnerability.
-                Resp::error(
-                    421,
-                    "this dashboard answers only to its own loopback address",
-                )
-            } else if method.is_write() && !write_is_permitted(&request, port) {
-                // Correctly addressed and still not ours: see `origin::is_same_origin_write`. A `403`
-                // rather than a `421`, because the address was right and the provenance was not.
-                Resp::error(
-                    403,
-                    "a request that starts work must come from this dashboard's own page",
-                )
-            } else {
-                match read_body(&mut request) {
-                    Err(response) => response,
-                    Ok(body) => match store.reader() {
-                        Ok(reader) => {
-                            let req = Req::parse(request.url())
-                                .with_method(method)
-                                .with_body(body);
-                            router::route(&req, &reader, &settings)
-                        }
-                        Err(error) => Resp::error(503, &format!("database unavailable: {error}")),
-                    },
+            // A panic in a handler must cost the request and not the daemon. Bound here rather than trusted
+            // not to happen, for the same reason `Supervisor::spawn` bounds its worker body — and with more
+            // at stake, because this runs on the main thread: an unwind out of `serve` leaves `run_with`
+            // through the back door, and the collectors, the writer and the instance lock all go with it.
+            //
+            // `AssertUnwindSafe` needs stating. The reader is opened and dropped inside, the request is not
+            // touched again on this path, and the one piece of shared state a handler can reach with an
+            // invariant of its own is the run registry's mutex. A panic while that is held poisons it, and
+            // every later benchmark request then answers 500 through this same boundary — a lost feature
+            // rather than a lost daemon, which is the trade this is here to make.
+            let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                dispatch(&mut request, port, store, &settings)
+            }));
+            let response = match outcome {
+                Ok(response) => response,
+                Err(payload) => {
+                    sink.log(
+                        Level::Error,
+                        "serve",
+                        format!(
+                            "a request handler panicked and the dashboard answered 500; collection is \
+                             unaffected: {} {}: {}",
+                            request.method().as_str(),
+                            request.url(),
+                            supervisor::describe(&*payload)
+                        ),
+                    );
+                    Resp::error(500, "the dashboard could not handle that request")
                 }
             };
             if let Err(error) = respond(request, &response) {
                 sink.log(Level::Warn, "serve", format!("failed to respond: {error}"));
             }
         }
+    }
+}
+
+/// The gates, the body and the route for one request.
+///
+/// Three gates, in widening order of what they cost to check and narrowing order of what they let through.
+/// All of them run before the database is opened.
+///
+/// Separate from the accept loop so the panic boundary has one call to wrap, rather than a closure holding
+/// the whole loop body and therefore the failure counter it must not lose.
+fn dispatch(
+    request: &mut tiny_http::Request,
+    port: u16,
+    store: &Store,
+    settings: &Settings,
+) -> Resp {
+    let method = Method::parse(request.method().as_str());
+    if !origin::is_own_host(host_header(request), port) {
+        // A rebound request is not a request for this server, and answering it at all is the whole of the
+        // vulnerability.
+        return Resp::error(
+            421,
+            "this dashboard answers only to its own loopback address",
+        );
+    }
+    if method.is_write() && !write_is_permitted(request, port) {
+        // Correctly addressed and still not ours: see `origin::is_same_origin_write`. A `403` rather than a
+        // `421`, because the address was right and the provenance was not.
+        return Resp::error(
+            403,
+            "a request that starts work must come from this dashboard's own page",
+        );
+    }
+    let body = match read_body(request) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    match store.reader() {
+        Ok(reader) => {
+            let req = Req::parse(request.url())
+                .with_method(method)
+                .with_body(body);
+            router::route(&req, &reader, settings)
+        }
+        Err(error) => Resp::error(503, &format!("database unavailable: {error}")),
     }
 }
 
@@ -265,18 +311,28 @@ fn write_is_permitted(request: &tiny_http::Request, port: u16) -> bool {
 /// claim rather than a fact. A report with its samples is tens of kilobytes, so the limit is generous by two
 /// orders of magnitude and still finite — which is what stops a single request from exhausting the memory of
 /// a daemon that is meant to be the least noticeable thing on the machine.
+///
+/// An absent length is a body of unknown size, not an empty one. `tiny_http` reports `None` for a chunked
+/// request and decodes the chunks through the same reader, so the stream is read under the same cap. Treating
+/// the absence as zero discarded the body and then blamed the document: a valid chunked `POST /api/compare`
+/// was answered `unreadable report: EOF while parsing value`. Browsers' `fetch` sends a length for a string
+/// body, so the dashboard's own pages never hit it — `fetch` with a *stream* body, and plenty of other
+/// clients, do.
 fn read_body(request: &mut tiny_http::Request) -> Result<Vec<u8>, Resp> {
-    let declared = request.body_length().unwrap_or(0);
-    if declared > MAX_BODY_BYTES {
+    let declared = request.body_length();
+    if declared.is_some_and(|length| length > MAX_BODY_BYTES) {
         return Err(Resp::error(
             413,
             &format!("a request body may not exceed {MAX_BODY_BYTES} bytes"),
         ));
     }
-    if declared == 0 {
+    if declared == Some(0) {
         return Ok(Vec::new());
     }
-    let mut body = Vec::with_capacity(declared);
+    // Only the declared length is trusted for the allocation, and only as a hint. An unknown length reserves
+    // nothing and lets the read grow the buffer, which is what keeps `Transfer-Encoding: chunked` from being
+    // an eight-mebibyte allocation for a request that turns out to carry twelve bytes.
+    let mut body = Vec::with_capacity(declared.unwrap_or(0));
     // One byte past the limit, so a body whose declared length understated it is caught rather than silently
     // truncated into something that might still parse.
     let mut limited = std::io::Read::take(request.as_reader(), MAX_BODY_BYTES as u64 + 1);

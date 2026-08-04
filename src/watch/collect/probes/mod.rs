@@ -25,6 +25,7 @@ use crate::watch::{
 use covariates::Observer;
 use scratch::Scratch;
 use std::{
+    collections::HashMap,
     path::Path,
     sync::{Arc, atomic::AtomicBool},
 };
@@ -67,7 +68,7 @@ pub fn run(config: &CollectConfig, data_dir: &Path, clock: &dyn Clock, sink: &Si
     // that checks a flag it can never see set is a workload that reads no flag at all.
     let cancel = Arc::new(AtomicBool::new(false));
     let mut scratch: Option<Scratch> = None;
-    let mut failures = 0_u64;
+    let mut failures = Failures::default();
     let mut warmed = false;
 
     while clock.sleep(config.probe_interval) {
@@ -79,11 +80,7 @@ pub fn run(config: &CollectConfig, data_dir: &Path, clock: &dyn Clock, sink: &Si
             match Scratch::prepare(config, data_dir) {
                 Ok(prepared) => scratch = Some(prepared),
                 Err(error) => {
-                    report(
-                        sink,
-                        &format!("no scratch directory: {error:#}"),
-                        &mut failures,
-                    );
+                    failures.report(sink, &format!("no scratch directory: {error:#}"));
                     continue;
                 }
             }
@@ -126,7 +123,7 @@ pub fn run(config: &CollectConfig, data_dir: &Path, clock: &dyn Clock, sink: &Si
         for problem in scratch.tidy() {
             sink.log(Level::Warn, "prober", format!("scratch: {problem}"));
         }
-        report_failures(sink, &outcome.failures, &mut failures);
+        failures.report_each(sink, &outcome.failures);
 
         if outcome.metrics.is_empty() {
             // A run with no measurements is not a data point. Recording the covariates alone would put
@@ -146,24 +143,56 @@ pub fn run(config: &CollectConfig, data_dir: &Path, clock: &dyn Clock, sink: &Si
     }
 }
 
-/// Log every failure, but say so only in bursts.
+/// Distinct failure messages counted separately before they share a bucket.
 ///
-/// The count is always advanced, so the message carries how many went unreported.
-fn report(sink: &Sink, problem: &str, seen: &mut u64) {
-    *seen += 1;
-    if *seen % FAILURE_REPORT_EVERY == 1 {
-        sink.log(
-            Level::Warn,
-            "prober",
-            format!("{problem} ({seen} failure(s) so far)"),
-        );
-    }
+/// The map is keyed by the message, so an unbounded one is a memory leak with an external trigger: a failure
+/// whose text carries a byte count or a temporary path produces a fresh key every time. Past this many, new
+/// messages fall into a shared count — which loses the per-message burst policy for them and keeps the
+/// process's memory a fact about this file rather than about what the disk decided to say.
+const MAX_DISTINCT_FAILURES: usize = 32;
+
+/// How many of each kind of failure have been seen, so a burst of one does not silence another.
+///
+/// One shared counter meant a standing failure suppressed the *first* report of a genuinely new one for up to
+/// 99 occurrences: an unwritable scratch volume failing every fifteen minutes held the count near a multiple
+/// of [`FAILURE_REPORT_EVERY`] for ever, and a different fault arriving in between was counted and never
+/// mentioned.
+#[derive(Debug, Default)]
+struct Failures {
+    seen: HashMap<String, u64>,
+    /// Everything past [`MAX_DISTINCT_FAILURES`], counted together.
+    overflow: u64,
 }
 
-/// Report each of a probe's workload failures through [`report`].
-fn report_failures(sink: &Sink, problems: &[String], seen: &mut u64) {
-    for problem in problems {
-        report(sink, problem, seen);
+impl Failures {
+    /// Log this failure, but say so only in bursts of its own kind.
+    ///
+    /// The count is always advanced, so the message carries how many of *this* problem went unreported.
+    fn report(&mut self, sink: &Sink, problem: &str) {
+        let count = if let Some(seen) = self.seen.get_mut(problem) {
+            *seen += 1;
+            *seen
+        } else if self.seen.len() < MAX_DISTINCT_FAILURES {
+            self.seen.insert(problem.to_string(), 1);
+            1
+        } else {
+            self.overflow += 1;
+            self.overflow
+        };
+        if count % FAILURE_REPORT_EVERY == 1 {
+            sink.log(
+                Level::Warn,
+                "prober",
+                format!("{problem} ({count} failure(s) so far)"),
+            );
+        }
+    }
+
+    /// Report each of a probe's workload failures.
+    fn report_each(&mut self, sink: &Sink, problems: &[String]) {
+        for problem in problems {
+            self.report(sink, problem);
+        }
     }
 }
 
@@ -341,15 +370,19 @@ mod tests {
     fn repeated_failures_are_reported_in_bursts_rather_than_every_time() {
         let (sender, receiver) = std::sync::mpsc::sync_channel(1024);
         let sink = Sink::new(sender);
-        let mut seen = 0;
+        let mut failures = Failures::default();
         let problems = vec!["filesystem: no such directory".to_string()];
         for _ in 0..250 {
-            report_failures(&sink, &problems, &mut seen);
+            failures.report_each(&sink, &problems);
         }
         drop(sink);
 
         let (_, events) = drain(&receiver);
-        assert_eq!(seen, 250, "every failure is counted");
+        assert_eq!(
+            failures.seen.get(&problems[0]).copied(),
+            Some(250),
+            "every failure is counted"
+        );
         assert_eq!(
             events.len(),
             3,
@@ -360,6 +393,57 @@ mod tests {
             events[2].contains("201"),
             "the message says how many went unreported: {}",
             events[2]
+        );
+    }
+
+    /// A standing failure must not silence a new and different one.
+    ///
+    /// With one shared counter it did: an unwritable scratch volume kept the count away from the reporting
+    /// boundary, so the first occurrence of an unrelated fault was counted and never mentioned — for up to 99
+    /// occurrences of it.
+    #[test]
+    fn a_standing_failure_does_not_suppress_the_first_report_of_a_different_one() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1024);
+        let sink = Sink::new(sender);
+        let mut failures = Failures::default();
+        let standing = vec!["no scratch directory: access is denied".to_string()];
+        for _ in 0..50 {
+            failures.report_each(&sink, &standing);
+        }
+        failures.report(&sink, "sqlite: database is locked");
+        drop(sink);
+
+        let (_, events) = drain(&receiver);
+        assert_eq!(
+            events.len(),
+            2,
+            "the standing failure once, and the new one once: {events:?}"
+        );
+        assert!(events[1].contains("database is locked"), "{events:?}");
+        assert!(
+            events[1].contains("(1 failure"),
+            "the new failure counts from one, not from the other's total: {}",
+            events[1]
+        );
+    }
+
+    /// The map cannot grow without bound, because failure messages can carry a number or a path.
+    #[test]
+    fn distinct_failures_past_the_cap_share_one_counter() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1024);
+        let sink = Sink::new(sender);
+        let mut failures = Failures::default();
+        for index in 0..MAX_DISTINCT_FAILURES * 4 {
+            failures.report(&sink, &format!("wrote {index} bytes, expected more"));
+        }
+        drop(sink);
+        let _ = drain(&receiver);
+
+        assert_eq!(failures.seen.len(), MAX_DISTINCT_FAILURES);
+        assert_eq!(
+            failures.overflow,
+            (MAX_DISTINCT_FAILURES * 3) as u64,
+            "everything past the cap is counted together rather than remembered"
         );
     }
 }

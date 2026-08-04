@@ -177,6 +177,13 @@ fn configure(conn: &Connection) -> Result<()> {
 /// machine that no longer exists, under an id every measurement in the file is attributed to.
 fn register_machine(conn: &Connection, inventory: &Inventory) -> Result<String> {
     let id = inventory.hostname_hash.clone();
+    // The identity every row in the file is attributed to and every query filters on, so an empty one is
+    // not a degraded case but a database whose rows all belong to the same nameless machine. `system::inventory`
+    // always hashes something, which makes this unreachable in the daemon and exactly the kind of invariant
+    // that stops being true when somebody constructs an `Inventory` by hand.
+    if id.trim().is_empty() {
+        anyhow::bail!("a machine has to have a non-empty hostname hash to be registered");
+    }
     let now = now_ms();
     conn.execute(
         "INSERT INTO machines (id, hostname_hash, os, os_version, architecture, cpu,
@@ -233,6 +240,28 @@ mod tests {
             agent_write_bytes_s: Some(1_048_576.0),
             scanner_write_bytes_s: None,
         }
+    }
+
+    /// The load-bearing invariant nothing used to check.
+    ///
+    /// `machines.id` is the hashed hostname, and every measurement in the file is attributed to it while every
+    /// query filters on it. An empty one is not a machine with a missing name — it is one key that all rows
+    /// belong to, and a second machine's rows would merge into the first's silently.
+    #[test]
+    fn a_machine_with_no_hostname_hash_is_refused_rather_than_registered() {
+        let temp = tempfile::tempdir().unwrap();
+        let opened = Store::open(
+            &temp.path().join("watch.db"),
+            &Inventory {
+                hostname_hash: "  ".into(),
+                ..inventory()
+            },
+        );
+        let error = match opened {
+            Ok(_) => panic!("an empty identity must not open a store"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(error.contains("non-empty hostname hash"), "{error}");
     }
 
     #[test]

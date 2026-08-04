@@ -55,6 +55,11 @@ pub enum RunState {
     Finished {
         run_id: String,
         started_ms: i64,
+        /// When the child's exit was first observed, which is within one poll of when it happened.
+        ///
+        /// Not the child's own clock. `bench` writes its exact start and end into the run marker; this is what
+        /// the daemon watching it saw, and it is stamped when the exit is *noticed* rather than when the run is
+        /// concluded — those diverge whenever nothing was polling. See `child::Running::exit_status`.
         ended_ms: i64,
         request: Summary,
         /// Whether the child exited successfully *and* left a report behind.
@@ -70,6 +75,27 @@ pub enum RunState {
         /// The tail of the child's stderr, which is where a failure explains itself.
         stderr: Vec<String>,
     },
+}
+
+/// Why a benchmark was not started.
+///
+/// Two cases, because they are two different statuses and only one of them is about the caller. A run already
+/// in flight is a `409`: the request was well formed and the machine is busy, and the page shows the running
+/// run rather than an error. Anything else is this daemon failing — a reports directory it cannot create, an
+/// executable it cannot launch — and reporting that as a conflict told the page to display "the machine is
+/// busy" for a full disk.
+#[derive(Debug)]
+pub enum StartRefusal {
+    /// A benchmark is already running, described for the page.
+    Busy(String),
+    /// The daemon could not start one.
+    Failed(anyhow::Error),
+}
+
+impl From<anyhow::Error> for StartRefusal {
+    fn from(error: anyhow::Error) -> Self {
+        Self::Failed(error)
+    }
 }
 
 /// One phase announcement, as the page draws it.
@@ -245,7 +271,10 @@ impl Registry {
     /// Returns the new run's identifier. The identifier is this daemon's own, not the report's: a report's
     /// `run_id` does not exist until the run has finished writing one, and the page needs something to poll
     /// with from the moment it asks.
-    pub fn start(&self, valid: &ValidRequest) -> Result<String> {
+    ///
+    /// The refusal distinguishes "one is already running" from "this daemon could not start one", because they
+    /// are a `409` and a `500` and the page acts on only the first. See [`StartRefusal`].
+    pub fn start(&self, valid: &ValidRequest) -> std::result::Result<String, StartRefusal> {
         let mut inner = self
             .inner
             .lock()
@@ -255,11 +284,11 @@ impl Registry {
         // that would be relying on something no comment at the call site records.
         if let Inner::Running(active) = &mut *inner {
             if active.running.exit_status().is_none() {
-                bail!(
+                return Err(StartRefusal::Busy(format!(
                     "a {} benchmark started {} is still running; wait for it or stop it first",
                     active.request.preset,
                     describe_age(crate::watch::store::now_ms() - active.started_ms)
-                );
+                )));
             }
             // It has finished but nothing has noticed yet, which the poll below would have settled. Settle it
             // here rather than refusing a request the machine is perfectly able to serve.
@@ -274,7 +303,9 @@ impl Registry {
         std::fs::create_dir_all(&reports)
             .with_context(|| format!("create {}", reports.display()))?;
         let report_path = reports.join(format!("agentbench-{}.json", &run_id[..8]));
-        let args = valid.to_args(&report_path);
+        // The child is told which database to mark, because this daemon knows and it is the only thing that
+        // does: see `ValidRequest::to_args`.
+        let args = valid.to_args(&report_path, &self.data_dir);
         let running = Running::spawn(&self.program, &args)?;
         let summary = valid.summary();
         // Logged because a benchmark is the loudest thing this machine will do for the next few minutes, and
@@ -391,6 +422,12 @@ impl Registry {
             cancelled,
             report_path,
         } = active;
+        // Read before the child is consumed, and only then defaulted. A run concluded without ever having been
+        // polled — a `shutdown` that killed it, say — has no observation to report, so "now" is the honest
+        // answer for that case and only that one.
+        let ended_ms = running
+            .exited_ms()
+            .unwrap_or_else(crate::watch::store::now_ms);
         let (exit_code, stderr) = running.finish();
         // Success is the exit code *and* the file. A child that returned zero without leaving a report has
         // not produced anything the compare page can be pointed at, and reporting that as a success would
@@ -418,7 +455,7 @@ impl Registry {
         RunState::Finished {
             run_id,
             started_ms,
-            ended_ms: crate::watch::store::now_ms(),
+            ended_ms,
             request,
             ok,
             exit_code,

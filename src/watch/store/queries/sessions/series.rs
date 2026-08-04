@@ -8,7 +8,7 @@
 //! a harder one — a local day is 23 or 25 hours twice a year — so they belong with the baselines that
 //! need them rather than here.
 
-use crate::watch::store::queries::Point;
+use crate::watch::store::queries::{Point, Points};
 use anyhow::Result;
 use rusqlite::Connection;
 use serde::Serialize;
@@ -152,44 +152,43 @@ impl SessionSeries {
         }
     }
 
-    /// Statement yielding `(ts, numerator, denominator)` for this series.
+    /// Statement yielding `(ts, value, weight)` for this series, with no ordering or row cap of its own.
     ///
     /// Fixed text chosen by the enum, never assembled from a request. Failed, refused and interrupted
     /// tool calls are excluded from the latency series: each returned early or spent its time waiting
     /// for a person, so including them would make the machine look faster the more went wrong.
+    ///
+    /// The ordering and the cap are added by [`session_buckets`], because the two have to be applied in the
+    /// opposite order from the one they read in: the cap keeps the *newest* rows and the bucketing needs them
+    /// oldest first. Hence the aliases — the outer query selects these columns by name.
     fn sql(self) -> &'static str {
         match self {
             Self::ToolReadMs => {
-                "SELECT ts, duration_ms, 1 FROM session_tools
-                  WHERE machine_id = ?1 AND ts >= ?2 AND ts <= ?3 AND ok = 1 AND tool = 'Read'
-                  ORDER BY ts LIMIT ?4"
+                "SELECT ts, duration_ms AS value, 1 AS weight FROM session_tools
+                  WHERE machine_id = ?1 AND ts >= ?2 AND ts <= ?3 AND ok = 1 AND tool = 'Read'"
             }
             Self::ToolEditMs => {
-                "SELECT ts, duration_ms, 1 FROM session_tools
+                "SELECT ts, duration_ms AS value, 1 AS weight FROM session_tools
                   WHERE machine_id = ?1 AND ts >= ?2 AND ts <= ?3 AND ok = 1
-                    AND tool IN ('Edit', 'Write')
-                  ORDER BY ts LIMIT ?4"
+                    AND tool IN ('Edit', 'Write')"
             }
             Self::ToolSearchMs => {
-                "SELECT ts, duration_ms, 1 FROM session_tools
+                "SELECT ts, duration_ms AS value, 1 AS weight FROM session_tools
                   WHERE machine_id = ?1 AND ts >= ?2 AND ts <= ?3 AND ok = 1
-                    AND tool IN ('Grep', 'Glob')
-                  ORDER BY ts LIMIT ?4"
+                    AND tool IN ('Grep', 'Glob')"
             }
             Self::ToolBashMs => {
-                "SELECT ts, duration_ms, 1 FROM session_tools
-                  WHERE machine_id = ?1 AND ts >= ?2 AND ts <= ?3 AND ok = 1 AND tool = 'Bash'
-                  ORDER BY ts LIMIT ?4"
+                "SELECT ts, duration_ms AS value, 1 AS weight FROM session_tools
+                  WHERE machine_id = ?1 AND ts >= ?2 AND ts <= ?3 AND ok = 1 AND tool = 'Bash'"
             }
             Self::FirstResponseMs => {
-                "SELECT ts, first_response_ms, 1 FROM session_turns
-                  WHERE machine_id = ?1 AND ts >= ?2 AND ts <= ?3 AND first_response_ms IS NOT NULL
-                  ORDER BY ts LIMIT ?4"
+                "SELECT ts, first_response_ms AS value, 1 AS weight FROM session_turns
+                  WHERE machine_id = ?1 AND ts >= ?2 AND ts <= ?3
+                    AND first_response_ms IS NOT NULL"
             }
             Self::OutputTokens => {
-                "SELECT ts, output_tokens, 1 FROM session_turns
-                  WHERE machine_id = ?1 AND ts >= ?2 AND ts <= ?3
-                  ORDER BY ts LIMIT ?4"
+                "SELECT ts, output_tokens AS value, 1 AS weight FROM session_turns
+                  WHERE machine_id = ?1 AND ts >= ?2 AND ts <= ?3"
             }
             // Seconds, not milliseconds, in the denominator: the ratio reducer divides the sums as they
             // come, so the unit of the result is decided here rather than by a later multiplication
@@ -199,16 +198,16 @@ impl SessionSeries {
             // rows share a millisecond has no measurable span, and admitting it would contribute an
             // enormous rate to the bucket from a request nothing was actually measured about.
             Self::OutputTokensPerS => {
-                "SELECT ts, output_tokens, generation_ms / 1000.0 FROM session_turns
+                "SELECT ts, output_tokens AS value, generation_ms / 1000.0 AS weight
+                   FROM session_turns
                   WHERE machine_id = ?1 AND ts >= ?2 AND ts <= ?3
-                    AND generation_ms IS NOT NULL AND generation_ms > 0
-                  ORDER BY ts LIMIT ?4"
+                    AND generation_ms IS NOT NULL AND generation_ms > 0"
             }
             Self::CacheHitRatio => {
-                "SELECT ts, cache_read, cache_read + input_tokens FROM session_turns
+                "SELECT ts, cache_read AS value, cache_read + input_tokens AS weight
+                   FROM session_turns
                   WHERE machine_id = ?1 AND ts >= ?2 AND ts <= ?3
-                    AND cache_read + input_tokens > 0
-                  ORDER BY ts LIMIT ?4"
+                    AND cache_read + input_tokens > 0"
             }
         }
     }
@@ -226,9 +225,14 @@ pub struct Bucket {
     pub observations: usize,
 }
 
-/// Bucketed points for one derived series, oldest first.
+/// Bucketed points for one derived series, oldest first, capped at `limit` buckets.
 ///
 /// The chart form: [`session_buckets`] without the weights, which no chart has a use for.
+///
+/// `limit` is honoured here and nowhere below, because a bucket count is a question about a chart rather than
+/// about the data: a caller naming a one-minute bucket over a year is asking for half a million points, and the
+/// endpoint's ceiling exists so that request cannot be answered literally. Left unapplied, as it was, the
+/// endpoint read `limit` and then passed it only to the passive family.
 pub fn session_series(
     conn: &Connection,
     machine_id: &str,
@@ -236,19 +240,24 @@ pub fn session_series(
     from_ms: i64,
     to_ms: i64,
     bucket_ms: i64,
-) -> Result<Vec<Point>> {
-    Ok(
-        session_buckets(conn, machine_id, series, from_ms, to_ms, bucket_ms)?
-            .into_iter()
-            .map(|bucket| Point {
-                ts: bucket.ts,
-                value: bucket.value,
-            })
-            .collect(),
-    )
+    limit: usize,
+) -> Result<Points> {
+    let points = session_buckets(conn, machine_id, series, from_ms, to_ms, bucket_ms)?
+        .into_iter()
+        .map(|bucket| Point {
+            ts: bucket.ts,
+            value: bucket.value,
+        })
+        .collect();
+    Ok(Points::keep_recent(points, limit))
 }
 
 /// Bucketed values for one derived series with their weights, oldest first.
+///
+/// [`MAX_ROWS`] bounds the rows read, and it is spent on the newest of them: the statement selects a
+/// newest-first window and the wrapper sorts it back into time order, so a range holding more calls than the
+/// budget summarises its recent end rather than its oldest. The plain `ORDER BY ts LIMIT` this replaced kept
+/// the oldest instead, which for a chart is the opposite of what a reader is looking at.
 pub fn session_buckets(
     conn: &Connection,
     machine_id: &str,
@@ -258,7 +267,12 @@ pub fn session_buckets(
     bucket_ms: i64,
 ) -> Result<Vec<Bucket>> {
     let bucket_ms = bucket_ms.max(1);
-    let mut statement = conn.prepare_cached(series.sql())?;
+    // The inner text comes from the enum; only the ordering and the cap are added here.
+    let sql = format!(
+        "SELECT ts, value, weight FROM ({inner} ORDER BY ts DESC LIMIT ?4) ORDER BY ts",
+        inner = series.sql()
+    );
+    let mut statement = conn.prepare_cached(&sql)?;
     let mut rows = statement.query(rusqlite::params![
         machine_id,
         from_ms,
@@ -326,10 +340,19 @@ mod tests {
     use super::*;
     use crate::watch::store::queries::sessions::tests::{MACHINE, MINUTE, fixture};
 
+    /// A bucket budget wide enough not to be the thing under test.
+    const UNBOUNDED: usize = 10_000;
+
+    /// Every point of one series, with the bucket budget out of the way.
+    fn points(conn: &Connection, series: SessionSeries, bucket_ms: i64) -> Vec<Point> {
+        session_series(conn, MACHINE, series, 0, i64::MAX, bucket_ms, UNBOUNDED)
+            .unwrap()
+            .points
+    }
+
     /// Values of one series, bucket by bucket.
     fn values(conn: &Connection, series: SessionSeries, bucket_ms: i64) -> Vec<f64> {
-        session_series(conn, MACHINE, series, 0, i64::MAX, bucket_ms)
-            .unwrap()
+        points(conn, series, bucket_ms)
             .into_iter()
             .map(|point| point.value)
             .collect()
@@ -384,15 +407,7 @@ mod tests {
     fn buckets_split_by_time_and_are_ordered_oldest_first() {
         let conn = fixture();
         // The search series is the one spanning two minutes: a Grep in the first, a Glob in the second.
-        let points = session_series(
-            &conn,
-            MACHINE,
-            SessionSeries::ToolSearchMs,
-            0,
-            i64::MAX,
-            MINUTE,
-        )
-        .unwrap();
+        let points = points(&conn, SessionSeries::ToolSearchMs, MINUTE);
         assert_eq!(points.len(), 2, "two minutes of calls, two buckets");
         assert!(points[0].ts < points[1].ts);
         assert_eq!(points[0].ts % MINUTE, 0, "buckets are aligned");
@@ -485,24 +500,59 @@ mod tests {
     #[test]
     fn an_empty_range_yields_no_points_rather_than_an_error() {
         let conn = fixture();
-        let points =
-            session_series(&conn, MACHINE, SessionSeries::ToolReadMs, 0, 1, MINUTE).unwrap();
-        assert!(points.is_empty());
+        let points = session_series(
+            &conn,
+            MACHINE,
+            SessionSeries::ToolReadMs,
+            0,
+            1,
+            MINUTE,
+            UNBOUNDED,
+        )
+        .unwrap();
+        assert!(points.points.is_empty());
     }
 
     #[test]
     fn another_machines_rows_are_never_mixed_in() {
         let conn = fixture();
-        let points = session_series(
+        let rows = session_series(
             &conn,
             "some-other-machine",
             SessionSeries::ToolReadMs,
             0,
             i64::MAX,
             MINUTE,
+            UNBOUNDED,
         )
         .unwrap();
-        assert!(points.is_empty());
+        assert!(rows.points.is_empty());
+    }
+
+    /// A bucket budget narrower than the range keeps the recent end and says so.
+    ///
+    /// Without this the endpoint's ceiling was decorative for three of its four families: a one-minute bucket
+    /// over a year asks for half a million points, and the answer was as many as the row cap allowed with
+    /// `truncated` hardcoded false.
+    #[test]
+    fn a_tight_bucket_budget_keeps_the_newest_buckets_and_reports_truncation() {
+        let conn = fixture();
+        let rows = session_series(
+            &conn,
+            MACHINE,
+            SessionSeries::ToolSearchMs,
+            0,
+            i64::MAX,
+            MINUTE,
+            1,
+        )
+        .unwrap();
+        assert!(rows.truncated);
+        assert_eq!(rows.points.len(), 1);
+        assert_eq!(
+            rows.points[0].value, 900.0,
+            "the later minute's glob, not the earlier minute's grep"
+        );
     }
 
     #[test]
@@ -541,15 +591,7 @@ mod tests {
         assert_eq!(buckets[0].observations, 1, "one grep in the first minute");
         assert_eq!(buckets[1].observations, 1);
         // The chart form must be the same numbers with the weights dropped, never a second computation.
-        let points = session_series(
-            &conn,
-            MACHINE,
-            SessionSeries::ToolSearchMs,
-            0,
-            i64::MAX,
-            MINUTE,
-        )
-        .unwrap();
+        let points = points(&conn, SessionSeries::ToolSearchMs, MINUTE);
         assert_eq!(
             points.iter().map(|point| point.value).collect::<Vec<_>>(),
             buckets

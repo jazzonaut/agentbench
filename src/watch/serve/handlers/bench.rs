@@ -12,7 +12,7 @@
 use crate::watch::serve::{
     Settings,
     response::{Req, Resp},
-    runs::{BenchRequest, Registry},
+    runs::{BenchRequest, Registry, StartRefusal},
 };
 use serde::Serialize;
 
@@ -53,7 +53,13 @@ pub fn start(req: &Req, settings: &Settings) -> Resp {
         // A run already in flight is the one refusal that is not the caller's mistake, and `409` is what
         // says so: the request was well formed and the machine is busy. The page shows the running run
         // rather than an error, so it needs to be able to tell this from a `400`.
-        Err(error) => Resp::error(409, &format!("{error:#}")),
+        Err(StartRefusal::Busy(message)) => Resp::error(409, &message),
+        // The daemon failing to start a run is not a conflict. This used to answer `409` for an unwritable
+        // reports directory and for an executable that would not launch, which told the page to display "the
+        // machine is busy" for a full disk.
+        Err(StartRefusal::Failed(error)) => {
+            Resp::error(500, &format!("could not start the benchmark: {error:#}"))
+        }
     }
 }
 

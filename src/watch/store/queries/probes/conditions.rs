@@ -13,7 +13,7 @@
 //! it is a fact about what the measurement beside it was taken under. Nothing here reports
 //! `lower_is_better`, and the verdict machinery is never applied to these values as though it did.
 
-use crate::watch::store::queries::Point;
+use crate::watch::store::queries::{Point, Points};
 use anyhow::Result;
 use rusqlite::Connection;
 use serde::Serialize;
@@ -248,6 +248,10 @@ pub fn known_series() -> Vec<String> {
 /// it started under is the same kind of fact whatever wrote it. So this frame carries points from run
 /// markers too, which the frame above will not show — visible in practice only on
 /// [`CondSeries::CpuAt`], since a marker records no other covariate.
+///
+/// `limit` and the truncation it reports follow the probe frame exactly, which is not merely tidiness: the two
+/// frames share a cursor, so a budget that cut one of them at a different end of the range would put a reader's
+/// crosshair on two different runs.
 pub fn cond_series(
     conn: &Connection,
     machine_id: &str,
@@ -255,22 +259,24 @@ pub fn cond_series(
     from_ms: i64,
     to_ms: i64,
     uncontended_only: bool,
-) -> Result<Vec<Point>> {
+    limit: usize,
+) -> Result<Points> {
     // The column comes from a closed enum, never from caller input.
     let sql = format!(
         "SELECT ts, {column} FROM probe_runs
           WHERE machine_id = ?1 AND ts >= ?2 AND ts <= ?3 AND {column} IS NOT NULL
             AND (?4 = 0 OR contended = 0)
-          ORDER BY ts LIMIT ?5",
+          ORDER BY ts DESC LIMIT ?5",
         column = series.column()
     );
     let mut statement = conn.prepare_cached(&sql)?;
+    let budget = limit.min(super::MAX_ROWS);
     let mut rows = statement.query(rusqlite::params![
         machine_id,
         from_ms,
         to_ms,
         uncontended_only as i64,
-        super::MAX_ROWS as i64,
+        budget.saturating_add(1) as i64,
     ])?;
     let mut points = Vec::new();
     while let Some(row) = rows.next()? {
@@ -279,7 +285,8 @@ pub fn cond_series(
             value: row.get(1)?,
         });
     }
-    Ok(points)
+    points.reverse();
+    Ok(Points::keep_recent(points, budget))
 }
 
 #[cfg(test)]
@@ -287,12 +294,24 @@ mod tests {
     use super::*;
     use crate::watch::store::queries::probes::tests::{MACHINE, fixture};
 
+    /// A budget wide enough not to be the thing under test.
+    const UNBOUNDED: usize = 10_000;
+
     fn values(conn: &Connection, series: CondSeries, uncontended_only: bool) -> Vec<f64> {
-        cond_series(conn, MACHINE, series, 0, i64::MAX, uncontended_only)
-            .unwrap()
-            .into_iter()
-            .map(|point| point.value)
-            .collect()
+        cond_series(
+            conn,
+            MACHINE,
+            series,
+            0,
+            i64::MAX,
+            uncontended_only,
+            UNBOUNDED,
+        )
+        .unwrap()
+        .points
+        .into_iter()
+        .map(|point| point.value)
+        .collect()
     }
 
     #[test]
@@ -375,9 +394,46 @@ mod tests {
     fn another_machines_runs_are_never_mixed_in() {
         let conn = fixture();
         assert!(
-            cond_series(&conn, "someone-else", CondSeries::CpuAt, 0, i64::MAX, false)
-                .unwrap()
-                .is_empty()
+            cond_series(
+                &conn,
+                "someone-else",
+                CondSeries::CpuAt,
+                0,
+                i64::MAX,
+                false,
+                UNBOUNDED,
+            )
+            .unwrap()
+            .points
+            .is_empty()
+        );
+    }
+
+    /// The budget is spent on the same end of the range the probe frame spends it on.
+    ///
+    /// Both frames share a cursor, so a covariate series cut at the opposite end would line a reader's
+    /// crosshair up with a different run in each panel.
+    #[test]
+    fn a_tight_budget_keeps_the_newest_runs_and_reports_truncation() {
+        let conn = fixture();
+        let rows = cond_series(
+            &conn,
+            MACHINE,
+            CondSeries::ClockPercent,
+            0,
+            i64::MAX,
+            false,
+            2,
+        )
+        .unwrap();
+        assert!(rows.truncated);
+        assert_eq!(
+            rows.points
+                .iter()
+                .map(|point| point.value)
+                .collect::<Vec<_>>(),
+            vec![137.0, 127.0],
+            "the two most recent runs, still oldest first"
         );
     }
 

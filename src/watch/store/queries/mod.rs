@@ -31,6 +31,41 @@ pub struct Point {
     pub value: f64,
 }
 
+/// Points for one series, and whether the row budget ran out before the range did.
+///
+/// What [`SeriesRows`] is for the passive family, without the resolution and reducer that only a summarised
+/// stream has. It exists because three families used to answer with a bare `Vec<Point>` and a `truncated` flag
+/// hardcoded `false` at the handler, while their SQL capped the rows — so a range holding more points than the
+/// cap was answered with a partial series that described itself as whole.
+///
+/// [`SeriesRows`]: samples::SeriesRows
+#[derive(Debug, Clone, PartialEq)]
+pub struct Points {
+    /// Oldest first.
+    pub points: Vec<Point>,
+    /// True when the budget ran out before the range did.
+    pub truncated: bool,
+}
+
+impl Points {
+    /// Keep at most `limit` points, taken from the recent end, and say whether anything was dropped.
+    ///
+    /// One policy for every family, and it is the passive series' policy: asked for more than it can carry, a
+    /// chart is better off showing the recent end of the range at full fidelity than a thinned version of the
+    /// whole thing. The run-shaped families used to do the opposite by accident — `ORDER BY ts LIMIT n` keeps
+    /// the *oldest* n — so the one thing a reader was certainly looking at was the first thing dropped.
+    ///
+    /// `points` arrives oldest first, which is the order every caller has in hand and the order the answer
+    /// goes out in.
+    pub(super) fn keep_recent(mut points: Vec<Point>, limit: usize) -> Self {
+        let truncated = points.len() > limit;
+        if truncated {
+            points.drain(..points.len() - limit);
+        }
+        Self { points, truncated }
+    }
+}
+
 /// Counts and freshness used by `--status` and the health tile.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Health {

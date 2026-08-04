@@ -4,7 +4,7 @@ use crate::{install, metrics::catalog, model::Metric};
 use anyhow::{Result, bail};
 use std::{
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     time::Instant,
 };
 
@@ -16,13 +16,28 @@ use std::{
 /// The count is a parameter because process creation is one of the operations a security scanner
 /// intercepts, which makes it worth measuring in the background as well as in a benchmark — and the
 /// background wants far fewer launches for the same metric.
+///
+/// All three of the child's streams go to the null device, and that is part of the measurement rather than
+/// tidiness. Inherited handles make the cost of a spawn depend on what the *parent's* stdout happens to be, so
+/// the same benchmark run from a terminal, run with its output piped to a file, and run from a logon task with
+/// no console at all measured three slightly different things under one metric name. The null device is the
+/// same on every path.
+///
+/// It also stops the child talking. Under `cargo test` this program's own executable is the test harness, which
+/// reads `internal-noop` as a filter matching nothing and says so — 45 copies of "running 0 tests … 558
+/// filtered out" interleaved with the real results, which is where the summary went to hide.
 pub fn run(launches: usize) -> Result<Vec<Metric>> {
     let current = std::env::current_exe()?;
     let executable = console_build(&current, |path| path.is_file());
     let mut times = Vec::new();
     for _ in 0..launches.max(1) {
         let started = Instant::now();
-        let status = Command::new(&executable).arg("internal-noop").status()?;
+        let status = Command::new(&executable)
+            .arg("internal-noop")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?;
         if !status.success() {
             bail!("internal process benchmark failed");
         }
