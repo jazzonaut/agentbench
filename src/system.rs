@@ -40,7 +40,7 @@ pub fn available_space(path: &Path) -> Option<u64> {
 /// Stable, hashed identity of this machine.
 ///
 /// Extracted so that a caller needing only the identity does not have to build a whole [`Inventory`],
-/// which enumerates every disk and spawns a child process to name the power source. [`inventory`] uses
+/// which enumerates every disk and every process on the machine. [`inventory`] uses
 /// it too, so the two can never disagree about which machine a row belongs to — and they must not, since
 /// this value is the primary key of the dashboard's `machines` table.
 pub fn machine_id() -> String {
@@ -219,28 +219,10 @@ fn is_elevated() -> bool {
     crate::watch::platform::is_elevated()
 }
 
-#[cfg(windows)]
-fn power_source() -> Option<String> {
-    let output = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            "(Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue).BatteryStatus",
-        ])
-        .output()
-        .ok()?;
-    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if value.is_empty() {
-        Some("ac_or_desktop".into())
-    } else {
-        Some(format!("battery_status_{value}"))
-    }
-}
-
 /// Which source is powering the machine, named for the report.
 ///
-/// Delegated rather than reimplemented. There were two Unix readings of this one fact and they
-/// disagreed: this one walked `/sys/class/power_supply` looking for any `online` file, and since a
+/// Delegated rather than reimplemented, on every platform. There were two Unix readings of this one fact
+/// and they disagreed: this one walked `/sys/class/power_supply` looking for any `online` file, and since a
 /// battery has no such file and `read_dir` order is arbitrary, visiting `BAT0` first returned `None`
 /// for the whole function — the answer was decided by directory ordering. The watch-side reading
 /// filters on `type == "Mains"`, keeps looking, and distinguishes "cannot tell" from "on mains", so it
@@ -249,17 +231,23 @@ fn power_source() -> Option<String> {
 /// The cost argument that kept them apart no longer holds either way round: the surviving
 /// implementation is a few small reads on Linux and one short-lived `pmset` on macOS, which is what
 /// this path was already spending.
-#[cfg(unix)]
+///
+/// Windows followed later, for a reason ADR 0001 could not have anticipated when it permitted a child
+/// process here. This arm spent a `powershell -Command (Get-CimInstance Win32_Battery …)` — a WMI query,
+/// several hundred milliseconds — on a question `GetSystemPowerStatus` answers in one call, and the ADR
+/// allowed it because `inventory()` runs once per report and a report is printed to a console. The tray
+/// build has no console, so that child arrived as a PowerShell window flashing on the user's desktop at
+/// every login.
+///
+/// The recorded string changes with it: Windows reported `ac_or_desktop` or `battery_status_2`, and now
+/// reports the `ac`/`battery` every other platform already used. Nothing reads it but the JSON report, and
+/// one spelling across platforms is what a reader holding two reports needs. A desktop still reads `ac`:
+/// `GetSystemPowerStatus` reports `AC_LINE_ONLINE` for a machine with no battery at all.
 fn power_source() -> Option<String> {
     Some(match crate::watch::platform::on_battery()? {
         true => "battery".into(),
         false => "ac".into(),
     })
-}
-
-#[cfg(not(any(windows, unix)))]
-fn power_source() -> Option<String> {
-    None
 }
 
 pub fn native_diagnostics(_elevated_requested: bool) -> (serde_json::Value, Vec<String>) {

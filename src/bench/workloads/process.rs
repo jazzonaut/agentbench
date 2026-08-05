@@ -26,18 +26,39 @@ use std::{
 /// It also stops the child talking. Under `cargo test` this program's own executable is the test harness, which
 /// reads `internal-noop` as a filter matching nothing and says so — 45 copies of "running 0 tests … 558
 /// filtered out" interleaved with the real results, which is where the summary went to hide.
+///
+/// On Windows the child is given no console either, and that is the same argument one step further. A
+/// console-subsystem child inherits the parent's console when there is one and is handed a brand new one —
+/// window, `conhost.exe` and all — when there is not. Measured on this machine at a one-second probe
+/// cadence, release build, median of the launches in each run: **7.9 ms per launch from a console parent
+/// and 184.8 ms from the windowless tray build**, under one metric name. Console allocation was 96% of what
+/// the tray reported as the cost of starting a process. With `DETACHED_PROCESS` the same two parents
+/// measure 7.9 ms and 8.5 ms, which is what this metric claimed to be all along.
+///
+/// The visible half was five console windows appearing on the user's desktop four times an hour, once per
+/// probe. `DETACHED_PROCESS` rather than `CREATE_NO_WINDOW`, which only hides the window: the console and
+/// its host process are still created, so all 177 ms of it would still be in the number.
 pub fn run(launches: usize) -> Result<Vec<Metric>> {
     let current = std::env::current_exe()?;
     let executable = console_build(&current, |path| path.is_file());
     let mut times = Vec::new();
     for _ in 0..launches.max(1) {
         let started = Instant::now();
-        let status = Command::new(&executable)
+        let mut command = Command::new(&executable);
+        command
             .arg("internal-noop")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()?;
+            .stderr(Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            /// `DETACHED_PROCESS`. Safe here only because all three streams are already the null device:
+            /// a child with no console and an inherited handle would have nowhere to write.
+            const DETACHED_PROCESS: u32 = 0x0000_0008;
+            command.creation_flags(DETACHED_PROCESS);
+        }
+        let status = command.status()?;
         if !status.success() {
             bail!("internal process benchmark failed");
         }

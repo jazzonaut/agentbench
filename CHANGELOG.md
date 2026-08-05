@@ -2,6 +2,31 @@
 
 All notable changes to AgentBench are documented here. The project follows [Semantic Versioning](https://semver.org/).
 
+## [0.8.1] - 2026-08-05
+
+Two child processes the windowless tray build had nowhere to put. The first was also the more expensive: a
+metric it reported was 96% console allocation.
+
+### Fixed
+
+- **The tray build no longer flashes console windows.** Every probe launched five `internal-noop` children
+  for `process.spawn_ms`, and a console-subsystem child with no console to inherit gets a fresh one — so the
+  windowless daemon put five console windows on screen four times an hour. They are now spawned
+  `DETACHED_PROCESS`, which is also the honest choice for the measurement: `CREATE_NO_WINDOW` only hides the
+  window, leaving the console and its `conhost` host process in a number that is supposed to be the cost of
+  starting one process. It was never only cosmetic — median per launch, measured at a one-second probe
+  cadence: **184.8 ms from the tray build against 7.9 ms from a terminal, now 8.5 ms and 7.9 ms**. Console
+  allocation was 96% of the figure, so **expect a large one-off downward step in `process.spawn_ms` collected
+  by the tray build**, and treat earlier values from it as a `conhost` startup time rather than a baseline.
+  Values from a terminal do not move. Probes also finish sooner: the same 45-second window fitted 19 probes
+  before and 28 after.
+- **No PowerShell window at login either.** `system::inventory()` named the power source with a
+  `Get-CimInstance Win32_Battery` query — several hundred milliseconds of WMI, in a visible window, for a
+  fact `GetSystemPowerStatus` answers in one call. It now delegates to the same `platform::on_battery()` the
+  probe covariates use, as Linux and macOS already did. The value recorded on Windows changes from
+  `ac_or_desktop` / `battery_status_2` to `ac` / `battery`, matching every other platform; it appears in the
+  JSON report's inventory and nothing computes on it.
+
 ## [0.8.0] - 2026-08-04
 
 The dashboard stops being read-only. Two pages join the machine view: one that starts a benchmark from a form
@@ -796,6 +821,8 @@ was different about the day it is describing, and every series the daemon collec
 - Privacy-safe JSON and Markdown reports with offline machine comparison.
 - Evidence-ranked diagnoses for system, network, security-scanner, and proxy bottlenecks.
 - Tag-driven Windows, Linux, macOS Intel, and macOS Apple Silicon GitHub releases.
+
+[0.8.1]: https://github.com/jazzonaut/agentbench/releases/tag/v0.8.1
 
 [0.8.0]: https://github.com/jazzonaut/agentbench/releases/tag/v0.8.0
 

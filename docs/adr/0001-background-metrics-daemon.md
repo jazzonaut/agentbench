@@ -317,10 +317,15 @@ that cannot be read is cost without benefit.
   March's numbers incomparable to April's with nothing in the data to say so. The interval does get a
   one-second floor, in the file and on the CLI flag alike, since back-to-back probing stops being
   background collection.
-- **`platform::on_battery()` is a new capability and does not share code with `system::power_source`.**
-  They answer different questions under different budgets: the report's version names the source in prose
-  once per run and is free to spend a child process on it, whereas this one is asked immediately before a
-  measurement. Windows uses `GetSystemPowerStatus`, Linux reads sysfs, macOS spends a short `pmset`
+- ~~**`platform::on_battery()` is a new capability and does not share code with `system::power_source`.**~~
+  Reversed: `system::power_source` is now a thin naming layer over `platform::on_battery()` on every
+  platform. What was wrong was the budget, not the implementations. The report's version was said to be
+  "free to spend a child process on it" because it runs once per report and a report is printed to a
+  console — and the tray build, which did not exist when that was written, has no console for a child to
+  appear in. See *A windowless build has nowhere to put a console* below.
+
+  The implementations are unchanged and are what survived the merge. Windows uses `GetSystemPowerStatus`,
+  Linux reads sysfs, macOS spends a short `pmset`
   because IOKit is the only alternative and it would mean a new dependency, and everything else reports
   that it cannot tell. `None` is stored as SQL NULL and read back as unknown — never as "on mains",
   because a laptop on battery runs a third slower for a reason that has nothing to do with degradation.
@@ -735,6 +740,50 @@ left to be inferred from the code.
   JavaScript would eventually disagree with the `.md` file beside it about the same pair of files.
   `POST /api/compare` takes report *documents* and no paths — an endpoint taking paths would be a loopback
   service that reads any file on the machine and returns whichever parts of it parse as a report.
+
+### A windowless build has nowhere to put a console
+
+`agentbench-tray` is linked for the Windows subsystem, which is the whole reason it exists. The consequence
+nothing in this document had drawn out is that **every child process the daemon spawns is a window on the
+user's desktop**, because a console-subsystem child with no console to inherit is given a fresh one — window,
+`conhost.exe` and all. The daemon spawned two kinds, and both were visible.
+
+- **Five console windows, four times an hour.** The probe's `process` phase launches five `internal-noop`
+  children per run. This is the second time the same design collided with the tray build: the first was five
+  *notification-area icons* per probe, fixed by resolving the console sibling instead of `current_exe`, and
+  the fix inherited the console problem from the executable it switched to. `DETACHED_PROCESS` on the child
+  is the answer, chosen over `CREATE_NO_WINDOW` — which the run supervisor uses and which is right there,
+  since a benchmark's child is minutes long and its startup cost is noise — because `CREATE_NO_WINDOW` only
+  hides the window. The console and its host process are still created, and here that cost is the
+  measurement.
+- **It was a measurement bug before it was a visible one, and a large one.** `process.spawn_ms` is the same
+  metric name from the probe and from `bench`, and the console made it parent-dependent in exactly the way
+  the null-device decision one release earlier had just removed for the standard streams: a spawn from a
+  terminal inherited a console, a spawn from the tray built one. Measured at a one-second probe cadence,
+  release build, median per launch:
+
+  | parent | before | after |
+  | --- | --- | --- |
+  | console (`agentbench dashboard` from a terminal) | 7.9 ms | 7.9 ms |
+  | windowless (`agentbench-tray.exe`) | **184.8 ms** | **8.5 ms** |
+
+  Console allocation was 96% of what the tray build reported as the cost of starting a process — a metric
+  the README documents, off by a factor of 23 on the only build most users run. The same 45-second window
+  fitted 19 probes before the change and 28 after, because each probe was carrying five of those 177 ms.
+  **Expect a one-off downward step in tray-collected `process.spawn_ms`**, annotated on the chart by the
+  version marker of the release carrying it. Values collected before it are not a usable baseline: they are
+  a `conhost` startup time with a process spawn inside.
+- **One PowerShell window at every login.** `system::inventory()` runs once at daemon startup and named the
+  power source with `powershell -Command (Get-CimInstance Win32_Battery …)`, a WMI query costing several
+  hundred milliseconds, for a fact `GetSystemPowerStatus` returns in one call. The deviation above permitted
+  that child on the grounds that a report is printed to a console; the daemon is the caller that is not.
+  Delegating to `platform::on_battery()` changes the recorded string on Windows from `ac_or_desktop` /
+  `battery_status_2` to the `ac` / `battery` the other platforms already used — read by nothing but the JSON
+  report, and one spelling across platforms is what a reader holding two of them needs.
+- **The rule this leaves behind:** a `Command` on any path the daemon can reach needs a creation flag, and
+  which flag is a measurement question rather than a cosmetic one. The remaining child processes in the tool
+  — `schtasks`, the elevated Defender query, `tool_version` — are reachable only from the console build and
+  the control centre, where a console already exists and inheriting it is correct.
 
 ### Questions phase 6 answered
 
